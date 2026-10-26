@@ -68,6 +68,13 @@ Facts about a particular user or their work never go here (they go to the profil
   coordinator lock and watcher duties, even in a throwaway profile. **How:** launch a separate,
   explicitly scoped coordinator fixture with its own instructions and the throwaway profile.
   Before any UI action, re-read the agent's current state and screen; never answer a stale dialog.
+- **Quota limits are runtime/account-specific; connectors must follow runtime handoffs.**
+  Workers sharing an account draw on that account's limit, not every available runtime's quota.
+  **Why:** a model-client limit does not establish that an independent runtime or MCP service is
+  unavailable. **How:** use the available approved runtime and verify its own MCP configuration
+  and authenticated tools. Resolve missing supported connector setup instead of waiting for the
+  other runtime's reset; surface the exact OAuth/consent step if needed. Never transfer credentials
+  between clients or bypass authentication. Stop the old writer before resuming its replacement.
 - **Tool-call shells are not persistent coordinator identities.** **Why:** a terminal tool may
   start a fresh shell for each call; a lock owned by that shell becomes stale when it exits.
   **How:** use the runtime's persistent session identity. With `bin/zed`'s legacy PID fallback,
