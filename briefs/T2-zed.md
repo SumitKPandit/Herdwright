@@ -87,3 +87,15 @@ Clean up every herdr workspace and worktree you create.
 - Branch pushed to origin; **do not raise a PR and do not merge** — Zed will review and merge.
 - Commit message format for this repo: `ZED | Description in imperative mood`.
 - Finish with ZED:DONE, including exactly how Zed should run the migration and create `profile/sumit`.
+
+## Added requirement (user, 2026-10-26): one active Zed per profile
+Multiple Claude sessions may be opened in the Zed checkout. Guard against two acting as Zed:
+- A lock (in the profile dir, gitignored) records the holder's herdr pane id, Claude session id, pid, and time.
+- On startup Zed checks it. If another live holder exists, offer the user: **read-only** (answer
+  status questions from the DB; no watcher, no relaying, no commits) or **take over** (acquire the
+  lock; the old holder must notice and step down — e.g. its `bin/zed watch` exits with a clear
+  line when it loses the lock, and CLAUDE.md tells Zed to stop acting then).
+- Stale lock (holder pane no longer exists in herdr / pid dead) is cleared automatically.
+- Mutating `bin/zed` commands and `watch` refuse (with a clear message) when the caller doesn't
+  hold the lock; read-only commands (status, list, show) always work. Add a SQLite busy timeout.
+- Different profiles never conflict.
