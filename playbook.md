@@ -28,3 +28,7 @@ Facts about a particular user or their work never go here (they go to the profil
   in-flight API calls may fail — after a wake, run `check-workers` and nudge any worker that
   stopped on an error. To survive lid-close, the Mac must be on power with an external display
   (clamshell) — don't change system power settings without the user's OK.
+- **Usage limits are shared.** Zed and every worker (and their sub-agents) draw on the same
+  claude.ai plan limit. Hitting it pauses everything until reset (workers auto-continue after the
+  reset; sub-agents may need a restart). Size parallel waves to the plan, tell the user when a
+  limit pauses work, and after a reset check that each worker actually resumed.
