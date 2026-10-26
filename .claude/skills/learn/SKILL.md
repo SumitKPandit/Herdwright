@@ -19,6 +19,7 @@ Ask: *would this be true and useful for a Zed serving someone else?*
   | People, handles, reviewers | `profile/knowledge/people.md` |
   | How to set up / run / log in / QA a repo; gotchas | `profile/knowledge/repos/<repo>.md` |
   | Repo paths, base branches, worktree root | `profile/config/projects.json` |
+  | Which agent runtimes, their order, permission mode, model policy | `profile/config/runtimes.json` |
 
 - **Yes — it makes any Zed better** (a tool quirk, a workflow improvement, a missing step) → core:
   a lesson in `playbook.md`; a change to a skill, `CLAUDE.md`, `templates/`, `bin/` or

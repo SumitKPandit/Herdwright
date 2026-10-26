@@ -23,7 +23,12 @@ description: Intake a new piece of work from the user, record it, write a brief 
    `bin/zed log <T> "decision: ..." kind=decision`.
 3. Per repo, copy `templates/brief.md` to `profile/briefs/T<id>-<repo>.md` and fill it with confirmed
    facts only. List open points explicitly so the worker asks rather than guesses.
-4. `bin/zed spawn <T> repo=<repo> base=<base> branch=<branch per profile/rules.md> brief=profile/briefs/T<id>-<repo>.md`
-   (branch description: short kebab-case; confirm with the user if it isn't obvious).
-5. Make sure the watcher is running (see CLAUDE.md "Watch"). Tell the user: T-id, session(s),
-   worktree, branch. Commit the profile.
+4. If the model policy needs a ranking and `bin/zed models show` says it is missing or stale,
+   refresh it (`models` skill) before spawning. If the source cannot be read, tell the user and
+   get their model choice; never claim a CLI default is benchmark-optimal.
+   `bin/zed spawn <T> repo=<repo> base=<base> branch=<branch per profile/rules.md> brief=profile/briefs/T<id>-<repo>.md`
+   (branch description: short kebab-case; confirm with the user if it isn't obvious). It picks the
+   runtime (first usable one in `config/runtimes.json`) and the model/effort (model policy); its
+   output says which and why. If it says no runtime is available, tell the user (`switch-runtime`).
+5. Make sure the watcher is running (see CLAUDE.md "Runtimes"). Tell the user: T-id, session(s),
+   worktree, branch, runtime and model. Commit the profile.

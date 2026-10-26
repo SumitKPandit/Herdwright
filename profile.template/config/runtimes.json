@@ -1,0 +1,18 @@
+{
+  "order": ["claude", "copilot"],
+  "runtimes": {
+    "claude": {
+      "enabled": true
+    },
+    "copilot": {
+      "enabled": true,
+      "permission_mode": "assisted",
+      "deny_tools": ["shell(gh pr merge)"]
+    }
+  },
+  "model_policy": {
+    "method": "attractive-quadrant",
+    "source": "Artificial Analysis: Intelligence Index vs Cost per task",
+    "max_age_days": 14
+  }
+}

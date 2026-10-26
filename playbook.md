@@ -28,7 +28,43 @@ Facts about a particular user or their work never go here (they go to the profil
   in-flight API calls may fail — after a wake, run `check-workers` and nudge any worker that
   stopped on an error. To survive lid-close, the Mac must be on power with an external display
   (clamshell) — don't change system power settings without the user's OK.
-- **Usage limits are shared.** Zed and every worker (and their sub-agents) draw on the same
-  claude.ai plan limit. Hitting it pauses everything until reset (workers auto-continue after the
-  reset; sub-agents may need a restart). Size parallel waves to the plan, tell the user when a
-  limit pauses work, and after a reset check that each worker actually resumed.
+- **Usage limits are shared per runtime.** Zed and every worker (and their sub-agents) on the same
+  runtime draw on the same plan: all Claude sessions share the claude.ai plan limit, all Copilot
+  sessions share the Copilot plan's AI credits. Hitting a limit pauses everything on that runtime
+  until reset (Claude workers auto-continue after the reset; sub-agents may need a restart). Size
+  parallel waves to the plan, tell the user when a limit pauses work, and after a reset check that
+  each worker actually resumed. With both runtimes, see the `switch-runtime` skill.
+- **Copilot CLI: never autopilot.** **Why:** in autopilot, Copilot's ask-the-user tool doesn't
+  wait; it returns "Making best guess on autopilot", which breaks the no-assumption rule. **How:**
+  Zed and its workers run `--mode interactive`. Workers are told to ask only via ZED:QUESTION.
+- **Copilot CLI wakes on a detached shell's completion.** **Why:** there is no Monitor tool; a
+  background shell started detached sends a "Detached shell … completed" notification that starts
+  a new turn even when the session is idle. **How:** Zed under Copilot runs `bin/zed watch --once`
+  detached and re-arms it after each wake-up.
+- **Copilot CLI workers need their rules and paths passed explicitly.** **Why:** there's no
+  system-prompt flag, and file access is limited to the working directory. **How:** `spawn` writes
+  the worker rules to `<profile>/.cache/copilot-instructions/zed-worker.instructions.md`, passes
+  that folder in `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` (via `herdr workspace create --env`), and adds
+  `--add-dir` for the profile and Zed's home. Its folder-trust dialog ("Do you trust the files in
+  this folder?") is accepted for worktrees Zed created.
+- **Copilot's Assisted Permissions judge the conversation, not the brief.** **Why:** the reviewer
+  approves what the human asked for in the session's messages. It escalated a worker's file writes,
+  commits and even `printf` checks because the authority sat in the brief file. It also approved an
+  explicitly requested `git push --force`. **How:** it isn't a substitute for the worker rules or the
+  git guards. `--deny-tool` (`deny_tools` in `runtimes.json`) is the only hard block; expect
+  approval dialogs (herdr `blocked`) and relay them to the user. Interactive sessions can only enter
+  Assisted mode through `/permissions` (the `--assisted-approval` flag is prompt-mode only), and
+  `spawn` does that.
+- **Claude Code's auto mode may refuse to launch unrestricted agents.** **Why:** its safety check
+  treats starting another agent with all permissions (e.g. `copilot --allow-all-tools`), or wording
+  a prompt to pre-authorise another agent's permission reviewer, as unsafe. **How:** don't work
+  around it; ask the user, who can choose the permission mode in `runtimes.json` or add a
+  permission rule.
+- **Herdr can report `agent_prompt_stalled` before Copilot starts a submitted prompt.** **Why:**
+  the activity gate expires after five seconds, but the prompt may already be in the transcript
+  and start shortly afterwards. **How:** inspect the agent's state and completion sequence;
+  `spawn` allows a short observation window. Never blindly submit the same brief again.
+- **Keep coordinator QA separate from worker fixtures.** **Why:** workers correctly refuse
+  coordinator lock and watcher duties, even in a throwaway profile. **How:** launch a separate,
+  explicitly scoped coordinator fixture with its own instructions and the throwaway profile.
+  Before any UI action, re-read the agent's current state and screen; never answer a stale dialog.

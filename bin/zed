@@ -7,11 +7,15 @@ home, or $ZED_PROFILE_DIR if set (e.g. a throwaway profile for testing).
 
 Concepts
   task     a unit of work the user asked for (usually one Jira ticket)
-  session  one Claude worker running in herdr, in its own git worktree, on one repo
+  session  one worker (Claude Code or GitHub Copilot CLI) running in herdr, in its own git
+           worktree, on one repo
+  runtime  the agent CLI a session runs on: `claude` or `copilot` (see RUNTIMES). Which ones the
+           user has, their order of preference and the model policy live in
+           <profile>/config/runtimes.json
   question something a worker (or Zed) needs the user to decide
   event    timestamped log line attached to a task (or global if no task)
 
-One active Zed per profile: the Claude session that holds the profile's lock
+One active Zed per profile: the agent session (either runtime) that holds the profile's lock
 (<profile>/.cache/zed.lock) is Zed. Other sessions get read-only access (status, list, show);
 mutating commands and `watch` refuse. See `zed lock`.
 
@@ -19,9 +23,12 @@ Run `zed help` for commands.
 """
 import fcntl
 import json
+import math
 import os
 import re
+import shutil
 import sqlite3
+import statistics
 import subprocess
 import sys
 import time
@@ -37,6 +44,39 @@ CORE_WORKER_RULES = ZED_HOME / "templates" / "worker-rules.md"
 PROFILE_RULES = PROFILE_DIR / "rules.md"
 GENERATED_WORKER_RULES = PROFILE_DIR / ".cache" / "worker-rules.md"
 LOCK_PATH = PROFILE_DIR / ".cache" / "zed.lock"
+RUNTIMES_PATH = PROFILE_DIR / "config" / "runtimes.json"
+MODEL_RANKING_PATH = PROFILE_DIR / "config" / "model-ranking.json"
+RUNTIME_STATE_PATH = PROFILE_DIR / ".cache" / "runtime-state.json"
+WATCH_STATE_PATH = PROFILE_DIR / ".cache" / "watch-state.json"
+COPILOT_INSTRUCTIONS_DIR = PROFILE_DIR / ".cache" / "copilot-instructions"
+
+# What Zed needs to know about each agent CLI it can run on. Everything user-specific (which ones
+# they have, preference order, model policy, permission mode) is in <profile>/config/runtimes.json.
+RUNTIMES = {
+    "claude": {
+        "cli": "claude",
+        "session_env": "CLAUDE_CODE_SESSION_ID",  # set in the shell of every Claude Code session
+        "pid_env": "CLAUDE_PID",
+        "efforts": ["low", "medium", "high", "xhigh", "max"],
+        "trust_prompt": "Yes, I trust this folder",
+        "trust_keys": ["down", "enter"],
+        # e.g. "You've hit your session limit · resets 3pm", "Usage limit reached · continuing automatically at …"
+        "limit_patterns": [r"hit your \w+ limit", r"usage limit reached", r"limit reached\b.*\breset"],
+    },
+    "copilot": {
+        "cli": "copilot",
+        "session_env": "COPILOT_AGENT_SESSION_ID",
+        "pid_env": "COPILOT_LOADER_PID",
+        "efforts": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+        "trust_prompt": "Do you trust the files in this folder?",
+        "trust_keys": ["enter"],  # "1. Yes": trust for this session only
+        # e.g. "You've been rate limited on the current model. Would you like to switch to …"
+        "limit_patterns": [r"rate.limited", r"rate limit (reached|exceeded)", r"quota (reached|exceeded)",
+                           r"out of (ai )?credits", r"no (remaining )?(premium requests|ai credits)"],
+        "credits_pattern": r"Session: ([\d.]+) AIC used",
+    },
+}
+PERMISSION_MODE_MENU = {"manual": "1", "assisted": "2", "allow-all": "3"}  # Copilot's /permissions dialog
 
 TASK_STATES = ["intake", "active", "waiting_user", "in_review", "pr_open", "parked", "done", "cancelled"]
 SESSION_STATES = ["running", "waiting_user", "finished", "closed"]
@@ -63,10 +103,15 @@ CREATE TABLE IF NOT EXISTS sessions (
   agent TEXT NOT NULL,
   workspace_id TEXT,
   pane_id TEXT,
-  claude_session_id TEXT,
+  claude_session_id TEXT,  -- the agent CLI's own session id, whichever runtime
   pr_url TEXT,
   status TEXT NOT NULL DEFAULT 'running',
   external INTEGER NOT NULL DEFAULT 0,
+  runtime TEXT NOT NULL DEFAULT 'claude',
+  model TEXT,
+  effort TEXT,
+  brief TEXT,
+  credits REAL,  -- Copilot AI credits used, as last read from the session's footer
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -96,7 +141,7 @@ def now():
 
 def require_profile():
     if not (PROFILE_DIR / "profile.md").exists():
-        die(f"no profile at {PROFILE_DIR}. Start `claude` in {ZED_HOME} to run onboarding, "
+        die(f"no profile at {PROFILE_DIR}. Start `claude` or `copilot` in {ZED_HOME} to run onboarding, "
             "or set ZED_PROFILE_DIR.")
 
 
@@ -107,8 +152,11 @@ def db():
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(sessions)")]
-    if "external" not in cols:  # migrate DBs created before session adoption existed
-        conn.execute("ALTER TABLE sessions ADD COLUMN external INTEGER NOT NULL DEFAULT 0")
+    # migrate DBs created before these columns existed
+    for col, decl in [("external", "INTEGER NOT NULL DEFAULT 0"), ("runtime", "TEXT NOT NULL DEFAULT 'claude'"),
+                      ("model", "TEXT"), ("effort", "TEXT"), ("brief", "TEXT"), ("credits", "REAL")]:
+        if col not in cols:
+            conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
     return conn
 
 
@@ -126,16 +174,39 @@ def run(cmd, check=True, cwd=None):
 
 # ---------------------------------------------------------------- lock
 
+def ancestor_pids():
+    pids, pid = [], os.getppid()
+    while pid > 1 and len(pids) < 50:
+        pids.append(pid)
+        r = run(["ps", "-o", "ppid=", "-p", str(pid)], check=False)
+        pid = int(r.stdout.strip() or 0)
+    return pids
+
+
 def me():
-    """Identity of the Claude session running this command (falls back to the parent shell)."""
-    return {"pane": os.environ.get("HERDR_PANE_ID"),
-            "claude_session": os.environ.get("CLAUDE_CODE_SESSION_ID"),
-            "pid": int(os.environ.get("CLAUDE_PID") or os.getppid())}
+    """Identity of the agent session running this command (falls back to the parent shell).
+    Env vars are inherited, so when both runtimes' vars are set, the nearest ancestor process wins."""
+    found = {name: int(os.environ[rt["pid_env"]]) for name, rt in RUNTIMES.items()
+             if os.environ.get(rt["pid_env"], "").isdigit()}
+    runtime = None
+    if len(found) > 1:
+        order = ancestor_pids()
+        runtime = min(found, key=lambda n: order.index(found[n]) if found[n] in order else len(order))
+    elif found:
+        runtime = next(iter(found))
+    rt = RUNTIMES.get(runtime, {})
+    return {"pane": os.environ.get("HERDR_PANE_ID"), "runtime": runtime,
+            "agent_session": os.environ.get(rt["session_env"]) if rt else None,
+            "pid": found.get(runtime) or os.getppid()}
+
+
+def session_of(h):
+    return h.get("agent_session") or h.get("claude_session")  # claude_session: locks written before runtimes
 
 
 def same_holder(a, b):
-    if a.get("claude_session") and b.get("claude_session"):
-        return a["claude_session"] == b["claude_session"]
+    if session_of(a) and session_of(b):
+        return session_of(a) == session_of(b)
     return a.get("pid") == b.get("pid")
 
 
@@ -151,9 +222,9 @@ def holder_alive(h):
         r = run(["herdr", "pane", "get", h["pane"]], check=False)
         if "pane_not_found" in r.stdout + r.stderr:
             return False
-        if r.returncode == 0 and h.get("claude_session"):
+        if r.returncode == 0 and session_of(h):
             session = (json.loads(r.stdout)["result"]["pane"].get("agent_session") or {}).get("value")
-            if session and session != h["claude_session"]:
+            if session and session != session_of(h):
                 return False
     return True
 
@@ -171,7 +242,7 @@ def holds_lock():
 
 
 def describe(h):
-    return (f"pane {h.get('pane') or '-'}, Claude session {h.get('claude_session') or '-'}, "
+    return (f"pane {h.get('pane') or '-'}, {h.get('runtime') or 'claude'} session {session_of(h) or '-'}, "
             f"pid {h.get('pid')}, since {h.get('acquired_at')}")
 
 
@@ -226,6 +297,212 @@ def herdr_json(args):
     if r.returncode != 0:
         die(f"herdr {' '.join(args)} failed:\n{r.stderr or r.stdout}")
     return json.loads(r.stdout)
+
+
+# ---------------------------------------------------------------- runtimes
+
+def runtime_config():
+    """The profile's runtimes.json; a profile without one is Claude-only (as before runtimes existed)."""
+    if not RUNTIMES_PATH.exists():
+        return {"order": ["claude"], "runtimes": {"claude": {"enabled": True}}}
+    return json.loads(RUNTIMES_PATH.read_text())
+
+
+def runtime_settings(name):
+    return runtime_config().get("runtimes", {}).get(name, {})
+
+
+def read_json(path, default):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return default
+    except json.JSONDecodeError as e:
+        die(f"invalid JSON in {path}: {e}")
+
+
+def runtime_state():
+    return read_json(RUNTIME_STATE_PATH, {})
+
+
+def runtime_report(name):
+    """installed / enabled / limited for one runtime, as a dict."""
+    if name not in RUNTIMES:
+        die(f"unknown runtime '{name}'. Known: {', '.join(RUNTIMES)}")
+    cfg = runtime_config()
+    return {"runtime": name, "installed": bool(shutil.which(RUNTIMES[name]["cli"])),
+            "enabled": name in cfg.get("order", []) and cfg.get("runtimes", {}).get(name, {}).get("enabled", True),
+            "limited": runtime_state().get(name)}
+
+
+def choose_runtime(requested="auto", exclude=()):
+    """The runtime to start a session on: the one asked for, or the first usable one in the profile's order."""
+    if requested and requested != "auto":
+        rep = runtime_report(requested)
+        if not (rep["installed"] and rep["enabled"]) or rep["limited"]:
+            die(f"runtime '{requested}' is not usable here: {rep}")
+        return requested
+    order = [r for r in runtime_config().get("order", []) if r not in exclude]
+    for name in order:
+        rep = runtime_report(name)
+        if rep["installed"] and rep["enabled"] and not rep["limited"]:
+            return name
+    die("no runtime available: " + "; ".join(json.dumps(runtime_report(n)) for n in order)
+        + ". Wait for a limit to reset, or `bin/zed runtime ok <runtime>` if it already has.")
+
+
+def cmd_runtime(args):
+    """runtime status | runtime limited <rt> [until=<when>] [note...] | runtime ok <rt>"""
+    sub = args[0] if args else "status"
+    require_profile()
+    if sub == "status":
+        for name in RUNTIMES:
+            rep = runtime_report(name)
+            model, effort, why = pick_model(name)
+            print(json.dumps(rep | {"model": model, "effort": effort, "model_choice": why}))
+        print("order: " + " → ".join(runtime_config().get("order", [])))
+        return
+    if len(args) < 2:
+        die("runtime limited <runtime> [until=<when>] [note...] | runtime ok <runtime>")
+    name = args[1]
+    runtime_report(name)
+    conn = db()
+    require_lock()
+    state = runtime_state()
+    if sub == "limited":
+        until = next((a[6:] for a in args[2:] if a.startswith("until=")), None)
+        note = " ".join(a for a in args[2:] if not a.startswith("until="))
+        state[name] = {"since": now(), "until": until, "note": note}
+        log_event(conn, None, "runtime", f"{name} limited" + (f" until {until}" if until else "") + (f": {note}" if note else ""))
+    elif sub == "ok":
+        state.pop(name, None)
+        log_event(conn, None, "runtime", f"{name} available again")
+    else:
+        die(f"unknown runtime subcommand {sub}")
+    RUNTIME_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    RUNTIME_STATE_PATH.write_text(json.dumps(state, indent=2) + "\n")
+    conn.commit()
+    write_status(conn)
+    print(json.dumps(runtime_report(name)))
+
+
+# ---------------------------------------------------------------- models
+
+def norm_model(name):
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def available_models(runtime):
+    """Model ids this runtime accepts, as {normalised: id}. The profile may pin a list per runtime."""
+    pinned = runtime_settings(runtime).get("models")
+    if pinned is not None:
+        return {norm_model(m): m for m in pinned}
+    if runtime == "copilot":  # `copilot help config` lists the models this account can use
+        if not shutil.which("copilot"):
+            return {}
+        text = run(["copilot", "help", "config"], check=False).stdout
+        section = text.split("`model`", 1)[1].split("\n\n", 1)[0] if "`model`" in text else ""
+        return {norm_model(m): m for m in re.findall(r'-\s+"([^"]+)"', section)}
+    if runtime == "claude":  # Claude Code has no listing; it accepts any Claude model's full name
+        return None
+    return {}
+
+
+def runtime_model_id(runtime, model, available):
+    if available is None:  # claude: Anthropic model ids use dashes (claude-opus-5-5)
+        return model.replace(".", "-") if norm_model(model).startswith("claude") else None
+    return available.get(norm_model(model))
+
+
+def model_ranking():
+    return read_json(MODEL_RANKING_PATH, None)
+
+
+def pick_model(runtime):
+    """(model, effort, reason) for a new session on `runtime`, per the profile's model policy.
+    model/effort None = let the CLI use its own default."""
+    rs = runtime_settings(runtime)
+    if rs.get("model"):  # an explicit choice in the profile always wins
+        return rs["model"], rs.get("effort"), "fixed in runtimes.json"
+    policy = runtime_config().get("model_policy", {"method": "default"})
+    method = policy.get("method", "default")
+    if method == "default":
+        return None, None, "CLI default (model_policy.method=default)"
+    if method != "attractive-quadrant":
+        die(f"unknown model_policy.method '{method}' (default | attractive-quadrant)")
+    ranking = model_ranking()
+    if not ranking or not ranking.get("entries"):
+        return None, None, f"CLI default: no model ranking yet ({MODEL_RANKING_PATH.name}; see the `models` skill)"
+    age = (datetime.now() - datetime.strptime(ranking["imported_at"][:10], "%Y-%m-%d")).days
+    stale = f"; ranking is {age} days old, refresh it (`models` skill)" if age > policy.get("max_age_days", 14) else ""
+    entries = [e for e in ranking["entries"] if e.get("intelligence") is not None and e.get("cost_per_task") is not None]
+    available = available_models(runtime)
+    offered = [(runtime_model_id(runtime, e["model"], available), e) for e in entries]
+    offered = [(mid, e) for mid, e in offered if mid]
+    if not offered:
+        return None, None, f"CLI default: no ranked model is offered by {runtime}{stale}"
+
+    def quadrant(population):
+        # The "most attractive quadrant" of Intelligence vs Cost per task: at least the median intelligence
+        # and at most the median cost of `population`. The most intelligent offered model there (cheaper on ties).
+        mid_i = statistics.median(e["intelligence"] for e in population)
+        mid_c = statistics.median(e["cost_per_task"] for e in population)
+        inside = [(mid, e) for mid, e in offered if e["intelligence"] >= mid_i and e["cost_per_task"] <= mid_c]
+        best = max(inside, key=lambda c: (c[1]["intelligence"], -c[1]["cost_per_task"]), default=None)
+        return best, f"medians {mid_i:g}/{mid_c:g}"
+
+    best, medians = quadrant(entries)
+    scope = "all ranked models"
+    if not best:  # none of this runtime's models is in the overall quadrant: use its own models' quadrant
+        best, medians = quadrant([e for _, e in offered])
+        scope = f"{runtime}'s own models (none in the overall quadrant)"
+    if not best:  # still empty: the cheapest of its models with at least their median intelligence
+        mid_i = statistics.median(e["intelligence"] for _, e in offered)
+        best = min(((m, e) for m, e in offered if e["intelligence"] >= mid_i),
+                   key=lambda c: (c[1]["cost_per_task"], -c[1]["intelligence"]))
+        scope, medians = f"{runtime}'s own models (empty quadrant), cheapest at or above", f"median intelligence {mid_i:g}"
+    mid, e = best
+    effort = e.get("effort") if e.get("effort") in RUNTIMES[runtime]["efforts"] else None
+    return mid, effort, (f"{e.get('name', e['model'])}: intelligence {e['intelligence']}, cost/task {e['cost_per_task']} "
+                         f"(quadrant of {scope}, {medians}; ranking of {ranking['imported_at'][:10]}){stale}")
+
+
+def cmd_models(args):
+    """models show | models import <ranking.json>"""
+    sub = args[0] if args else "show"
+    require_profile()
+    if sub == "show":
+        r = model_ranking()
+        print(f"ranking: {MODEL_RANKING_PATH} " + (f"({len(r.get('entries', []))} entries, imported {r.get('imported_at')}, "
+                                                  f"source: {r.get('source')})" if r else "(none)"))
+        print("policy: " + json.dumps(runtime_config().get("model_policy", {"method": "default"})))
+        for name in runtime_config().get("order", []):
+            print(f"{name}: " + json.dumps(dict(zip(("model", "effort", "reason"), pick_model(name)))))
+    elif sub == "import":
+        if len(args) < 2:
+            die("models import <ranking.json>")
+        require_lock()
+        data = json.loads(Path(args[1]).read_text())
+        for e in data.get("entries", []):
+            missing = [k for k in ("model", "intelligence", "cost_per_task") if k not in e]
+            if missing:
+                die(f"ranking entry {e} lacks {missing}")
+            if not isinstance(e["model"], str) or not e["model"].strip():
+                die("ranking entries need a non-empty model id")
+            for k in ("intelligence", "cost_per_task"):
+                if (type(e[k]) not in (int, float) or not math.isfinite(e[k]) or e[k] < 0):
+                    die(f"ranking entry {e['model']} needs a finite, non-negative number for {k}")
+            if e.get("effort") and not any(e["effort"] in rt["efforts"] for rt in RUNTIMES.values()):
+                die(f"unknown reasoning effort '{e['effort']}' for {e['model']}")
+        if not data.get("entries"):
+            die("ranking has no entries")
+        data["imported_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        MODEL_RANKING_PATH.parent.mkdir(parents=True, exist_ok=True)
+        MODEL_RANKING_PATH.write_text(json.dumps(data, indent=2) + "\n")
+        print(f"imported {len(data['entries'])} entries")
+        cmd_models(["show"])
+    else:
+        die("models show | models import <ranking.json>")
 
 
 def projects():
@@ -316,6 +593,9 @@ def render_status(conn, live=None):
                f"- status: **{t['status']}** · worktype: {t['worktype'] or '-'} · updated {t['updated_at']}"]
         if t["description"]:
             out.append(f"- {t['description']}")
+        credits = conn.execute("SELECT SUM(credits) FROM sessions WHERE task_id=?", (t["id"],)).fetchone()[0]
+        if credits is not None:
+            out.append(f"- Copilot AI credits used: {credits:g}")
         for s in conn.execute("SELECT * FROM sessions WHERE task_id=? ORDER BY id", (t["id"],)):
             state = s["status"]
             if s["status"] in ("running", "waiting_user") and s["pane_id"]:
@@ -323,7 +603,9 @@ def render_status(conn, live=None):
                 state += f" / agent {a['agent_status']}" if a else " / agent NOT FOUND"
             pr = f" · PR {s['pr_url']}" if s["pr_url"] else ""
             ext = " (external)" if s["external"] else ""
-            out.append(f"- S{s['id']}{ext} `{s['agent']}` {s['repo']} `{s['branch']}` ← `{s['base']}` · {state}{pr}")
+            rt = f" · {s['runtime']}" + (f" {s['model']}" if s["model"] else "") + (f" ({s['effort']})" if s["effort"] else "")
+            credits = f" · {s['credits']:g} AI credits" if s["credits"] is not None else ""
+            out.append(f"- S{s['id']}{ext} `{s['agent']}` {s['repo']} `{s['branch']}` ← `{s['base']}` · {state}{rt}{credits}{pr}")
         last = conn.execute("SELECT * FROM events WHERE task_id=? ORDER BY id DESC LIMIT 3", (t["id"],)).fetchall()
         for e in reversed(last):
             out.append(f"  - {e['ts']} [{e['kind']}] {e['text']}")
@@ -351,7 +633,9 @@ def render_status(conn, live=None):
         lines.append("- None.")
     for t in done:
         prs = [s["pr_url"] for s in conn.execute("SELECT pr_url FROM sessions WHERE task_id=? AND pr_url IS NOT NULL", (t["id"],))]
+        credits = conn.execute("SELECT SUM(credits) FROM sessions WHERE task_id=?", (t["id"],)).fetchone()[0]
         lines.append(f"- T{t['id']} {t['jira'] or ''} {t['title']} — {t['status']} {t['updated_at']}"
+                     + (f" · {credits:g} Copilot AI credits" if credits is not None else "")
                      + (f" — {', '.join(prs)}" if prs else ""))
     lines.append("")
     return "\n".join(lines)
@@ -499,13 +783,85 @@ def worker_rules():
     text = text.replace("{{ZED_HOME}}", str(ZED_HOME)).replace("{{PROFILE}}", str(PROFILE_DIR))
     GENERATED_WORKER_RULES.parent.mkdir(parents=True, exist_ok=True)
     GENERATED_WORKER_RULES.write_text(text)
+    # Copilot has no system-prompt flag; it loads *.instructions.md from COPILOT_CUSTOM_INSTRUCTIONS_DIRS.
+    COPILOT_INSTRUCTIONS_DIR.mkdir(parents=True, exist_ok=True)
+    (COPILOT_INSTRUCTIONS_DIR / "zed-worker.instructions.md").write_text(text)
     return GENERATED_WORKER_RULES
 
 
-def cmd_spawn(args):
-    """spawn <task-id> repo=<repo> base=<branch> branch=<branch> brief=<path> [name=<agent>]"""
+def runtime_launch(runtime, agent, model, effort):
+    """(env for the herdr workspace, CLI arguments) to start a worker on `runtime`."""
+    rules = worker_rules()
+    model_args = (["--model", model] if model else [])
+    if runtime == "claude":
+        return [], ["--permission-mode", "auto", "-n", agent, "--append-system-prompt-file", str(rules),
+                    *model_args, *(["--effort", effort] if effort else [])]
+    rs = runtime_settings("copilot")
+    # Interactive mode, never autopilot: in autopilot Copilot answers its own questions with a guess.
+    # --experimental: needed for Assisted Permissions (selected after start, see set_copilot_permissions).
+    # --add-dir: Copilot limits file access to the worktree; workers read their brief and knowledge
+    # in the profile and use Zed's tools (e.g. bin/bb).
+    return [f"COPILOT_CUSTOM_INSTRUCTIONS_DIRS={COPILOT_INSTRUCTIONS_DIR}"], [
+        "--mode", "interactive", "--experimental", "-n", agent, "--add-dir", str(PROFILE_DIR), "--add-dir", str(ZED_HOME),
+        *model_args,
+        *(["--reasoning-effort", effort] if effort else []),
+        *[f"--allow-tool={a}" for a in rs.get("allow_tools", [])],
+        *[f"--deny-tool={d}" for d in rs.get("deny_tools", [])]]
+
+
+def set_copilot_permissions(agent):
+    """Switch a fresh Copilot session to the profile's permission mode via its /permissions dialog
+    (Assisted can't be chosen by flag in interactive mode). Returns an error string, or None."""
+    mode = runtime_settings("copilot").get("permission_mode", "assisted")
+    labels = {"manual": "Manual Approval", "assisted": "Assisted Permissions", "allow-all": "Allow All"}
+    if mode not in labels:
+        return f"unknown copilot permission_mode '{mode}' ({', '.join(labels)})"
+    r = run(["herdr", "agent", "prompt", agent, "/permissions"], check=False)
+    if r.returncode:
+        return f"could not open /permissions: {r.stderr or r.stdout}"
+    for _ in range(30):
+        screen = read_screen(agent)
+        if all(label in screen for label in labels.values()):
+            break
+        time.sleep(0.2)
+    else:
+        return "the /permissions menu did not appear"
+    r = run(["herdr", "agent", "send-keys", agent, PERMISSION_MODE_MENU[mode]], check=False)
+    if r.returncode:
+        return f"could not select {labels[mode]}: {r.stderr or r.stdout}"
+    for _ in range(30):
+        screen = read_screen(agent)
+        # The menu itself contains every label; only accept the selected mode in the footer.
+        footer = "\n".join(screen.strip().splitlines()[-4:])
+        if labels[mode] in footer and not all(label in screen for label in labels.values()):
+            return None
+        time.sleep(0.2)
+    return f"could not switch to {labels[mode]}; footer: {footer!r}"
+
+
+def prompt_worker(agent, text):
+    before = herdr_json(["agent", "get", agent])["result"]["agent"].get("completion_seq", 0)
+    r = run(["herdr", "agent", "prompt", agent, text,
+             "--wait", "--until", "working", "--until", "blocked", "--timeout", "30000"], check=False)
+    if r.returncode == 0:
+        return True, ""
+    if "agent_prompt_stalled" in r.stderr:
+        # Herdr's five-second activity gate can expire before Copilot starts its first turn.
+        # Observe activity/completion without ever submitting the same brief a second time.
+        for _ in range(40):
+            a = herdr_json(["agent", "get", agent])["result"]["agent"]
+            if a["agent_status"] in ("working", "blocked") or (a.get("completion_seq") or 0) > (before or 0):
+                return True, ""
+            time.sleep(0.25)
+    return False, r.stderr or r.stdout
+
+
+def cmd_spawn(args, worktree=None):
+    """spawn <task-id> repo=<repo> base=<branch> branch=<branch> brief=<path> [name=<agent>]
+    [runtime=auto|claude|copilot] [model=] [effort=] [handoff=<note>]"""
     if not args:
-        die("spawn <task-id> repo=... base=... branch=... brief=<file> [name=...]")
+        die("spawn <task-id> repo=... base=... branch=... brief=<file> [name=...] [runtime=auto|claude|copilot] "
+            "[model=] [effort=] [from=] [handoff=<note>]")
     tid = int(args[0].lstrip("T"))
     kv = parse_kv(args[1:])
     for k in ("repo", "base", "branch", "brief"):
@@ -519,16 +875,30 @@ def cmd_spawn(args):
     brief = Path(kv["brief"]).resolve()
     if not brief.exists():
         die(f"brief not found: {brief}")
+    runtime = choose_runtime(kv.get("runtime", "auto"))
+    model, effort, model_why = pick_model(runtime)
+    if "model" in kv:  # the policy's effort belongs to the policy's model
+        model, effort, model_why = kv["model"], kv.get("effort"), "given to spawn"
+    elif "effort" in kv:
+        effort, model_why = kv["effort"], model_why + "; effort given to spawn"
+    if effort and effort not in RUNTIMES[runtime]["efforts"]:
+        die(f"invalid effort '{effort}' for {runtime}: {RUNTIMES[runtime]['efforts']}")
+    if runtime == "copilot" and runtime_settings(runtime).get("permission_mode", "assisted") not in PERMISSION_MODE_MENU:
+        die("copilot permission_mode must be manual, assisted or allow-all")
 
     agent = kv.get("name") or f"t{tid}-{slugify(kv['repo'], 12)}"
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", agent):
         die(f"bad agent name '{agent}'")
     wt_root = expand(projects()["worktree_root"])
-    worktree = wt_root / kv["repo"] / slugify(kv["branch"].split("/")[-1], 60)
+    reuse_worktree = worktree is not None
+    if reuse_worktree and not worktree.is_dir():
+        die(f"handoff worktree is missing: {worktree}")
+    worktree = worktree or wt_root / kv["repo"] / slugify(kv["branch"].split("/")[-1], 60)
 
     # 1. worktree (projects with "worktrees": false, e.g. plain doc folders, run in place)
     if p.get("worktrees") is False:
-        worktree = repo_path
+        if not reuse_worktree:
+            worktree = repo_path
     elif worktree.exists():
         print(f"reusing existing worktree {worktree}")
     else:
@@ -542,45 +912,65 @@ def cmd_spawn(args):
             run(["git", "-C", str(repo_path), "worktree", "add", "-b", kv["branch"], str(worktree), start])
         # Don't let the new branch track the base branch; worker pushes with -u.
         run(["git", "-C", str(worktree), "branch", "--unset-upstream"], check=False)
+    if p.get("worktrees") is not False:
+        actual = run(["git", "-C", str(worktree), "branch", "--show-current"]).stdout.strip()
+        if actual != kv["branch"]:
+            die(f"worktree {worktree} is on '{actual}', not '{kv['branch']}'; left untouched")
 
-    # 2. herdr workspace + claude
+    # 2. herdr workspace + agent CLI
+    require_lock()
+    env, cli_args = runtime_launch(runtime, agent, model, effort)
     label = f"T{tid} {t['jira'] or ''} {kv['repo']}".strip()
-    ws = herdr_json(["workspace", "create", "--cwd", str(worktree), "--label", label, "--no-focus"])["result"]
+    ws = herdr_json(["workspace", "create", "--cwd", str(worktree), "--label", label, "--no-focus",
+                     *[a for e in env for a in ("--env", e)]])["result"]
     ws_id, pane_id = ws["workspace"]["workspace_id"], ws["root_pane"]["pane_id"]
     time.sleep(1.5)  # let the shell reach its prompt
-    claude_args = ["--permission-mode", "auto", "-n", agent,
-                   "--append-system-prompt-file", str(worker_rules())]
-    r = run(["herdr", "agent", "start", agent, "--kind", "claude", "--pane", pane_id, "--timeout", "60000",
-             "--", *claude_args], check=False)
+    r = run(["herdr", "agent", "start", agent, "--kind", runtime, "--pane", pane_id, "--timeout", "60000",
+             "--", *cli_args], check=False)
     if r.returncode != 0 and "agent_not_ready" in r.stderr:
-        # A fresh worktree triggers Claude Code's folder-trust dialog. Zed created this worktree
+        # A fresh worktree triggers the CLI's folder-trust dialog. Zed created this worktree
         # from a configured repo, so accept it; anything else stays blocked for Zed to inspect.
         screen = run(["herdr", "agent", "read", agent, "--source", "visible"], check=False).stdout
-        if "Yes, I trust this folder" in screen:  # the pane was opened with cwd=worktree
-            run(["herdr", "agent", "send-keys", agent, "down", "enter"], check=False)
+        if RUNTIMES[runtime]["trust_prompt"] in screen:  # the pane was opened with cwd=worktree
+            run(["herdr", "agent", "send-keys", agent, *RUNTIMES[runtime]["trust_keys"]], check=False)
             r = run(["herdr", "agent", "wait", agent, "--until", "idle", "--timeout", "60000"], check=False)
+    perm_error = set_copilot_permissions(agent) if runtime == "copilot" and r.returncode == 0 else None
     ts = now()
     cur = conn.execute(
-        "INSERT INTO sessions(task_id,repo,base,branch,worktree,agent,workspace_id,pane_id,status,created_at,updated_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (tid, kv["repo"], kv["base"], kv["branch"], str(worktree), agent, ws_id, pane_id, "running", ts, ts))
+        "INSERT INTO sessions(task_id,repo,base,branch,worktree,agent,workspace_id,pane_id,status,runtime,model,effort,"
+        "brief,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (tid, kv["repo"], kv["base"], kv["branch"], str(worktree), agent, ws_id, pane_id, "running",
+         runtime, model, effort, str(brief), ts, ts))
     sid = cur.lastrowid
     conn.execute("UPDATE tasks SET status='active' WHERE id=? AND status IN ('intake','parked')", (tid,))
-    log_event(conn, tid, "spawn", f"S{sid} {agent} on {kv['repo']} {kv['branch']} ← {kv['base']} ({worktree})")
+    log_event(conn, tid, "spawn", f"S{sid} {agent} on {kv['repo']} {kv['branch']} ← {kv['base']} ({worktree}); "
+              f"{runtime} model {model or 'default'} effort {effort or 'default'} ({model_why})")
     touch_task(conn, tid)
     conn.commit()
     write_status(conn)
     if r.returncode != 0:
         die(f"S{sid}: agent start did not report ready (pane {pane_id}). Inspect with: herdr agent read {agent}\n{r.stderr}")
+    if perm_error:
+        die(f"S{sid}: {perm_error}. The worker hasn't been given its brief; inspect with: herdr agent read {agent}")
 
     # 3. hand over the brief
-    pr = run(["herdr", "agent", "prompt", agent,
-              f"You are session S{sid} for Zed task T{tid}. Zed's home is {ZED_HOME}; "
-              f"the user's profile is {PROFILE_DIR}. Read your brief at {brief}, then "
-              f"{PROFILE_DIR}/knowledge/repos/{kv['repo']}.md if it exists. Then start.",
-              "--wait", "--until", "working", "--until", "blocked", "--timeout", "30000"], check=False)
+    require_lock()
+    text = (f"You are the engineering worker, NOT the Zed coordinator, for session S{sid} / task T{tid}. "
+            f"Do not onboard, acquire the coordinator lock, or change the coordinator's task database. "
+            f"Zed's home is {ZED_HOME}; the user's profile is {PROFILE_DIR}. "
+            f"Read your worker rules at {GENERATED_WORKER_RULES} and your brief at {brief}, then "
+            f"{PROFILE_DIR}/knowledge/repos/{kv['repo']}.md if it exists. ")
+    if kv.get("handoff"):
+        text += (f"You are taking over from an earlier session that stopped (see the handoff note at "
+                 f"{Path(kv['handoff']).resolve()}): read it, check the worktree's git state, and continue "
+                 f"from where it stopped; don't redo finished work. ")
+    prompt_ok, prompt_error = prompt_worker(agent, text + "Then start.")
     print(json.dumps({"task": f"T{tid}", "session": f"S{sid}", "agent": agent, "pane": pane_id,
-                      "workspace": ws_id, "worktree": str(worktree), "prompt_ok": pr.returncode == 0}))
+                      "workspace": ws_id, "worktree": str(worktree), "runtime": runtime, "model": model,
+                      "effort": effort, "model_choice": model_why, "prompt_ok": prompt_ok}))
+    if not prompt_ok:
+        die(f"S{sid}: brief submission did not report activity; inspect before retrying:\n{prompt_error}")
+    return sid
 
 
 def cmd_session(args):
@@ -592,7 +982,7 @@ def cmd_session(args):
         require_lock()
         s = resolve_session(conn, rest[0].lstrip("S") if rest[0].startswith("S") and rest[0][1:].isdigit() else rest[0])
         for k, v in parse_kv(rest[1:]).items():
-            if k not in ("status", "pr_url", "claude_session_id", "pane_id", "workspace_id", "base"):
+            if k not in ("status", "pr_url", "claude_session_id", "pane_id", "workspace_id", "base", "brief"):
                 die(f"cannot set '{k}' on a session")
             if k == "status" and v not in SESSION_STATES:
                 die(f"status must be one of {SESSION_STATES}")
@@ -604,7 +994,7 @@ def cmd_session(args):
         for s in conn.execute("SELECT * FROM sessions WHERE status!='closed' ORDER BY id"):
             a = live.get(s["pane_id"])
             print(f"S{s['id']:<3} T{s['task_id']:<3} {s['agent']:<20} {s['status']:<13} "
-                  f"agent={a['agent_status'] if a else 'GONE':<8} {s['repo']} {s['branch']}")
+                  f"agent={a['agent_status'] if a else 'GONE':<8} {s['runtime']:<8} {s['repo']} {s['branch']}")
     else:
         die(f"unknown session subcommand {sub}")
     conn.commit()
@@ -637,8 +1027,9 @@ def cmd_close(args):
         if (dirty or unpushed.returncode != 0 or unpushed.stdout.strip()) and "force" not in args:
             die(f"S{s['id']} worktree has uncommitted or unpushed work:\n{dirty}\n{unpushed.stdout}{unpushed.stderr}\n"
                 "Resolve it first, or pass 'keep-worktree' / 'force'.")
+    record_credits(conn, s)
     if s["workspace_id"]:
-        run(["herdr", "workspace", "close", s["workspace_id"]], check=False)
+        run(["herdr", "workspace", "close", s["workspace_id"]])
     if "keep-worktree" not in args and wt.exists():
         repo_path = expand(project(s["repo"])["path"])
         run(["git", "-C", str(repo_path), "worktree", "remove", *(["--force"] if "force" in args else []), str(wt)])
@@ -651,7 +1042,7 @@ def cmd_close(args):
 
 
 def cmd_adopt(args):
-    """adopt <pane-id> <task-id> [repo=] — track a Claude session Zed didn't start. Never closed by Zed."""
+    """adopt <pane-id> <task-id> [repo=] — track an agent session Zed didn't start. Never closed by Zed."""
     if len(args) < 2:
         die("adopt <pane-id> <task-id> [repo=<name>]")
     pane_id, tid = args[0], int(args[1].lstrip("T"))
@@ -666,10 +1057,10 @@ def cmd_adopt(args):
     branch = run(["git", "-C", cwd, "branch", "--show-current"], check=False).stdout.strip() or "-"
     ts = now()
     cur = conn.execute(
-        "INSERT INTO sessions(task_id,repo,base,branch,worktree,agent,workspace_id,pane_id,claude_session_id,status,external,created_at,updated_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?)",
+        "INSERT INTO sessions(task_id,repo,base,branch,worktree,agent,workspace_id,pane_id,claude_session_id,status,external,"
+        "runtime,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?,?)",
         (tid, kv.get("repo", Path(cwd).name), "-", branch, cwd, a.get("name") or pane_id, a["workspace_id"], pane_id,
-         (a.get("agent_session") or {}).get("value"), "running", ts, ts))
+         (a.get("agent_session") or {}).get("value"), "running", a.get("agent") or "claude", ts, ts))
     log_event(conn, tid, "adopt", f"S{cur.lastrowid} adopted external session in {pane_id} ({cwd})")
     conn.execute("UPDATE tasks SET status='active' WHERE id=? AND status='intake'", (tid,))
     touch_task(conn, tid)
@@ -678,38 +1069,146 @@ def cmd_adopt(args):
     print(f"S{cur.lastrowid}")
 
 
+def cmd_handoff(args):
+    """handoff <S|agent> [runtime=auto|claude|copilot] [brief=<file>] [model=] [effort=] — move a stopped worker (e.g. one paused
+    by a usage limit) to a new session on another runtime, in the same worktree and branch. Only with the user's OK."""
+    if not args:
+        die("handoff <S|agent> [runtime=auto|claude|copilot] [brief=<file>]")
+    conn = db()
+    require_lock()
+    ref = args[0][1:] if args[0].startswith("S") and args[0][1:].isdigit() else args[0]
+    s = resolve_session(conn, ref)
+    kv = parse_kv(args[1:])
+    if s["external"] or s["status"] == "closed":
+        die(f"S{s['id']} is {'external' if s['external'] else 'closed'}; handoff is for running sessions Zed started")
+    brief = kv.get("brief") or s["brief"] or str(PROFILE_DIR / "briefs" / f"T{s['task_id']}-{s['repo']}.md")
+    if not Path(brief).exists():
+        die(f"brief not found: {brief}; pass brief=<file>")
+    target = choose_runtime(kv.get("runtime", "auto"), exclude=(s["runtime"],))
+    if target == s["runtime"]:
+        die("handoff needs a different runtime")
+    wt = s["worktree"]
+    if not s["workspace_id"]:
+        die("handoff needs the old worker's managed workspace so it can be stopped safely")
+    if not Path(wt).is_dir():
+        die(f"handoff worktree is missing: {wt}")
+    if project(s["repo"]).get("worktrees") is not False:
+        actual = run(["git", "-C", wt, "branch", "--show-current"]).stdout.strip()
+        if actual != s["branch"]:
+            die(f"handoff worktree is on '{actual}', not '{s['branch']}'; left untouched")
+
+    def git(*a):
+        r = run(["git", "-C", wt, *a], check=False)
+        return (r.stdout + r.stderr).strip() or "(nothing)"
+
+    screen = run(["herdr", "agent", "read", s["agent"], "--source", "recent-unwrapped", "--lines", "150"], check=False)
+    qs = conn.execute("SELECT * FROM questions WHERE session_id=? ORDER BY id", (s["id"],)).fetchall()
+    note = PROFILE_DIR / "briefs" / f"T{s['task_id']}-{s['repo']}-handoff-S{s['id']}.md"
+    note.write_text("\n".join([
+        f"# Handoff from S{s['id']} ({s['runtime']}) — T{s['task_id']} {s['repo']}", "",
+        f"Written by Zed on {now()}. S{s['id']} stopped before finishing (state: {s['status']}); "
+        f"{runtime_state().get(s['runtime'], {}).get('note') or 'see its last output below'}.",
+        f"Brief: {brief}", f"Worktree: {wt}", f"Branch: {s['branch']} (base {s['base']})", "",
+        "## Git state", "", "```", f"$ git status --short", git("status", "--short"), "",
+        f"$ git log --oneline origin/{s['base']}..HEAD", git("log", "--oneline", f"origin/{s['base']}..HEAD"), "",
+        "$ git diff --stat HEAD", git("diff", "--stat", "HEAD"), "```", "",
+        "## Questions and answers so far", "",
+        *([f"- Q{q['id']} [{q['status']}] {q['question']}" + (f"\n  → {q['answer']}" if q["answer"] else "") for q in qs]
+          or ["- None."]), "",
+        "## Last output of the previous session", "", "```",
+        (screen.stdout.strip() if screen.returncode == 0 else f"(could not read it: {screen.stderr.strip()})"), "```", ""]))
+    # Stop the old session so it doesn't resume on its own (e.g. after a limit resets) and race the new one.
+    record_credits(conn, s)
+    require_lock()
+    if s["workspace_id"]:
+        run(["herdr", "workspace", "close", s["workspace_id"]])
+    conn.execute("UPDATE sessions SET status='closed', updated_at=? WHERE id=?", (now(), s["id"]))
+    log_event(conn, s["task_id"], "handoff", f"S{s['id']} ({s['runtime']}) closed, worktree kept; handing over to {target} ({note})")
+    conn.commit()
+    conn.close()
+    return cmd_spawn([str(s["task_id"]), f"repo={s['repo']}", f"base={s['base']}", f"branch={s['branch']}",
+                      f"brief={brief}", f"runtime={target}", f"handoff={note}", f"name={s['agent']}",
+                      *[f"{k}={kv[k]}" for k in ("model", "effort") if k in kv]], worktree=Path(wt))
+
+
+def read_screen(agent):
+    return run(["herdr", "agent", "read", agent, "--source", "visible"], check=False).stdout
+
+
+def limit_line(runtime, screen, last=25):
+    """The line near the bottom of the screen that looks like the runtime's usage-limit message, if any."""
+    for line in reversed(screen.strip().splitlines()[-last:]):
+        if any(re.search(p, line, re.I) for p in RUNTIMES.get(runtime, {}).get("limit_patterns", [])):
+            return line.strip(" │┃●")
+    return None
+
+
+def record_credits(conn, s, screen=None):
+    """Store the AI credits a Copilot session has used so far (its footer: "Session: 4.2 AIC used")."""
+    pattern = RUNTIMES.get(s["runtime"], {}).get("credits_pattern")
+    if not pattern or s["external"]:
+        return
+    m = re.findall(pattern, screen if screen is not None else read_screen(s["agent"]))
+    if m:
+        conn.execute("UPDATE sessions SET credits=? WHERE id=?", (float(m[-1]), s["id"]))
+
+
 def cmd_watch(args):
     """Emit one line whenever a managed worker changes to a state that needs Zed's attention.
-    Meant to be run under Claude Code's Monitor tool. Exits when this session loses the Zed lock."""
-    interval = float(args[0]) if args else 3.0
+    Claude Code: run it under the Monitor tool. Copilot CLI: run `watch --once` as a detached shell; it
+    exits after the first event(s), which wakes Zed, and remembers what it has reported so a re-armed
+    watch only reports new changes. Exits (3) when this session loses the Zed lock."""
+    once = "--once" in args
+    rest = [a for a in args if a != "--once"]
+    interval = float(rest[0]) if rest else 3.0
     db().close()
     require_lock()
-    prev = {}
-    first = True
+    saved = read_json(WATCH_STATE_PATH, None) if once else None
+    prev = {int(k): v for k, v in saved.items()} if saved is not None else {}
+    first = saved is None
     while True:
         if not holds_lock():
             h = read_lock()
             print("LOCK LOST: " + (f"another session took over as Zed ({describe(h)})" if h else "the Zed lock was released")
                   + ". Stop acting as Zed: no watcher, relaying or commits; read-only from now on.", flush=True)
             sys.exit(3)
+        events = []
         try:
             conn = db()
             sessions = conn.execute("SELECT * FROM sessions WHERE status IN ('running','waiting_user')").fetchall()
-            conn.close()
             live = live_agents()
             for s in sessions:
                 a = live.get(s["pane_id"])
                 state = a["agent_status"] if a else "gone"
                 key = s["id"]
-                if prev.get(key) != state:
+                snapshot = {"state": state, "sequence": a.get("state_change_seq") if a else None}
+                if prev.get(key) != snapshot:
+                    line = None
                     if not first and state in ("idle", "done", "blocked", "unknown", "gone"):
-                        print(f"S{s['id']} T{s['task_id']} {s['agent']} → {state}", flush=True)
-                    elif first and state in ("blocked", "gone"):
-                        print(f"S{s['id']} T{s['task_id']} {s['agent']} is {state} (at watch start)", flush=True)
-                    prev[key] = state
+                        line = f"S{s['id']} T{s['task_id']} {s['agent']} → {state}"
+                    elif first and state in ("idle", "done", "blocked", "gone"):
+                        line = f"S{s['id']} T{s['task_id']} {s['agent']} is {state} (at watch start)"
+                    if line and state != "gone":
+                        screen = read_screen(s["agent"])
+                        record_credits(conn, s, screen)
+                        hit = limit_line(s["runtime"], screen)
+                        if hit:
+                            line += f" · possible {s['runtime']} usage limit: {hit}"
+                    if line:
+                        events.append(line)
+                    prev[key] = snapshot
             first = False
+            conn.commit()
+            conn.close()
         except Exception as e:  # keep the watch alive through transient failures
             print(f"watch error: {e}", file=sys.stderr, flush=True)
+        for line in events:
+            print(line, flush=True)
+        if once:
+            WATCH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            WATCH_STATE_PATH.write_text(json.dumps(prev))
+            if events:
+                return
         time.sleep(interval)
 
 
@@ -718,7 +1217,8 @@ def cmd_paths(args):
     print(json.dumps({"home": str(ZED_HOME), "profile": str(PROFILE_DIR),
                       "profile_exists": (PROFILE_DIR / "profile.md").exists(),
                       "db": str(DB_PATH), "status": str(STATUS_PATH), "projects": str(PROJECTS_PATH),
-                      "briefs": str(PROFILE_DIR / "briefs")}, indent=2))
+                      "briefs": str(PROFILE_DIR / "briefs"), "runtimes": str(RUNTIMES_PATH),
+                      "model_ranking": str(MODEL_RANKING_PATH)}, indent=2))
 
 
 def cmd_status(args):
@@ -738,10 +1238,20 @@ def cmd_help(args):
   log <T|-> <text...> [kind=note]
   q add <T|-> <question...> [session=S] | q answer <Q> <answer...> | q list
   spawn <T> repo= base= branch= brief=<file> [name=<agent>] [from=<start-ref, default origin/<base>>]
-  session list | session set <S|agent> key=value... (status pr_url claude_session_id pane_id workspace_id base)
+        [runtime=auto|claude|copilot] [model=] [effort=] [handoff=<note>]
+                                     runtime/model/effort default to the profile's order and model policy
+  session list | session set <S|agent> key=value... (status pr_url claude_session_id pane_id workspace_id base brief)
   close <S|agent> [keep-worktree] [force]   (external sessions are only untracked)
   adopt <pane-id> <T> [repo=]        track a session Zed didn't start (user's own)
-  watch [interval-seconds]           (run under Monitor)
+  handoff <S|agent> [runtime=] [brief=] [model=] [effort=]
+                                     move a stopped worker to another runtime, same worktree
+                                     (writes a handoff note, closes the old session, spawns the new one)
+  runtime status | runtime limited <rt> [until=<when>] [note...] | runtime ok <rt>
+                                     which runtimes are usable; mark one limited / available again
+  models show | models import <ranking.json>
+                                     the model ranking and what the policy picks per runtime
+  watch [interval-seconds] [--once]  Claude: run under Monitor. Copilot: run `watch --once` as a
+                                     detached shell; it exits after the first event(s)
   status                             (regenerate + print STATUS.md)
   paths                              (Zed home, profile dir, DB/STATUS/config/briefs locations)
   lock status | lock acquire [--take-over] | lock release
@@ -752,7 +1262,8 @@ Session states: """ + ", ".join(SESSION_STATES))
 
 
 COMMANDS = {"task": cmd_task, "log": cmd_log, "q": cmd_q, "spawn": cmd_spawn, "session": cmd_session,
-            "close": cmd_close, "adopt": cmd_adopt, "watch": cmd_watch, "status": cmd_status, "paths": cmd_paths, "lock": cmd_lock, "help": cmd_help}
+            "close": cmd_close, "adopt": cmd_adopt, "handoff": cmd_handoff, "watch": cmd_watch, "status": cmd_status,
+            "paths": cmd_paths, "lock": cmd_lock, "runtime": cmd_runtime, "models": cmd_models, "help": cmd_help}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:

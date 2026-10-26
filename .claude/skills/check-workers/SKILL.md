@@ -18,9 +18,14 @@ description: Inspect worker sessions after a watcher event or when the user asks
    - `ZED:BLOCKED` → `bin/zed q add` describing what's needed; ask the user.
    - herdr state `blocked` (approval/permission UI) → read the screen, describe exactly what it
      wants to do, ask the user. Answer with `herdr agent send-keys` only after the user decides.
+     (Copilot workers ask through such dialogs whenever their permission reviewer isn't sure.)
+   - The event says `possible <runtime> usage limit: …`, or the screen shows the CLI's limit
+     message → `switch-runtime` skill.
    - No marker and idle → the worker paused without following protocol. Prompt it:
      "Continue, or end with ZED:QUESTION / ZED:DONE / ZED:BLOCKED." Don't bother the user.
    - `GONE` → find out (pane closed? crash?), tell the user, propose resuming with a new
      session on the same branch.
    - `ZED:DONE` with a PR but no real QA in its `QA:` line → send it back to QA first (CLAUDE.md, directive 6).
+   Copilot sessions also record their AI credits used (`bin/zed status` shows them per session
+   and per task); mention them when you report a Copilot task as done.
 4. Commit the profile if anything changed.
