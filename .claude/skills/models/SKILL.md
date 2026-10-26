@@ -17,6 +17,8 @@ Every `spawn` picks a model and effort per the profile's `config/runtimes.json` 
 - `spawn ... model= effort=` overrides it for one session, only when the user asks.
 
 `bin/zed models show` prints the ranking's age and what each runtime would get, with the reason.
+Optional `model_policy.max_effort` (e.g. `"high"`) caps the reasoning effort the ranking picks, to
+save tokens; `spawn ... effort=` still overrides it for a single session.
 
 ## Refresh the ranking
 When it's missing or older than `model_policy.max_age_days`:

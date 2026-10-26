@@ -462,9 +462,13 @@ def pick_model(runtime):
                    key=lambda c: (c[1]["cost_per_task"], -c[1]["intelligence"]))
         scope, medians = f"{runtime}'s own models (empty quadrant), cheapest at or above", f"median intelligence {mid_i:g}"
     mid, e = best
-    effort = e.get("effort") if e.get("effort") in RUNTIMES[runtime]["efforts"] else None
+    efforts = RUNTIMES[runtime]["efforts"]
+    effort = e.get("effort") if e.get("effort") in efforts else None
+    cap, capped = policy.get("max_effort"), ""
+    if effort and cap in efforts and efforts.index(effort) > efforts.index(cap):
+        effort, capped = cap, f"; effort capped at {cap} (model_policy.max_effort)"
     return mid, effort, (f"{e.get('name', e['model'])}: intelligence {e['intelligence']}, cost/task {e['cost_per_task']} "
-                         f"(quadrant of {scope}, {medians}; ranking of {ranking['imported_at'][:10]}){stale}")
+                         f"(quadrant of {scope}, {medians}; ranking of {ranking['imported_at'][:10]}){stale}{capped}")
 
 
 def cmd_models(args):
