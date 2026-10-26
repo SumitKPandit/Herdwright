@@ -99,3 +99,10 @@ Facts about a particular user or their work never go here (they go to the profil
   approval, read the screen again until the agent is `working` and no prompt is showing, before
   re-arming. Read each prompt before answering; never send a blind "don't ask again" or Down+Enter.
   While a worker is blocked, check `bin/zed session list` for `agent=blocked` on every turn.
+- **A replacement worker should resume the work, not rebuild the setup.** **Why:** on a long
+  multi-unit task, each new session spent its first stretch re-reading the earlier session's state
+  and rewriting the pipeline docs and tools, so a full day produced 3 of 76 units. **How:** in the
+  handoff or the first prompt, say: trust the recorded state; change tooling only when a run fails;
+  start producing within a fixed time; scripts for mechanical steps, model calls only for judgment;
+  report throughput early and progress per unit. Check the first progress report, and step in if
+  the worker is still changing its setup.
