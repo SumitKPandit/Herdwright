@@ -794,8 +794,9 @@ def runtime_launch(runtime, agent, model, effort):
     rules = worker_rules()
     model_args = (["--model", model] if model else [])
     if runtime == "claude":
+        # --add-dir: workers read their brief, rules and knowledge from the profile outside their worktree.
         return [], ["--permission-mode", "auto", "-n", agent, "--append-system-prompt-file", str(rules),
-                    *model_args, *(["--effort", effort] if effort else [])]
+                    "--add-dir", str(PROFILE_DIR), *model_args, *(["--effort", effort] if effort else [])]
     rs = runtime_settings("copilot")
     # Interactive mode, never autopilot: in autopilot Copilot answers its own questions with a guess.
     # --experimental: needed for Assisted Permissions (selected after start, see set_copilot_permissions).
