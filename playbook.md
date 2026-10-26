@@ -82,3 +82,7 @@ Facts about a particular user or their work never go here (they go to the profil
   Keep health polling inside the background process. Scheduled chat prompts are visible turns
   in the user's conversation, not a silent watchdog; do not substitute them without explicit
   consent. Monitoring must stop when the coordinator loses the role or tracked work ends.
+- **Use native usage reports for Copilot AI-credit totals.** **Why:** raw session telemetry
+  (`total_nano_aiu`) is not interchangeable with the CLI's displayed AI Credits. **How:** capture
+  the completed session's `/usage`, record that total and its provenance, and label any interim
+  telemetry separately instead of converting it into a claimed billed-credit figure.
