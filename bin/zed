@@ -1700,6 +1700,21 @@ def prompt_summary(screen):
     return " | ".join(keep)[:600]
 
 
+TOOLING_DIRS = {".git", "tools", "bin", "node_modules", ".venv", "venv", "__pycache__", ".ext"}
+
+
+def output_files_since(worktree, since):
+    """How many files in the worktree changed after `since` (epoch), ignoring tooling, so work products
+    count as progress and re-tooling doesn't."""
+    if not worktree or not Path(worktree).is_dir():
+        return 0
+    n = 0
+    for root, dirs, files in os.walk(worktree):
+        dirs[:] = [d for d in dirs if d not in TOOLING_DIRS]
+        n += sum(1 for f in files if "BRIEF" not in f and os.path.getmtime(os.path.join(root, f)) > since)
+    return n
+
+
 AUTO_APPROVE_PATH = PROFILE_DIR / "config" / "auto-approve.json"
 
 
@@ -1755,12 +1770,14 @@ def health_events(conn, s, a, state, alerts):
         if u:
             step = u["output"] // USAGE_ALERT_OUTPUT
             if step > seen.setdefault("usage_step", 0):
-                done = sum(plan_progress(p)[0] for p in plan_files(s["task_id"]))
-                if done <= seen.get("usage_plan_done", -1):  # tokens spent with no plan progress: needs judgment
-                    out.append(f"{tag} · USAGE without plan progress: {fmt_usage(u)}, still {done} steps done")
+                done = sum(len(re.findall(r"^\s*- \[[xX]\]", p.read_text(), re.M)) for p in plan_files(s["task_id"]))
+                since = seen.get("usage_at", 0)
+                wrote = output_files_since(s["worktree"], since)
+                if done <= seen.get("usage_plan_done", -1) and not wrote:  # tokens spent, nothing produced: needs judgment
+                    out.append(f"{tag} · USAGE without progress: {fmt_usage(u)}, still {done} plan steps, no new output files")
                 else:
-                    log_event(conn, s["task_id"], "auto", f"S{s['id']} usage {fmt_usage(u)}; {done} plan steps done")
-                seen["usage_step"], seen["usage_plan_done"] = step, done
+                    log_event(conn, s["task_id"], "auto", f"S{s['id']} usage {fmt_usage(u)}; {done} plan steps; {wrote} output files changed")
+                seen["usage_step"], seen["usage_plan_done"], seen["usage_at"] = step, done, time.time()
     return out
 
 
