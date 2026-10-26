@@ -228,7 +228,7 @@ class ZedTests(unittest.TestCase):
         conn.execute("INSERT INTO tasks(title,created_at,updated_at) VALUES ('QA','now','now')")
         conn.execute("INSERT INTO sessions(task_id,repo,base,branch,worktree,agent,workspace_id,pane_id,runtime,"
                      "brief,created_at,updated_at) VALUES (1,'scratch','main','feature/qa',?,'qa','qa-ws','qa:p1',"
-                     "'claude',?,'now','now')", (str(self.root), str(self.root / "profile.md")))
+                     "'claude',?,'2000-01-01 00:00','2000-01-01 00:00')", (str(self.root), str(self.root / "profile.md")))
         conn.commit()
         return conn
 
