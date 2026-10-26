@@ -1804,7 +1804,8 @@ def health_events(conn, s, a, state, alerts):
         last = max([started] + [datetime.fromtimestamp(p.stat().st_mtime) for p in plans])
         idle = int((now - last).total_seconds() // 60)
         what = "no plan file yet" if not plans else "no plan progress"
-        if idle >= STALL_MINUTES and seen.get("stall") != last.isoformat():
+        producing = idle >= STALL_MINUTES and output_files_since(s["worktree"], time.time() - STALL_MINUTES * 60) > 0
+        if idle >= STALL_MINUTES and not producing and seen.get("stall") != last.isoformat():
             seen["stall"] = last.isoformat()
             out.append(f"{tag} · STALL: {what} for {idle} min while working (check for re-tooling or repeated work)")
     if state == "blocked":
