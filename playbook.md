@@ -22,3 +22,9 @@ Facts about a particular user or their work never go here (they go to the profil
 - **Keep core and profile changes in separate commits.** **Why:** `bin/zed-core-sync` can only
   carry commits that touch nothing under `profile/` to `main`. **How:** stage by path
   (`git add profile/` vs. everything else) and commit twice when a change spans both.
+- **Sleep (macOS):** each Claude Code session runs `caffeinate -i` while it's working, so idle
+  sleep is already prevented whenever any worker (or Zed) is mid-turn. Closing the lid, choosing
+  Sleep, or a flat battery still sleeps the machine; everything pauses and resumes on wake, but
+  in-flight API calls may fail — after a wake, run `check-workers` and nudge any worker that
+  stopped on an error. To survive lid-close, the Mac must be on power with an external display
+  (clamshell) — don't change system power settings without the user's OK.
