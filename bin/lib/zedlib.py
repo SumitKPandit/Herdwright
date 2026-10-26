@@ -1,6 +1,6 @@
 """Shared helpers for the bin/zed-<name> scripts (ported from firstmate's fm-timeout-lib, fm-line-cap-lib).
 
-Scripts add this folder to sys.path (see `import_zedlib` in each script) and import what they need.
+Each script puts this folder on sys.path itself and imports what it needs.
 Nothing here touches the task DB for writing; the scripts are read-only unless they say otherwise.
 """
 import json
@@ -8,7 +8,6 @@ import os
 import re
 import sqlite3
 import subprocess
-import sys
 from pathlib import Path
 
 ZED_HOME = Path(__file__).resolve().parent.parent.parent
@@ -108,7 +107,3 @@ def parse_plan_steps(text):
                       "text": body, "line": m.group(0)})
     return steps
 
-
-def import_zedlib(script_file):
-    """Used by scripts: make `import zedlib` work wherever the script is invoked from (symlinks included)."""
-    sys.path.insert(0, str(Path(script_file).resolve().parent / "lib"))

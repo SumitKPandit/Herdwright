@@ -20,7 +20,7 @@ class PrTests(unittest.TestCase):
     def test_parse_url(self):
         self.assertEqual(pr.parse_url("https://github.com/o/r/pull/7/files"), ("github", "o/r", 7))
         self.assertEqual(pr.parse_url("https://bitbucket.org/ws/s/pull-requests/3"), ("bitbucket", "ws/s", 3))
-        with self.assertRaises(pr.LookupError_):
+        with self.assertRaises(pr.PrLookupError):
             pr.parse_url("https://example.com/x")
 
     def test_github_check_summary(self):
@@ -79,10 +79,10 @@ class PrTests(unittest.TestCase):
         self.assertEqual((code, naps), (3, [10, 10]))
 
     def test_wait_survives_transient_errors_but_not_three(self):
-        err = pr.LookupError_("504")
+        err = pr.PrLookupError("504")
         code, _, _ = self.run_wait([err, make()])
         self.assertEqual(code, 0)
-        with self.assertRaises(pr.LookupError_):
+        with self.assertRaises(pr.PrLookupError):
             self.run_wait([err, err, err])
 
     def test_ready_problems(self):

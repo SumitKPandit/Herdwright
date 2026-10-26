@@ -18,7 +18,6 @@ Flags: pane-gone, worktree-missing, wrong-branch, on-protected-branch, finished-
 lost), closed-with-worktree, no-plan (running >10 min), pr-merged, pr-closed.
 """
 import argparse
-import json
 import re
 import sys
 import time

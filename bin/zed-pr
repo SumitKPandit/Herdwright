@@ -39,7 +39,7 @@ GH_URL = re.compile(r"^https://github\.com/([^/]+/[^/]+)/pull/(\d+)")
 BB_URL = re.compile(r"^https://bitbucket\.org/([^/]+/[^/]+)/pull-requests/(\d+)")
 
 
-class LookupError_(Exception):
+class PrLookupError(Exception):
     pass
 
 
@@ -48,7 +48,7 @@ def parse_url(url):
         m = rx.match(url)
         if m:
             return forge, m.group(1), int(m.group(2))
-    raise LookupError_(f"not a GitHub or Bitbucket PR URL: {url}")
+    raise PrLookupError(f"not a GitHub or Bitbucket PR URL: {url}")
 
 
 def summarize_github_checks(rollup):
@@ -78,7 +78,7 @@ def fetch_github(url, repo, number):
     fields = "state,isDraft,title,baseRefName,headRefOid,mergeable,reviewDecision,statusCheckRollup,reviewRequests,latestReviews,author"
     r = zedlib.run_bounded(["gh", "pr", "view", url, "--json", fields], timeout=60)
     if not r.ok:
-        raise LookupError_(f"gh pr view failed: {(r.stderr or r.stdout).strip()[:300]}")
+        raise PrLookupError(f"gh pr view failed: {(r.stderr or r.stdout).strip()[:300]}")
     j = json.loads(r.stdout)
     requested = [(x.get("login") or x.get("slug") or "").lower() for x in j.get("reviewRequests") or []]
     reviewed = [(x.get("author") or {}).get("login", "").lower() for x in j.get("latestReviews") or []]
@@ -96,7 +96,7 @@ def fetch_bitbucket(url, repo, number):
         pr = bb.call("GET", f"/repositories/{repo}/pullrequests/{number}")
         st = bb.call("GET", f"/repositories/{repo}/pullrequests/{number}/statuses?pagelen=50")
     except SystemExit as e:  # bb.die() exits; keep the script's own error path
-        raise LookupError_("bin/bb request failed (run `bin/bb check`)") from e
+        raise PrLookupError("bin/bb request failed (run `bin/bb check`)") from e
     failing, pending, passing = [], [], 0
     for s in st.get("values", []):
         if s.get("state") == "SUCCESSFUL":
@@ -169,7 +169,7 @@ def cmd_wait(a, fetcher=fetch, sleep=time.sleep, clock=time.monotonic):
         try:
             pr = fetcher(a.url)
             errors = 0
-        except LookupError_:
+        except PrLookupError:
             errors += 1  # a transient forge error (e.g. HTTP 504) must not end a long wait
             if errors >= 3:
                 raise
@@ -255,7 +255,7 @@ def main(argv=None):
     a = build_parser().parse_args(argv)
     try:
         return {"state": cmd_state, "wait": cmd_wait, "ready-check": cmd_ready}[a.cmd](a)
-    except LookupError_ as e:
+    except PrLookupError as e:
         print(f"zed-pr: {e}", file=sys.stderr)
         return 2
 

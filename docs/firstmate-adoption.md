@@ -36,10 +36,25 @@ Ranked by model turns saved per day. Savings are **estimates** from reading the 
 
 `bin/lib/zedlib.py` (profile paths, bounded run, line cap, git/herdr wrappers) is built first because every capability shares it.
 
-## Not built here, and what to wire
+## Not built here
 
 - **S21 owns:** watcher/routine events, wake queue with ack, Stop hook, `zed start`, brief scaffolding, `max_running`, effort by kind, triage, quota estimate, spend ledger, status file, context ceiling, landed-work test, PR polling. Rows marked `S21` below are *covered* by those.
-- **Wiring after merge** is listed per capability in the final report (e.g. `check-workers` calls `zed-crew state`, worker rules call `zed-pr wait`).
+
+## Wiring (Zed's step, after S21's branch merges)
+
+Each script has `--help`, a test in `tests/`, and works without `bin/zed` changes. Run tests from `tests/`, e.g. `python3 -m unittest test_zed_pr`.
+
+| Script | Wire it into | How |
+|---|---|---|
+| `zed-pr` | worker rules, `check-workers` | worker rules: *wait on CI with `bin/zed-pr wait <url>` (one command), never sleep-then-check*; `check-workers` / `relay`: `bin/zed-pr state <url>` instead of reading the PR by hand; before accepting a PR as ready: `bin/zed-pr ready-check <url>`. S21's PR polling can shell out to `zed-pr state --json` |
+| `zed-crew` | `check-workers`, session start | `bin/zed-crew state` replaces the screen read + git commands; `bin/zed-crew reconcile` in `zed start`; `peek` when facts are not enough |
+| `zed-plan` | `bin/zed spawn` / `check-workers` | spawn (or the first worker event) runs `zed-plan lint T<id>`; the watcher's STALL check can use `zed-plan progress` (overrun = 2x estimate) |
+| `zed-guard` | `bin/zed spawn` | after creating the worktree: `bin/zed-guard install <worktree> --repo <repo> --base <base> (--jira <ID> \| --no-commit-format)`; `zed-guard audit` in `zed start` |
+| `zed-hygiene` | wrap-up skill, session start | `bin/zed-hygiene report [--fetch]` at wrap-up; `--apply` only with the user's OK (it fast-forwards clones) |
+| `zed-hostload` | `bin/zed spawn` | refuse/queue a spawn on exit 2, warn on exit 1 |
+| `zed-pretool` | `.claude/settings.json` | `hooks.PreToolUse` matcher `*` running `bin/zed-pretool` (it only acts in the session that holds the lock); needs the user's OK, see the report's questions |
+| `zed-update` | session start | `bin/zed-update check` prints core commits waiting; `apply` merges them |
+| `zed-export` | wrap-up / cron | `bin/zed-export export profile/db/backup.json` |
 
 ## Every script
 
