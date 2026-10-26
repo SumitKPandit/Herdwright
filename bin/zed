@@ -1172,15 +1172,16 @@ def cmd_handoff(args):
     require_lock()
     ref = args[0][1:] if args[0].startswith("S") and args[0][1:].isdigit() else args[0]
     s = resolve_session(conn, ref)
-    kv = parse_kv(args[1:])
+    kv = parse_kv([a for a in args[1:] if a != "restart"])
     if s["external"] or s["status"] == "closed":
         die(f"S{s['id']} is {'external' if s['external'] else 'closed'}; handoff is for running sessions Zed started")
     brief = kv.get("brief") or s["brief"] or str(PROFILE_DIR / "briefs" / f"T{s['task_id']}-{s['repo']}.md")
     if not Path(brief).exists():
         die(f"brief not found: {brief}; pass brief=<file>")
-    target = choose_runtime(kv.get("runtime", "auto"), exclude=(s["runtime"],))
-    if target == s["runtime"]:
-        die("handoff needs a different runtime")
+    restart = "restart" in args[1:]  # same runtime, fresh session (e.g. to apply a new model/effort ceiling)
+    target = s["runtime"] if restart else choose_runtime(kv.get("runtime", "auto"), exclude=(s["runtime"],))
+    if target == s["runtime"] and not restart:
+        die("handoff needs a different runtime (or `restart` for a fresh session on the same one)")
     wt = s["worktree"]
     if not s["workspace_id"]:
         die("handoff needs the old worker's managed workspace so it can be stopped safely")
@@ -1372,7 +1373,7 @@ def cmd_help(args):
   session list | session set <S|agent> key=value... (status pr_url claude_session_id pane_id workspace_id base brief)
   close <S|agent> [keep-worktree] [force]   (external sessions are only untracked)
   adopt <pane-id> <T> [repo=]        track a session Zed didn't start (user's own)
-  handoff <S|agent> [runtime=] [brief=] [model=] [effort=]
+  handoff <S|agent> [runtime=] [brief=] [model=] [effort=] [restart]
                                      move a stopped worker to another runtime, same worktree
                                      (writes a handoff note, closes the old session, spawns the new one)
   runtime status | runtime limited <rt> [until=<when>] [note...] | runtime ok <rt>
