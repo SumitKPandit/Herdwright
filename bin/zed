@@ -49,6 +49,7 @@ RUNTIMES_PATH = PROFILE_DIR / "config" / "runtimes.json"
 MODEL_RANKING_PATH = PROFILE_DIR / "config" / "model-ranking.json"
 RUNTIME_STATE_PATH = PROFILE_DIR / ".cache" / "runtime-state.json"
 WATCH_STATE_PATH = PROFILE_DIR / ".cache" / "watch-state.json"
+SPEND_LEDGER_PATH = PROFILE_DIR / "db" / "spend.jsonl"
 WATCHER_PID_PATH = PROFILE_DIR / ".cache" / "watch.pid"
 COPILOT_INSTRUCTIONS_DIR = PROFILE_DIR / ".cache" / "copilot-instructions"
 
@@ -773,12 +774,57 @@ def fmt_usage(u):
             f"{u['cache_read'] / 1e6:.0f}M cache-read tokens")
 
 
+def task_plan_progress(task_id):
+    done = todo = 0
+    for plan in plan_files(task_id):
+        d, t = plan_progress(plan)
+        done, todo = done + d, todo + t
+    return done, done + todo
+
+
+def spend_rows():
+    try:
+        return [json.loads(l) for l in SPEND_LEDGER_PATH.read_text().splitlines() if l.strip()]
+    except FileNotFoundError:
+        return []
+
+
+def record_spend(conn, s):
+    """Append what a session cost (tokens or Copilot credits), how long it ran and how far its plan got to the
+    spend ledger (db/spend.jsonl), when it is closed or handed over."""
+    if s["external"]:
+        return
+    usage = claude_usage(s["worktree"], s["claude_session_id"]) if s["runtime"] == "claude" else None
+    done, total = task_plan_progress(s["task_id"])
+    started = datetime.strptime(s["created_at"], "%Y-%m-%d %H:%M")
+    row = {"ts": now(), "session": s["id"], "task": s["task_id"], "repo": s["repo"], "runtime": s["runtime"],
+           "model": s["model"], "effort": s["effort"], "minutes": int((datetime.now() - started).total_seconds() // 60),
+           "tokens": usage, "credits": s["credits"], "plan_done": done, "plan_total": total}
+    SPEND_LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with SPEND_LEDGER_PATH.open("a") as f:
+        f.write(json.dumps(row) + "\n")
+
+
+def spend_line(task_id, rows):
+    """Spend against plan progress for a task, from its closed sessions' ledger rows."""
+    mine = [r for r in rows if r["task"] == task_id]
+    if not mine:
+        return None
+    out = sum((r["tokens"] or {}).get("output", 0) for r in mine)
+    credits = sum(r["credits"] or 0 for r in mine)
+    done, total = task_plan_progress(task_id)
+    spend = ", ".join(x for x in (f"{out / 1e6:.2f}M output tokens" if out else "", f"{credits:g} AI credits" if credits else "") if x) or "no usage recorded"
+    return (f"- spend (closed sessions): {spend}, {sum(r['minutes'] for r in mine)} min, plan {done}/{total} steps"
+            + (f" (~{out / done / 1e3:.0f}k output tokens per step done)" if out and done else ""))
+
+
 def plan_files(task_id):
     return sorted((PROFILE_DIR / "briefs").glob(f"T{task_id}-*-plan.md"))
 
 
 def render_status(conn, live=None):
     live = live if live is not None else live_agents()
+    ledger = spend_rows()
     lines = ["# Zed status", "", f"_Generated {now()} from the task DB (`bin/zed status`). Do not edit by hand._", ""]
 
     open_q = conn.execute(
@@ -818,6 +864,8 @@ def render_status(conn, live=None):
         for plan in plan_files(t["id"]):
             done, todo = plan_progress(plan)
             out.append(f"- plan `{plan.name}`: {done}/{done + todo} steps done")
+        if line := spend_line(t["id"], ledger):
+            out.append(line)
         last = conn.execute("SELECT * FROM events WHERE task_id=? ORDER BY id DESC LIMIT 3", (t["id"],)).fetchall()
         for e in reversed(last):
             out.append(f"  - {e['ts']} [{e['kind']}] {e['text']}")
@@ -1322,6 +1370,7 @@ def cmd_close(args):
             die(f"S{s['id']} worktree has uncommitted or unpushed work:\n{dirty}\n{unpushed.stdout}{unpushed.stderr}\n"
                 "Resolve it first, or pass 'keep-worktree' / 'force'.")
     record_credits(conn, s)
+    record_spend(conn, s)
     if s["workspace_id"]:
         close_workspace(s["workspace_id"])
     if "keep-worktree" not in args and wt.exists():
@@ -1414,6 +1463,7 @@ def cmd_handoff(args):
         (screen.stdout.strip() if screen.returncode == 0 else f"(could not read it: {screen.stderr.strip()})"), "```", ""]))
     # Stop the old session so it doesn't resume on its own (e.g. after a limit resets) and race the new one.
     record_credits(conn, s)
+    record_spend(conn, s)
     require_lock()
     if s["workspace_id"]:
         close_workspace(s["workspace_id"])

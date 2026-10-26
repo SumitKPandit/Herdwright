@@ -514,6 +514,25 @@ class ZedTests(unittest.TestCase):
             self.z.cmd_quota([])
         self.assertIn("no quota.threshold_tokens set", self.output.getvalue())
 
+    def test_close_appends_to_the_spend_ledger_and_status_shows_spend_against_plan(self):
+        conn = self.session()
+        s = conn.execute("SELECT * FROM sessions").fetchone()
+        (self.root / "briefs").mkdir(exist_ok=True)
+        (self.root / "briefs" / "T1-scratch-plan.md").write_text("- [x] a\n- [x] b\n- [ ] c\n")
+        usage = {"output": 400_000, "input": 10, "cache_read": 5, "cache_write": 7}
+        with patch.object(self.z, "claude_usage", return_value=usage):
+            self.z.record_spend(conn, s)
+            rows = self.z.spend_rows()
+            self.assertEqual((rows[0]["session"], rows[0]["plan_done"], rows[0]["plan_total"]), (1, 2, 3))
+            self.assertEqual(rows[0]["tokens"]["output"], 400_000)
+            status = self.z.render_status(conn, live={})
+        self.assertIn("spend (closed sessions): 0.40M output tokens", status)
+        self.assertIn("plan 2/3 steps", status)
+        self.assertIn("200k output tokens per step", status)
+        conn.execute("UPDATE sessions SET external=1")
+        self.z.record_spend(conn, conn.execute("SELECT * FROM sessions").fetchone())
+        self.assertEqual(len(self.z.spend_rows()), 1)  # external sessions aren't ours to account
+
 
 if __name__ == "__main__":
     unittest.main()
