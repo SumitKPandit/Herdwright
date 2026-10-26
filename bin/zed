@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """zed — Zed's task tracker and herdr session driver.
 
-Everything Zed knows about ongoing work lives in db/zed.db (SQLite).
-STATUS.md is regenerated from it on every write.
+Everything Zed knows about ongoing work lives in the user's profile: <profile>/db/zed.db (SQLite),
+and <profile>/STATUS.md is regenerated from it on every write. The profile is `profile/` in Zed's
+home, or $ZED_PROFILE_DIR if set (e.g. a throwaway profile for testing).
 
 Concepts
   task     a unit of work the user asked for (usually one Jira ticket)
@@ -10,8 +11,13 @@ Concepts
   question something a worker (or Zed) needs the user to decide
   event    timestamped log line attached to a task (or global if no task)
 
+One active Zed per profile: the Claude session that holds the profile's lock
+(<profile>/.cache/zed.lock) is Zed. Other sessions get read-only access (status, list, show);
+mutating commands and `watch` refuse. See `zed lock`.
+
 Run `zed help` for commands.
 """
+import fcntl
 import json
 import os
 import re
@@ -23,11 +29,14 @@ from datetime import datetime
 from pathlib import Path
 
 ZED_HOME = Path(__file__).resolve().parent.parent
-DB_PATH = ZED_HOME / "db" / "zed.db"
-STATUS_PATH = ZED_HOME / "STATUS.md"
-PROJECTS_PATH = ZED_HOME / "config" / "projects.json"
-BRIEFS_DIR = ZED_HOME / "briefs"
-WORKER_RULES = ZED_HOME / "templates" / "worker-rules.md"
+PROFILE_DIR = Path(os.environ.get("ZED_PROFILE_DIR") or ZED_HOME / "profile").expanduser().resolve()
+DB_PATH = PROFILE_DIR / "db" / "zed.db"
+STATUS_PATH = PROFILE_DIR / "STATUS.md"
+PROJECTS_PATH = PROFILE_DIR / "config" / "projects.json"
+CORE_WORKER_RULES = ZED_HOME / "templates" / "worker-rules.md"
+PROFILE_RULES = PROFILE_DIR / "rules.md"
+GENERATED_WORKER_RULES = PROFILE_DIR / ".cache" / "worker-rules.md"
+LOCK_PATH = PROFILE_DIR / ".cache" / "zed.lock"
 
 TASK_STATES = ["intake", "active", "waiting_user", "in_review", "pr_open", "parked", "done", "cancelled"]
 SESSION_STATES = ["running", "waiting_user", "finished", "closed"]
@@ -85,9 +94,16 @@ def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
+def require_profile():
+    if not (PROFILE_DIR / "profile.md").exists():
+        die(f"no profile at {PROFILE_DIR}. Start `claude` in {ZED_HOME} to run onboarding, "
+            "or set ZED_PROFILE_DIR.")
+
+
 def db():
+    require_profile()
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)  # waits up to 10s if another process is writing
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(sessions)")]
@@ -108,6 +124,103 @@ def run(cmd, check=True, cwd=None):
     return r
 
 
+# ---------------------------------------------------------------- lock
+
+def me():
+    """Identity of the Claude session running this command (falls back to the parent shell)."""
+    return {"pane": os.environ.get("HERDR_PANE_ID"),
+            "claude_session": os.environ.get("CLAUDE_CODE_SESSION_ID"),
+            "pid": int(os.environ.get("CLAUDE_PID") or os.getppid())}
+
+
+def same_holder(a, b):
+    if a.get("claude_session") and b.get("claude_session"):
+        return a["claude_session"] == b["claude_session"]
+    return a.get("pid") == b.get("pid")
+
+
+def holder_alive(h):
+    """False once the holder's process is gone, or its herdr pane is gone or runs another session."""
+    try:
+        os.kill(h["pid"], 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    if h.get("pane"):
+        r = run(["herdr", "pane", "get", h["pane"]], check=False)
+        if "pane_not_found" in r.stdout + r.stderr:
+            return False
+        if r.returncode == 0 and h.get("claude_session"):
+            session = (json.loads(r.stdout)["result"]["pane"].get("agent_session") or {}).get("value")
+            if session and session != h["claude_session"]:
+                return False
+    return True
+
+
+def read_lock():
+    try:
+        return json.loads(LOCK_PATH.read_text())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def holds_lock():
+    h = read_lock()
+    return bool(h) and same_holder(h, me())
+
+
+def describe(h):
+    return (f"pane {h.get('pane') or '-'}, Claude session {h.get('claude_session') or '-'}, "
+            f"pid {h.get('pid')}, since {h.get('acquired_at')}")
+
+
+def require_lock():
+    if holds_lock():
+        return
+    h = read_lock()
+    if h and holder_alive(h):
+        die(f"another session is acting as Zed for this profile ({describe(h)}). This session is "
+            "read-only: status/list/show work; to become Zed run `bin/zed lock acquire --take-over`.")
+    die("this session doesn't hold the Zed lock for this profile; run `bin/zed lock acquire` first.")
+
+
+def cmd_lock(args):
+    """lock status | lock acquire [--take-over] | lock release"""
+    sub = args[0] if args else "status"
+    require_profile()
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOCK_PATH.with_suffix(".guard"), "w") as guard:
+        fcntl.flock(guard, fcntl.LOCK_EX)  # serialise read-modify-write of the lock file
+        h, caller = read_lock(), me()
+        alive = bool(h) and holder_alive(h)
+        if h and not alive and not same_holder(h, caller):
+            LOCK_PATH.unlink(missing_ok=True)
+            print(f"cleared stale lock ({describe(h)})")
+            h = None
+        if sub == "status":
+            print(json.dumps({"holder": h, "holder_alive": alive if h else None,
+                              "you_hold_it": bool(h) and same_holder(h, caller), "you": caller}, indent=2))
+        elif sub == "acquire":
+            if h and not same_holder(h, caller) and "--take-over" not in args:
+                print(f"zed: the lock is held by a live session ({describe(h)}). Choose: stay read-only, "
+                      "or `bin/zed lock acquire --take-over` (its watcher will exit and it must step down).",
+                      file=sys.stderr)
+                sys.exit(2)
+            if h and same_holder(h, caller):
+                print("you already hold the lock")
+                return
+            LOCK_PATH.write_text(json.dumps(caller | {"acquired_at": now()}, indent=2) + "\n")
+            print("took over the lock from " + describe(h) if h else "acquired the lock")
+        elif sub == "release":
+            if not (h and same_holder(h, caller)):
+                die("you don't hold the lock")
+            LOCK_PATH.unlink()
+            print("released the lock")
+        else:
+            die("lock status | lock acquire [--take-over] | lock release")
+
+
 def herdr_json(args):
     r = run(["herdr", *args], check=False)
     if r.returncode != 0:
@@ -116,6 +229,8 @@ def herdr_json(args):
 
 
 def projects():
+    if not PROJECTS_PATH.exists():
+        die(f"{PROJECTS_PATH} is missing; add the user's repos there (see profile.template/config/).")
     return json.loads(PROJECTS_PATH.read_text())
 
 
@@ -181,7 +296,7 @@ def live_agents():
 
 def render_status(conn, live=None):
     live = live if live is not None else live_agents()
-    lines = [f"# Zed status", "", f"_Generated {now()} from db/zed.db. Do not edit by hand._", ""]
+    lines = ["# Zed status", "", f"_Generated {now()} from the task DB (`bin/zed status`). Do not edit by hand._", ""]
 
     open_q = conn.execute(
         "SELECT q.*, t.jira, t.title FROM questions q LEFT JOIN tasks t ON t.id=q.task_id "
@@ -243,7 +358,8 @@ def render_status(conn, live=None):
 
 
 def write_status(conn):
-    STATUS_PATH.write_text(render_status(conn))
+    if holds_lock():  # read-only sessions never write
+        STATUS_PATH.write_text(render_status(conn))
 
 
 # ---------------------------------------------------------------- commands
@@ -253,10 +369,12 @@ def cmd_task(args):
         die("task add|set|show|list")
     sub, rest = args[0], args[1:]
     conn = db()
+    if sub in ("add", "set"):
+        require_lock()
     if sub == "add":
         kv = parse_kv(rest)
         if "title" not in kv:
-            die("task add title=... [jira=MENT-123] [worktype=story] [description=...] [status=intake]")
+            die("task add title=... [jira=<ticket-id>] [worktype=<e.g. story>] [description=...] [status=intake]")
         ts = now()
         cur = conn.execute(
             "INSERT INTO tasks(title,jira,worktype,description,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
@@ -302,6 +420,7 @@ def cmd_log(args):
     if len(args) < 2:
         die("log <task-id|-> <text> [kind=note]")
     conn = db()
+    require_lock()
     tid = None if args[0] == "-" else int(args[0].lstrip("T"))
     kind = "note"
     text_parts = []
@@ -322,6 +441,8 @@ def cmd_q(args):
         die("q add <task-id|-> <question> [session=S] | q answer <qid> <answer> | q list")
     sub, rest = args[0], args[1:]
     conn = db()
+    if sub in ("add", "answer"):
+        require_lock()
     if sub == "add":
         tid = None if rest[0] == "-" else int(rest[0].lstrip("T"))
         sid = None
@@ -370,6 +491,17 @@ def slugify(s, n=40):
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:n].strip("-")
 
 
+def worker_rules():
+    """Core worker rules + the profile's rules.md, with {{ZED_HOME}} / {{PROFILE}} filled in."""
+    text = CORE_WORKER_RULES.read_text()
+    if PROFILE_RULES.exists():
+        text += "\n\n" + PROFILE_RULES.read_text()
+    text = text.replace("{{ZED_HOME}}", str(ZED_HOME)).replace("{{PROFILE}}", str(PROFILE_DIR))
+    GENERATED_WORKER_RULES.parent.mkdir(parents=True, exist_ok=True)
+    GENERATED_WORKER_RULES.write_text(text)
+    return GENERATED_WORKER_RULES
+
+
 def cmd_spawn(args):
     """spawn <task-id> repo=<repo> base=<branch> branch=<branch> brief=<path> [name=<agent>]"""
     if not args:
@@ -380,6 +512,7 @@ def cmd_spawn(args):
         if k not in kv:
             die(f"spawn needs {k}=")
     conn = db()
+    require_lock()
     t = get_task(conn, tid)
     p = project(kv["repo"])
     repo_path = expand(p["path"])
@@ -414,7 +547,7 @@ def cmd_spawn(args):
     ws_id, pane_id = ws["workspace"]["workspace_id"], ws["root_pane"]["pane_id"]
     time.sleep(1.5)  # let the shell reach its prompt
     claude_args = ["--permission-mode", "auto", "-n", agent,
-                   "--append-system-prompt-file", str(WORKER_RULES)]
+                   "--append-system-prompt-file", str(worker_rules())]
     r = run(["herdr", "agent", "start", agent, "--kind", "claude", "--pane", pane_id, "--timeout", "60000",
              "--", *claude_args], check=False)
     if r.returncode != 0 and "agent_not_ready" in r.stderr:
@@ -440,9 +573,9 @@ def cmd_spawn(args):
 
     # 3. hand over the brief
     pr = run(["herdr", "agent", "prompt", agent,
-              f"You are session S{sid} for Zed task T{tid}. Zed's home is {ZED_HOME}. "
-              f"Read your brief at {brief}, then {ZED_HOME}/knowledge/conventions.md, and "
-              f"{ZED_HOME}/knowledge/repos/{kv['repo']}.md if it exists. Then start.",
+              f"You are session S{sid} for Zed task T{tid}. Zed's home is {ZED_HOME}; "
+              f"the user's profile is {PROFILE_DIR}. Read your brief at {brief}, then "
+              f"{PROFILE_DIR}/knowledge/repos/{kv['repo']}.md if it exists. Then start.",
               "--wait", "--until", "working", "--until", "blocked", "--timeout", "30000"], check=False)
     print(json.dumps({"task": f"T{tid}", "session": f"S{sid}", "agent": agent, "pane": pane_id,
                       "workspace": ws_id, "worktree": str(worktree), "prompt_ok": pr.returncode == 0}))
@@ -454,6 +587,7 @@ def cmd_session(args):
     sub, rest = args[0], args[1:]
     conn = db()
     if sub == "set":
+        require_lock()
         s = resolve_session(conn, rest[0].lstrip("S") if rest[0].startswith("S") and rest[0][1:].isdigit() else rest[0])
         for k, v in parse_kv(rest[1:]).items():
             if k not in ("status", "pr_url", "claude_session_id", "pane_id", "workspace_id", "base"):
@@ -480,6 +614,7 @@ def cmd_close(args):
     if not args:
         die("close <S|agent> [keep-worktree] [force]")
     conn = db()
+    require_lock()
     ref = args[0][1:] if args[0].startswith("S") and args[0][1:].isdigit() else args[0]
     s = resolve_session(conn, ref)
     if s["external"]:
@@ -517,6 +652,7 @@ def cmd_adopt(args):
     pane_id, tid = args[0], int(args[1].lstrip("T"))
     kv = parse_kv(args[2:])
     conn = db()
+    require_lock()
     get_task(conn, tid)
     a = live_agents().get(pane_id)
     if not a:
@@ -539,11 +675,18 @@ def cmd_adopt(args):
 
 def cmd_watch(args):
     """Emit one line whenever a managed worker changes to a state that needs Zed's attention.
-    Meant to be run under Claude Code's Monitor tool."""
+    Meant to be run under Claude Code's Monitor tool. Exits when this session loses the Zed lock."""
     interval = float(args[0]) if args else 3.0
+    db().close()
+    require_lock()
     prev = {}
     first = True
     while True:
+        if not holds_lock():
+            h = read_lock()
+            print("LOCK LOST: " + (f"another session took over as Zed ({describe(h)})" if h else "the Zed lock was released")
+                  + ". Stop acting as Zed: no watcher, relaying or commits; read-only from now on.", flush=True)
+            sys.exit(3)
         try:
             conn = db()
             sessions = conn.execute("SELECT * FROM sessions WHERE status IN ('running','waiting_user')").fetchall()
@@ -565,10 +708,20 @@ def cmd_watch(args):
         time.sleep(interval)
 
 
+def cmd_paths(args):
+    """Print where Zed's files are, for skills and scripts."""
+    print(json.dumps({"home": str(ZED_HOME), "profile": str(PROFILE_DIR),
+                      "profile_exists": (PROFILE_DIR / "profile.md").exists(),
+                      "db": str(DB_PATH), "status": str(STATUS_PATH), "projects": str(PROJECTS_PATH),
+                      "briefs": str(PROFILE_DIR / "briefs")}, indent=2))
+
+
 def cmd_status(args):
     conn = db()
-    write_status(conn)
-    print(STATUS_PATH.read_text())
+    text = render_status(conn)
+    if holds_lock():
+        STATUS_PATH.write_text(text)
+    print(text)
 
 
 def cmd_help(args):
@@ -585,12 +738,16 @@ def cmd_help(args):
   adopt <pane-id> <T> [repo=]        track a session Zed didn't start (user's own)
   watch [interval-seconds]           (run under Monitor)
   status                             (regenerate + print STATUS.md)
+  paths                              (Zed home, profile dir, DB/STATUS/config/briefs locations)
+  lock status | lock acquire [--take-over] | lock release
+                                     one active Zed per profile; without the lock only
+                                     status, list, show, paths and lock work
 Task states:    """ + ", ".join(TASK_STATES) + """
 Session states: """ + ", ".join(SESSION_STATES))
 
 
 COMMANDS = {"task": cmd_task, "log": cmd_log, "q": cmd_q, "spawn": cmd_spawn, "session": cmd_session,
-            "close": cmd_close, "adopt": cmd_adopt, "watch": cmd_watch, "status": cmd_status, "help": cmd_help}
+            "close": cmd_close, "adopt": cmd_adopt, "watch": cmd_watch, "status": cmd_status, "paths": cmd_paths, "lock": cmd_lock, "help": cmd_help}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:

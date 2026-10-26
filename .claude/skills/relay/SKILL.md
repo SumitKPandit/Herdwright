@@ -10,7 +10,8 @@ description: Pass the user's answers or new instructions to the right worker ses
 2. `bin/zed q answer <Q> "<answer, verbatim>"`.
 3. Before prompting, `herdr agent get <agent>`: it must be `idle` or `done`. If it is `working`,
    wait for the watcher. If `blocked`, it's an approval UI — handle with send-keys per the user's decision.
-4. `herdr agent prompt <agent> "Answer from the engineering manager to your question <n> (<short restatement>): <verbatim answer>. Continue."`
+4. `herdr agent prompt <agent> "Answer from the user to your question <n> (<short restatement>): <verbatim answer>. Continue."`
    Combine all answers for one worker into one prompt.
 5. Also append the decision to the worker's brief under "Decisions already made by the user"
-   so it survives if the session is restarted. Commit the Zed repo.
+   (`profile/briefs/`) so it survives if the session is restarted. If the answer is durable beyond
+   this task, also record it per the `learn` skill. Commit the profile.

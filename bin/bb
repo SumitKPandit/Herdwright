@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""bb — minimal Bitbucket Cloud helper for Zed workers (cm-api, cm_db, cm_lib).
+"""bb — minimal Bitbucket Cloud helper for Zed workers.
 
-Auth: an Atlassian API token with Bitbucket scopes, stored in the macOS Keychain
-(never in this repo):
-  security add-generic-password -U -s zed-bitbucket -a <atlassian-email> -w
-Then check it with:  bin/bb whoami
+Auth: an Atlassian API token with Bitbucket scopes (read:user, read:repository, read:pullrequest,
+write:pullrequest), stored in the macOS Keychain, never in a repo. Copy the token, then:
+  security add-generic-password -U -s <service> -a <atlassian-email> -w "$(pbpaste)"
+<service> is `bitbucket.keychain_service` in <profile>/config/settings.json (default zed-bitbucket).
+Check it with:  bin/bb check
 
 Usage
   bb whoami
   bb users <workspace/slug>... [--pages N]   (people seen on recent PRs, with UUIDs)
-  bb check                             (diagnose auth: HTTP status per endpoint, no secrets shown)
-  bb pr create --title T --source BRANCH --dest BRANCH [--body-file F] [--draft] [--reviewer NICK ...]
-  bb pr view <id> [--repo criticalmedianyc/cm_api]
+  bb check [workspace/slug]            (diagnose auth: HTTP status per endpoint, no secrets shown;
+                                        repo defaults to bitbucket.check_repo in settings.json)
+  bb pr create --title T --source BRANCH --dest BRANCH [--body-file F] [--draft] [--reviewer UUID ...]
+  bb pr view <id> [--repo workspace/slug]
   bb pr list [--state OPEN] [--repo ...]
   bb pr ready <id>                     (clear draft)
 Repo defaults to the `origin` remote of the current directory.
@@ -19,14 +21,25 @@ Repo defaults to the `origin` remote of the current directory.
 import argparse
 import base64
 import json
+import os
 import re
 import subprocess
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 API = "https://api.bitbucket.org/2.0"
-SERVICE = "zed-bitbucket"
+ZED_HOME = Path(__file__).resolve().parent.parent
+PROFILE_DIR = Path(os.environ.get("ZED_PROFILE_DIR") or ZED_HOME / "profile").expanduser().resolve()
+
+
+def settings():
+    path = PROFILE_DIR / "config" / "settings.json"
+    return json.loads(path.read_text()).get("bitbucket", {}) if path.exists() else {}
+
+
+SERVICE = settings().get("keychain_service", "zed-bitbucket")
 
 
 def die(msg):
@@ -38,7 +51,7 @@ def credentials():
     r = subprocess.run(["security", "find-generic-password", "-s", SERVICE], capture_output=True, text=True)
     if r.returncode != 0:
         die(f"no Keychain item '{SERVICE}'. Store one with:\n"
-            f"  security add-generic-password -U -s {SERVICE} -a <atlassian-email> -w")
+            f"  security add-generic-password -U -s {SERVICE} -a <atlassian-email> -w \"$(pbpaste)\"")
     m = re.search(r'"acct"<blob>="([^"]*)"', r.stdout)
     token = subprocess.run(["security", "find-generic-password", "-s", SERVICE, "-w"],
                            capture_output=True, text=True).stdout.strip()
@@ -76,11 +89,14 @@ def probe(path, scheme):
         return e.code
 
 
-def check():
+def check(repo):
     email, token = credentials()
     print(f"account: {email}; token length {len(token)}; "
           f"whitespace in token: {token != token.strip() or ' ' in token}")
-    for path in ("/user", "/repositories/criticalmedianyc/cm_api", "/repositories/criticalmedianyc/cm_api/pullrequests?pagelen=1"):
+    paths = ["/user"]
+    if repo:
+        paths += [f"/repositories/{repo}", f"/repositories/{repo}/pullrequests?pagelen=1"]
+    for path in paths:
         print(f"{path}: basic={probe(path, 'basic')} bearer={probe(path, 'bearer')}")
 
 
@@ -117,14 +133,15 @@ def user_uuid(nick):
     if nick.startswith("{"):
         return nick
     die(f"pass reviewers as Bitbucket account UUIDs ({{...}}); '{nick}' is not one. "
-        "Ask Zed for the reviewer UUIDs (knowledge/people.md).")
+        "Ask Zed for the reviewer UUIDs (the profile's knowledge/people.md).")
 
 
 def main():
     ap = argparse.ArgumentParser(prog="bb")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("whoami")
-    sub.add_parser("check")
+    ck = sub.add_parser("check")
+    ck.add_argument("repo", nargs="?", help="workspace/slug to probe (default: bitbucket.check_repo)")
     us = sub.add_parser("users")
     us.add_argument("repos", nargs="+", help="workspace/slug ...")
     us.add_argument("--pages", type=int, default=1)
@@ -154,7 +171,7 @@ def main():
         users(a.repos, a.pages)
         return
     if a.cmd == "check":
-        check()
+        check(a.repo or settings().get("check_repo"))
         return
     repo = a.repo or repo_from_origin()
     if a.pr_cmd == "create":
