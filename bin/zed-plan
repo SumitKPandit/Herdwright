@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""zed-plan — check a worker's plan file and report its progress, no model.
+
+The plan file (profile/briefs/T<id>-<repo>-plan.md) is a checklist of steps, each with a "done when" and a
+rough time (worker rules: "Work to a plan"). Ported from the heading-reader and definition-of-done checks in
+firstmate's fm-brief-heading-lib / fm-dod-lib. Read-only.
+
+Usage
+  zed-plan lint <plan-file|T<id>> [--json]
+      structure problems: no steps, a step without a 'done when', a step without a time estimate (~40 min, ~2 h),
+      duplicate or out-of-order numbers. exit 0 clean, 1 problems, 2 no such plan
+  zed-plan progress <plan-file|T<id>> [--json]
+      steps done/total, the next step, estimated minutes remaining, and whether the current step has run past
+      twice its estimate since the plan was last updated (the rule that says stop and tell Zed). exit 0 on track, 1 overrun
+"""
+import argparse
+import re
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import zedlib  # noqa: E402
+
+DONE_WHEN = re.compile(r"done when", re.I)
+ESTIMATE = re.compile(r"~\s*(\d+(?:\.\d+)?)\s*(min|m|h|hr|hrs|hour|hours)\b", re.I)
+
+
+def find_plan(ref):
+    if re.fullmatch(r"T\d+", ref):
+        found = sorted(zedlib.BRIEFS_DIR.glob(f"{ref}-*-plan.md"))
+        return found[0] if found else None
+    p = Path(ref)
+    return p if p.exists() else None
+
+
+def estimate_minutes(text):
+    m = ESTIMATE.search(text)
+    if not m:
+        return None
+    n = float(m.group(1))
+    return int(n * 60) if m.group(2).lower().startswith("h") else int(n)
+
+
+def parse(text):
+    steps = zedlib.parse_plan_steps(text)
+    # a step's own text continues on indented lines until the next checklist item or a heading
+    for st, nxt in zip(steps, steps[1:] + [None]):
+        start = text.index(st["line"])
+        end = text.index(nxt["line"], start + 1) if nxt else len(text)
+        st["full"] = re.split(r"\n#{1,6} |\n\n\S", text[start:end])[0]
+        st["est_min"] = estimate_minutes(st["full"])
+    return steps
+
+
+def lint(steps):
+    problems = []
+    if not steps:
+        return ["no checklist steps found ('- [ ] 1. ...')"]
+    seen = set()
+    first = steps[0]["n"]  # plans may start at 0 or 1
+    for i, st in enumerate(steps, first):
+        if st["n"] in seen:
+            problems.append(f"step {st['n']}: duplicate number")
+        seen.add(st["n"])
+        if st["n"] != i:
+            problems.append(f"step {st['n']}: out of order (expected {i})")
+        if not DONE_WHEN.search(st["full"]):
+            problems.append(f"step {st['n']}: no 'Done when'")
+        if st["est_min"] is None:
+            problems.append(f"step {st['n']}: no time estimate (like '~40 min')")
+    return problems
+
+
+def progress(steps, plan_mtime, now=None):
+    now = now or time.time()
+    todo = [s for s in steps if not s["done"]]
+    cur = todo[0] if todo else None
+    age = int((now - plan_mtime) // 60)
+    out = {"done": len(steps) - len(todo), "total": len(steps), "next": cur["text"][:120] if cur else None,
+           "remaining_est_min": sum(s["est_min"] or 0 for s in todo), "minutes_since_update": age, "overrun": False}
+    if cur and cur["est_min"] and age > 2 * cur["est_min"]:
+        out["overrun"] = f"step {cur['n']} estimated {cur['est_min']} min, {age} min since the plan last changed"
+    return out
+
+
+def load(ref):
+    p = find_plan(ref)
+    if not p:
+        print(f"zed-plan: no plan file for {ref}", file=sys.stderr)
+        return None, None
+    return p, parse(p.read_text())
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="zed-plan", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for n in ("lint", "progress"):
+        p = sub.add_parser(n)
+        p.add_argument("plan")
+        p.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+    path, steps = load(a.plan)
+    if path is None:
+        return 2
+    if a.cmd == "lint":
+        problems = lint(steps)
+        zedlib.emit({"plan": str(path), "problems": problems}, a.json,
+                    lambda d: [f"{path.name}: " + ("ok" if not problems else f"{len(problems)} problem(s)")] + ["  - " + p for p in zedlib.cap_lines(problems, 20)])
+        return 1 if problems else 0
+    pr = progress(steps, path.stat().st_mtime)
+    zedlib.emit(pr, a.json, lambda d: [f"{path.name}: {d['done']}/{d['total']} done, ~{d['remaining_est_min']} min estimated left"
+                                       + (f"; next: {d['next']}" if d["next"] else "; complete")]
+                + ([f"  ! OVERRUN: {d['overrun']}"] if d["overrun"] else []))
+    return 1 if pr["overrun"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
