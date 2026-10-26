@@ -4,8 +4,8 @@
 Before the core/profile split, the user's data lived at the repo root (knowledge/, config/,
 db/, STATUS.md, briefs/) and some of their facts were written into core files. This moves the
 files into profile/ (with `git mv` where tracked, so history follows), fixes the paths inside
-them, writes the facts that were removed from core files into the profile, and regenerates
-STATUS.md from the existing task DB. Idempotent: rerunning only does what's still left.
+them, writes the facts that were removed from core files into the profile, and checks the task
+DB still reads. Idempotent: rerunning only does what's still left.
 
 Run it on the profile branch (never on main), with no `bin/zed watch` running against the
 checkout. Nothing is committed; review with `git status` and commit yourself.
@@ -207,10 +207,11 @@ def main():
         (profile / "briefs" / ".gitkeep").touch()
 
     env = dict(os.environ, ZED_PROFILE_DIR=str(profile))
-    r = subprocess.run([str(root / "bin" / "zed"), "status"], env=env, capture_output=True, text=True)
+    r = subprocess.run([str(root / "bin" / "zed"), "task", "list", "--all"], env=env, capture_output=True, text=True)
     if r.returncode != 0:
-        die(f"bin/zed status failed after migration:\n{r.stderr}")
-    print("regenerated profile/STATUS.md from profile/db/zed.db")
+        die(f"bin/zed can't read the migrated DB:\n{r.stderr}")
+    print(f"profile/db/zed.db reads fine ({len(r.stdout.splitlines())} tasks); profile/STATUS.md is "
+          "regenerated on Zed's next write, once it holds the lock")
     print("\nDone. Review `git status`, then commit on this branch (profile-only paths and the removed legacy paths).")
 
 
