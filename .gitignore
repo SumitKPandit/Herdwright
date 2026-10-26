@@ -4,3 +4,4 @@
 *.db-shm
 .claude/settings.local.json
 profile/.cache/
+__pycache__/

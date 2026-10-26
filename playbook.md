@@ -62,7 +62,7 @@ Facts about a particular user or their work never go here (they go to the profil
   permission rule.
 - **Herdr can report `agent_prompt_stalled` before Copilot starts a submitted prompt.** **Why:**
   the activity gate expires after five seconds, but the prompt may already be in the transcript
-  and start shortly afterwards. **How:** inspect the agent's state and completion sequence;
+  and start shortly afterwards. **How:** inspect the agent's state and state-change sequence;
   `spawn` allows a short observation window. Never blindly submit the same brief again.
 - **Keep coordinator QA separate from worker fixtures.** **Why:** workers correctly refuse
   coordinator lock and watcher duties, even in a throwaway profile. **How:** launch a separate,

@@ -840,7 +840,7 @@ def set_copilot_permissions(agent):
 
 
 def prompt_worker(agent, text):
-    before = herdr_json(["agent", "get", agent])["result"]["agent"].get("completion_seq", 0)
+    before = herdr_json(["agent", "get", agent])["result"]["agent"].get("state_change_seq", 0)
     r = run(["herdr", "agent", "prompt", agent, text,
              "--wait", "--until", "working", "--until", "blocked", "--timeout", "30000"], check=False)
     if r.returncode == 0:
@@ -850,7 +850,7 @@ def prompt_worker(agent, text):
         # Observe activity/completion without ever submitting the same brief a second time.
         for _ in range(40):
             a = herdr_json(["agent", "get", agent])["result"]["agent"]
-            if a["agent_status"] in ("working", "blocked") or (a.get("completion_seq") or 0) > (before or 0):
+            if a["agent_status"] in ("working", "blocked") or (a.get("state_change_seq") or 0) > (before or 0):
                 return True, ""
             time.sleep(0.25)
     return False, r.stderr or r.stdout
@@ -1001,6 +1001,13 @@ def cmd_session(args):
     write_status(conn)
 
 
+def close_workspace(ws_id):
+    """Close a herdr workspace; one that is already gone counts as closed. Anything else fails loudly."""
+    r = run(["herdr", "workspace", "close", ws_id], check=False)
+    if r.returncode and "workspace_not_found" not in r.stdout + r.stderr:
+        die(f"could not close herdr workspace {ws_id}:\n{r.stdout}{r.stderr}")
+
+
 def cmd_close(args):
     """close <S|agent> [keep-worktree] — stop the worker, close its herdr workspace, remove the worktree."""
     if not args:
@@ -1029,7 +1036,7 @@ def cmd_close(args):
                 "Resolve it first, or pass 'keep-worktree' / 'force'.")
     record_credits(conn, s)
     if s["workspace_id"]:
-        run(["herdr", "workspace", "close", s["workspace_id"]])
+        close_workspace(s["workspace_id"])
     if "keep-worktree" not in args and wt.exists():
         repo_path = expand(project(s["repo"])["path"])
         run(["git", "-C", str(repo_path), "worktree", "remove", *(["--force"] if "force" in args else []), str(wt)])
@@ -1121,7 +1128,7 @@ def cmd_handoff(args):
     record_credits(conn, s)
     require_lock()
     if s["workspace_id"]:
-        run(["herdr", "workspace", "close", s["workspace_id"]])
+        close_workspace(s["workspace_id"])
     conn.execute("UPDATE sessions SET status='closed', updated_at=? WHERE id=?", (now(), s["id"]))
     log_event(conn, s["task_id"], "handoff", f"S{s['id']} ({s['runtime']}) closed, worktree kept; handing over to {target} ({note})")
     conn.commit()

@@ -185,9 +185,9 @@ class ZedTests(unittest.TestCase):
 
     def test_delayed_prompt_activity_does_not_resubmit_the_brief(self):
         for after in ({"agent_status": "working"},
-                      {"agent_status": "done", "completion_seq": 12}):
+                      {"agent_status": "done", "state_change_seq": 12}):
             with self.subTest(after=after):
-                before = {"result": {"agent": {"completion_seq": 10}}}
+                before = {"result": {"agent": {"state_change_seq": 10}}}
                 with patch.object(self.z, "herdr_json", side_effect=[before, {"result": {"agent": after}}]), \
                         patch.object(self.z, "run", return_value=subprocess.CompletedProcess(
                             [], 1, "", "agent_prompt_stalled")) as run:
@@ -242,8 +242,7 @@ class ZedTests(unittest.TestCase):
             (self.root / "briefs").mkdir()
             self.assertEqual(self.z.cmd_handoff(["S1", "runtime=auto"]), 2)
             self.assertEqual(spawn.call_args.kwargs["worktree"], self.root)
-            self.assertTrue(any(c.args[0] == ["herdr", "workspace", "close", "qa-ws"]
-                                and c.kwargs.get("check", True) for c in run.call_args_list))
+            self.assertTrue(any(c.args[0] == ["herdr", "workspace", "close", "qa-ws"] for c in run.call_args_list))
             note = (self.root / "briefs/T1-scratch-handoff-S1.md").read_text()
             self.assertIn("feature/qa", note)
 
@@ -253,7 +252,7 @@ class ZedTests(unittest.TestCase):
 
         def run(cmd, **kwargs):
             if cmd[:3] == ["herdr", "workspace", "close"]:
-                raise SystemExit("workspace close failed")
+                return subprocess.CompletedProcess(cmd, 1, "", "server_unavailable")
             return subprocess.CompletedProcess(cmd, 0, "feature/qa\n", "")
 
         with patch.object(self.z, "db", return_value=conn), patch.object(self.z, "require_lock"), \
@@ -265,6 +264,14 @@ class ZedTests(unittest.TestCase):
                 self.z.cmd_handoff(["S1"])
             spawn.assert_not_called()
             self.assertEqual(conn.execute("SELECT status FROM sessions").fetchone()[0], "running")
+
+    def test_closing_a_workspace_that_is_already_gone_succeeds(self):
+        gone = subprocess.CompletedProcess([], 1, '{"error":{"code":"workspace_not_found"}}', "")
+        with patch.object(self.z, "run", return_value=gone):
+            self.z.close_workspace("w1")
+        with patch.object(self.z, "run", return_value=subprocess.CompletedProcess([], 1, "", "server_unavailable")):
+            with self.assertRaises(SystemExit):
+                self.z.close_workspace("w1")
 
     def test_watch_reports_fast_turns_once_and_records_first_idle(self):
         self.session()
