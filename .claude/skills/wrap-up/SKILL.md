@@ -17,5 +17,11 @@ following the `learn` skill. Then `bin/zed close <S>` (refuses if the worktree h
 Mark the task: `pr_open` while PRs await review/merge; `done` only when the user says it's done
 or the PR is merged (e.g. `gh pr view <url> --json state`). Commit the profile.
 
+Closing or untracking a session is not delivery of its task. Check the original acceptance
+criteria and record the actual output: for published documentation, its live URL and verified
+content/rendering; for an assessment, the report and its acceptance, not an implemented solution.
+Local drafts, a finished worker turn, or a handoff to another task must not be counted as a
+completed user deliverable. Record transferred work against its continuing task explicitly.
+
 Parking: if the user pauses a task with unpublished work, ask whether to push a WIP branch;
 otherwise keep the worktree (`bin/zed close <S> keep-worktree`) and set task status `parked`.
