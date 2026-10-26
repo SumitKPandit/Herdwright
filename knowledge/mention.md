@@ -35,7 +35,7 @@ Mention currently consists of two apps:
 - `claim` — CLAIM (Client, Account and Identity Management): Fastify/TS/Prisma service for managing
   Auth0 users across Onclusive apps. GitHub `AirPR/claim`, default `main`. Has its own CLAUDE.md.
 - `gum` — GUM (Global User Management): predecessor/sibling of CLAIM, same stack. GitHub `AirPR/gum`,
-  default `main`. (Relationship to CLAIM inferred, unconfirmed.)
+  default `main`. (Confirmed by user 2026-10-26.)
 - `iac` — not a git repo; the user's research notes/configs on 360's current infrastructure (Porter),
   made for writing a disaster recovery plan.
 - `prompt-library` — the user's project to build an agentic engineering workflow (Claude Code /

@@ -20,3 +20,7 @@ per session), relays their questions, and keeps a record of everything.
 3. Clone this repo, start herdr, open a pane in this folder and run `claude`.
    Say hi to Zed. Sessions/worktrees from the old machine won't exist; Zed will see them as
    `GONE` and can respawn from their pushed branches/PRs.
+4. Bitbucket token (Atlassian API token with scopes, Bitbucket: read:user, read:repository,
+   read:pullrequest, write:pullrequest). Copy it, then:
+   `security add-generic-password -U -s zed-bitbucket -a <atlassian-email> -w "$(pbpaste)"`
+   (the interactive `-w` prompt truncates at 128 chars). Verify: `bin/bb check`.

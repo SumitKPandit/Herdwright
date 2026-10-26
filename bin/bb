@@ -8,6 +8,7 @@ Then check it with:  bin/bb whoami
 
 Usage
   bb whoami
+  bb check                             (diagnose auth: HTTP status per endpoint, no secrets shown)
   bb pr create --title T --source BRANCH --dest BRANCH [--body-file F] [--draft] [--reviewer NICK ...]
   bb pr view <id> [--repo criticalmedianyc/cm_api]
   bb pr list [--state OPEN] [--repo ...]
@@ -61,6 +62,27 @@ def call(method, path, body=None):
         die(f"{method} {path} → HTTP {e.code}\n{e.read().decode(errors='replace')}")
 
 
+def probe(path, scheme):
+    """Return the HTTP status for GET path using Basic (email:token) or Bearer auth."""
+    email, token = credentials()
+    req = urllib.request.Request(API + path)
+    req.add_header("Authorization", "Basic " + base64.b64encode(f"{email}:{token}".encode()).decode()
+                   if scheme == "basic" else f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
+def check():
+    email, token = credentials()
+    print(f"account: {email}; token length {len(token)}; "
+          f"whitespace in token: {token != token.strip() or ' ' in token}")
+    for path in ("/user", "/repositories/criticalmedianyc/cm_api", "/repositories/criticalmedianyc/cm_api/pullrequests?pagelen=1"):
+        print(f"{path}: basic={probe(path, 'basic')} bearer={probe(path, 'bearer')}")
+
+
 def repo_from_origin():
     url = subprocess.run(["git", "remote", "get-url", "origin"], capture_output=True, text=True).stdout.strip()
     m = re.search(r"bitbucket\.org[:/]([^/]+)/([^/.]+?)(?:\.git)?$", url)
@@ -81,6 +103,7 @@ def main():
     ap = argparse.ArgumentParser(prog="bb")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("whoami")
+    sub.add_parser("check")
     pr = sub.add_parser("pr").add_subparsers(dest="pr_cmd", required=True)
     c = pr.add_parser("create")
     c.add_argument("--title", required=True)
@@ -102,6 +125,9 @@ def main():
     if a.cmd == "whoami":
         u = call("GET", "/user")
         print(f"{u.get('display_name')} ({u.get('nickname')}) {u.get('uuid')}")
+        return
+    if a.cmd == "check":
+        check()
         return
     repo = a.repo or repo_from_origin()
     if a.pr_cmd == "create":
