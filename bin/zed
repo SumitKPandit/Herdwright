@@ -1261,7 +1261,8 @@ def cmd_watch(args):
     saved = read_json(WATCH_STATE_PATH, None)
     prev = {int(k): v for k, v in saved.items()} if saved is not None else {}
     first = saved is None
-    alerts = {}  # per-session health alerts already reported (stall, usage step, long block)
+    alerts_path = WATCH_STATE_PATH.with_name("watch-alerts.json")
+    alerts = {int(k): v for k, v in read_json(alerts_path, {}).items()}  # health alerts already reported, kept across runs
     while True:
         if not holds_lock():
             h = read_lock()
@@ -1307,6 +1308,7 @@ def cmd_watch(args):
             print(line, flush=True)
         WATCH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         WATCH_STATE_PATH.write_text(json.dumps(prev))
+        alerts_path.write_text(json.dumps(alerts))
         if once and events:
             return
         time.sleep(interval)
@@ -1333,11 +1335,11 @@ def health_events(conn, s, a, state, alerts):
         last = max([started] + [datetime.fromtimestamp(p.stat().st_mtime) for p in plans])
         idle = int((now - last).total_seconds() // 60)
         what = "no plan file yet" if not plans else "no plan progress"
-        if idle >= STALL_MINUTES and seen.get("stall") != last:
-            seen["stall"] = last
+        if idle >= STALL_MINUTES and seen.get("stall") != last.isoformat():
+            seen["stall"] = last.isoformat()
             out.append(f"{tag} · STALL: {what} for {idle} min while working (check for re-tooling or repeated work)")
     if state == "blocked":
-        since = seen.setdefault("blocked_since", now)
+        since = datetime.fromisoformat(seen.setdefault("blocked_since", now.isoformat()))
         if (now - since).total_seconds() >= 300 and not seen.get("block_reminded"):
             seen["block_reminded"] = True
             out.append(f"{tag} · still blocked after 5 min (queued prompt? read the screen again)")
