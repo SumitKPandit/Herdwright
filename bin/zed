@@ -403,7 +403,8 @@ def cmd_spawn(args):
         if branch_exists:
             run(["git", "-C", str(repo_path), "worktree", "add", str(worktree), kv["branch"]])
         else:
-            run(["git", "-C", str(repo_path), "worktree", "add", "-b", kv["branch"], str(worktree), f"origin/{kv['base']}"])
+            start = kv.get("from", f"origin/{kv['base']}")
+            run(["git", "-C", str(repo_path), "worktree", "add", "-b", kv["branch"], str(worktree), start])
         # Don't let the new branch track the base branch; worker pushes with -u.
         run(["git", "-C", str(worktree), "branch", "--unset-upstream"], check=False)
 
@@ -578,7 +579,7 @@ def cmd_help(args):
   task show <T> | task list [--all]
   log <T|-> <text...> [kind=note]
   q add <T|-> <question...> [session=S] | q answer <Q> <answer...> | q list
-  spawn <T> repo= base= branch= brief=<file> [name=<agent>]
+  spawn <T> repo= base= branch= brief=<file> [name=<agent>] [from=<start-ref, default origin/<base>>]
   session list | session set <S|agent> key=value... (status pr_url claude_session_id pane_id workspace_id base)
   close <S|agent> [keep-worktree] [force]   (external sessions are only untracked)
   adopt <pane-id> <T> [repo=]        track a session Zed didn't start (user's own)

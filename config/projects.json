@@ -105,6 +105,16 @@
       "host": "github",
       "dev_base": "main",
       "branches": {}
+    },
+    "zed": {
+      "path": "~/codebase/zed",
+      "app": "zed",
+      "role": "Zed itself (this assistant's repo)",
+      "host": "github",
+      "dev_base": "main",
+      "branches": {
+        "main": "core: shareable capabilities only (planned)"
+      }
     }
   },
   "non_git_folders": {

@@ -1,6 +1,6 @@
 # Zed status
 
-_Generated 2026-10-26 08:10 from db/zed.db. Do not edit by hand._
+_Generated 2026-10-26 08:36 from db/zed.db. Do not edit by hand._
 
 ## Waiting on you
 
@@ -21,7 +21,12 @@ _Generated 2026-10-26 08:10 from db/zed.db. Do not edit by hand._
 
 ## Not started / parked
 
-- None.
+### T2 · no-jira · Split Zed into shareable core (main) and per-user profile (branch)
+- status: **intake** · worktype: chore · updated 2026-10-26 08:36
+- User wants anyone to clone Zed and onboard; Sumit's work lives on a separate branch
+  - 2026-10-26 08:36 [decision] decision: main branch = core capabilities anyone can clone; a separate branch holds everything personal to the user (user, 2026-10-26)
+  - 2026-10-26 08:36 [decision] decision: no history rewrite needed (user, 2026-10-26)
+  - 2026-10-26 08:36 [decision] decision: strict no-assumption rule and browser QA before every PR are universal Zed traits (user, 2026-10-26)
 
 ## Recently finished
 
