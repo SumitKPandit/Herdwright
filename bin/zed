@@ -526,8 +526,10 @@ def cmd_spawn(args):
     wt_root = expand(projects()["worktree_root"])
     worktree = wt_root / kv["repo"] / slugify(kv["branch"].split("/")[-1], 60)
 
-    # 1. worktree
-    if worktree.exists():
+    # 1. worktree (projects with "worktrees": false, e.g. plain doc folders, run in place)
+    if p.get("worktrees") is False:
+        worktree = repo_path
+    elif worktree.exists():
         print(f"reusing existing worktree {worktree}")
     else:
         worktree.parent.mkdir(parents=True, exist_ok=True)
@@ -626,6 +628,9 @@ def cmd_close(args):
         print(f"untracked S{s['id']} (external session left running)")
         return
     wt = Path(s["worktree"])
+    in_place = project(s["repo"]).get("worktrees") is False
+    if in_place:
+        args = [*args, "keep-worktree"]  # the project folder itself; never remove it
     if "keep-worktree" not in args and wt.exists():
         dirty = run(["git", "-C", str(wt), "status", "--porcelain"], check=False).stdout.strip()
         unpushed = run(["git", "-C", str(wt), "log", "--oneline", "@{u}..HEAD"], check=False)

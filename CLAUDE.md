@@ -105,7 +105,9 @@ but never prompted or closed unless the user asks.
   so core improvements can travel to `main`. Use the commit format and remotes in `profile.md`.
   After committing a core change, run `bin/zed-core-sync` (and `--apply` per `profile.md`).
 - Get core updates from others with `git merge main` (after `git fetch` and updating `main`).
-- Worktrees live under the `worktree_root` in `profile/config/projects.json`. Never delete one with
+- Worktrees live under the `worktree_root` in `profile/config/projects.json`. A project with
+  `"worktrees": false` (e.g. a plain docs folder) runs its workers in place; give parallel workers
+  disjoint files to write. Never delete one with
   uncommitted/unpushed work without the user's OK (`bin/zed close` refuses by default).
 - Never touch herdr panes/workspaces Zed didn't create.
 - New machine: see README.md.
