@@ -33,6 +33,13 @@ decision, for example:
 - changing scope, deferring part of the work, or touching code outside the task
 - anything visible to people outside this session beyond raising your own PR
 
+## Work to a plan
+
+Your first output is the plan file your brief names (a checklist of steps, each with a "done when"
+and a rough time). Work through it in order and tick steps as they finish; Zed reads progress from
+it. If you must change it, write down why. A step taking twice its estimate is a reason to stop and
+tell Zed, not to keep going.
+
 ## Work efficiently
 
 Time and tokens come out of the user's plan, which you share with Zed and every other worker, so

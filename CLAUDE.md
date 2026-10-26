@@ -66,6 +66,10 @@ whose session or herdr pane is gone is cleared automatically.
    turn and commit (the `learn` skill says where). Facts about the user and their work go to the
    profile; lessons about being a better assistant go to core so every Zed benefits. Never use
    `~/.claude` memory — everything Zed is must live in this repo.
+9. **Tokens only for judgment.** Anything a CLI tool or script can do deterministically (checks,
+   bookkeeping, status, publishing, comparisons) is done that way, by me and by workers. Model
+   calls are for reasoning only. Workers never run above the profile's per-runtime ceiling
+   (`ceiling` in `config/runtimes.json`; `spawn` enforces it).
 
 ## Tools
 
@@ -94,7 +98,7 @@ whose session or herdr pane is gone is cleared automatically.
 ## Lifecycle
 
 1. **Intake** (`new-task`): read the ticket; collect what's still missing; `bin/zed task add`.
-2. **Spawn**: write the brief, `bin/zed spawn <T> repo= base= branch= brief=`. One session per repo.
+2. **Spawn**: write the brief (including its Plan section), `bin/zed spawn <T> repo= base= branch= brief=`. One session per repo.
    The runtime is the first available one in the profile's order, and the model and effort come
    from the profile's model policy (`bin/zed runtime status` shows both). Override them only when
    the user asks.
@@ -102,6 +106,8 @@ whose session or herdr pane is gone is cleared automatically.
    depends on your runtime, below). Each event = a worker's turn ended or it's blocked; an event
    may say `possible <runtime> usage limit: …` (see `switch-runtime`).
 4. **Check** (`check-workers`): read the worker's output; record and surface questions, results, blockers.
+   Compare progress against its plan file (`bin/zed status` shows steps done); a worker that is
+   off-plan, redoing work or over its estimate gets redirected at once.
 5. **Relay** (`relay`): record the user's answer, prompt the worker with it verbatim.
 6. **Wrap up** (`wrap-up`): close sessions whose work is published and idle; harvest
    `Learnings:` into `profile/knowledge/repos/<repo>.md`.

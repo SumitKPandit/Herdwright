@@ -471,6 +471,27 @@ def pick_model(runtime):
                          f"(quadrant of {scope}, {medians}; ranking of {ranking['imported_at'][:10]}){stale}{capped}")
 
 
+def apply_ceiling(runtime, model, effort, why):
+    """Enforce the profile's per-runtime ceiling ({"model", "effort"} in runtimes.json): no model that
+    costs more per task than the ceiling model, no effort above the ceiling effort. Applies to overrides too."""
+    ceiling = runtime_settings(runtime).get("ceiling")
+    if not ceiling:
+        return model, effort, why
+    efforts = RUNTIMES[runtime]["efforts"]
+    cap = ceiling.get("effort")
+    if cap in efforts and (effort is None or efforts.index(effort) > efforts.index(cap)):
+        effort, why = cap, why + f"; effort set to the ceiling ({cap})"
+    if model is None:
+        return ceiling["model"], effort, why + f"; model set to the ceiling ({ceiling['model']})"
+    costs = {norm_model(e["model"]): e["cost_per_task"] for e in (model_ranking() or {}).get("entries", [])
+             if e.get("cost_per_task") is not None}
+    mine, top = costs.get(norm_model(model)), costs.get(norm_model(ceiling["model"]))
+    if norm_model(model) != norm_model(ceiling["model"]) and (mine is None or top is None or mine > top):
+        die(f"{model} is not known to cost less per task than the ceiling {ceiling['model']} "
+            f"(runtimes.json {runtime}.ceiling); refusing to spawn")
+    return model, effort, why
+
+
 def cmd_models(args):
     """models show | models import <ranking.json>"""
     sub = args[0] if args else "show"
@@ -610,6 +631,10 @@ def render_status(conn, live=None):
             rt = f" · {s['runtime']}" + (f" {s['model']}" if s["model"] else "") + (f" ({s['effort']})" if s["effort"] else "")
             credits = f" · {s['credits']:g} AI credits" if s["credits"] is not None else ""
             out.append(f"- S{s['id']}{ext} `{s['agent']}` {s['repo']} `{s['branch']}` ← `{s['base']}` · {state}{rt}{credits}{pr}")
+        for plan in sorted((PROFILE_DIR / "briefs").glob(f"T{t['id']}-*-plan.md")):
+            text = plan.read_text()
+            done, todo = len(re.findall(r"^\s*- \[[xX]\]", text, re.M)), len(re.findall(r"^\s*- \[ \]", text, re.M))
+            out.append(f"- plan `{plan.name}`: {done}/{done + todo} steps done")
         last = conn.execute("SELECT * FROM events WHERE task_id=? ORDER BY id DESC LIMIT 3", (t["id"],)).fetchall()
         for e in reversed(last):
             out.append(f"  - {e['ts']} [{e['kind']}] {e['text']}")
@@ -888,6 +913,7 @@ def cmd_spawn(args, worktree=None):
         effort, model_why = kv["effort"], model_why + "; effort given to spawn"
     if effort and effort not in RUNTIMES[runtime]["efforts"]:
         die(f"invalid effort '{effort}' for {runtime}: {RUNTIMES[runtime]['efforts']}")
+    model, effort, model_why = apply_ceiling(runtime, model, effort, model_why)
     if runtime == "copilot" and runtime_settings(runtime).get("permission_mode", "assisted") not in PERMISSION_MODE_MENU:
         die("copilot permission_mode must be manual, assisted or allow-all")
 
