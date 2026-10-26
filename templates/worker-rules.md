@@ -58,6 +58,16 @@ waste stops everyone.
 - **Report progress in output, not activity.** If a step is taking far longer than it should, stop
   and tell Zed why instead of grinding on.
 
+## Waits cost no turns
+
+Every turn you take resends your whole context, so a wait must cost as few turns as possible.
+- After a `ZED:QUESTION` or `ZED:BLOCKED`, end your turn at once. Don't poll, sleep or "check back".
+- Wait for CI, builds, deploys or a PR check with **one blocking command** that returns when the
+  thing is done: `gh pr checks --watch`, or `until <condition>; do sleep 30; done` (the Bash tool's
+  timeout is at most 600000 ms; for a longer wait, run it again once it returns).
+- Never `sleep` and then check by hand, and never start something in the background and poll it
+  with repeated tool calls.
+
 ## Before every PR
 
 1. **QA like a tester.** Anything with a UI is checked in a real browser (use the browser tool the
