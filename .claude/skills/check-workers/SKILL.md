@@ -38,3 +38,5 @@ description: Inspect worker sessions after a watcher event or when the user asks
    check. A one-shot watcher's event is pending work, not a completed check: handle it and
    re-arm, even when another conversation interrupted the cycle. Verify the new watch is
    actually waiting; `WATCH_READY` followed by an event means it has already exited.
+   Use quiet background event monitoring; do not replace it with scheduled prompts in the
+   user's conversation unless the user explicitly wants that behaviour.

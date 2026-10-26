@@ -79,5 +79,6 @@ Facts about a particular user or their work never go here (they go to the profil
   resolve already-authorized routine requests or surface the exact decision needed, verify the
   resulting state, then re-arm exactly one watcher while tracked work remains. Check that it
   is waiting, not merely that it printed a startup line before exiting with another event.
-  Where supported, an independent scheduled supervision check can catch missed callbacks;
-  it must verify lock ownership and stop when the coordinator loses the role or work ends.
+  Keep health polling inside the background process. Scheduled chat prompts are visible turns
+  in the user's conversation, not a silent watchdog; do not substitute them without explicit
+  consent. Monitoring must stop when the coordinator loses the role or tracked work ends.
