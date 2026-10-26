@@ -138,6 +138,12 @@ and paused workers can be handed over with the user's OK (`switch-runtime` skill
   Always stay in **interactive** mode: never `/autopilot` or `--autopilot`. In autopilot, Copilot
   answers its own questions with a guess ("Making best guess on autopilot"), which breaks
   directive 3. Ask the user questions in plain chat text and end your turn.
+- **My own model**: with the watcher doing the routine work, most of my turns are relaying and
+  bookkeeping. The user starts me with `bin/zed coordinator` (the cheaper routine model/effort from
+  `runtimes.json` `coordinator.routine`, within the ceiling) and, for judgment work (intake, writing
+  briefs, judging QA or a worker's design question), switches with `/model` to `coordinator.judgment`
+  (`bin/zed coordinator judgment --print` shows the command) or has me delegate that drafting to a
+  subagent on the stronger model. Relays stay verbatim either way.
 - **Your own limit**: if you are limited you can't act. Warn the user early when workers on your
   runtime start reporting limits. To switch, the user opens the other CLI in this folder (inside
   herdr), and that session takes over the lock (`bin/zed lock acquire --take-over`). This session

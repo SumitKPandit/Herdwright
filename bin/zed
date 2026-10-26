@@ -526,6 +526,30 @@ def require_capacity(conn, runtime, tid):
         sys.exit(75)
 
 
+def coordinator_command(mode):
+    """The `claude` command line that starts Zed's own session in `mode` ('routine' or 'judgment'), from the
+    profile's runtimes.json `coordinator.<mode>` ({"model", "effort"}), never above the claude ceiling."""
+    choice = runtime_config().get("coordinator", {}).get(mode)
+    if mode not in ("routine", "judgment") or not choice:
+        die(f"runtimes.json has no coordinator.{mode} ({{\"model\", \"effort\"}}); modes: routine, judgment")
+    model, effort, _ = apply_ceiling("claude", choice.get("model"), choice.get("effort"), "")
+    if effort and effort not in RUNTIMES["claude"]["efforts"]:
+        die(f"invalid coordinator effort '{effort}'")
+    return ["claude", *(["--model", model] if model else []), *(["--effort", effort] if effort else [])]
+
+
+def cmd_coordinator(args):
+    """coordinator [routine|judgment] [--print] — start Zed's own Claude session on the cheaper routine model/effort (the
+    default) or the stronger judgment one, in Zed's home. --print only shows the command and the `/model` switch."""
+    mode = next((a for a in args if not a.startswith("--")), "routine")
+    cmd = coordinator_command(mode)
+    if "--print" in args:
+        print(" ".join(cmd) + f"\n(inside a session: /model {cmd[cmd.index('--model') + 1] if '--model' in cmd else '<model>'})")
+        return
+    os.chdir(ZED_HOME)
+    os.execvp(cmd[0], cmd)
+
+
 def cmd_models(args):
     """models show | models import <ranking.json>"""
     sub = args[0] if args else "show"
@@ -1769,6 +1793,9 @@ def cmd_help(args):
                                      (writes a handoff note, closes the old session, spawns the new one)
   runtime status | runtime limited <rt> [until=<when>] [note...] | runtime ok <rt>
                                      which runtimes are usable; mark one limited / available again
+  coordinator [routine|judgment] [--print]
+                                     start Zed's own session on the cheaper routine model/effort (default) or the
+                                     stronger judgment one (runtimes.json coordinator.<mode>, within the ceiling)
   models show | models import <ranking.json>
                                      the model ranking and what the policy picks per runtime
   watch [interval-seconds] [--once]  Claude: run under Monitor. Copilot: run `watch --once` as a
@@ -1785,7 +1812,7 @@ Session states: """ + ", ".join(SESSION_STATES))
 
 COMMANDS = {"task": cmd_task, "log": cmd_log, "q": cmd_q, "spawn": cmd_spawn, "session": cmd_session,
             "close": cmd_close, "adopt": cmd_adopt, "handoff": cmd_handoff, "watch": cmd_watch, "status": cmd_status,
-            "brief": cmd_brief, "paths": cmd_paths, "start": cmd_start, "lock": cmd_lock, "runtime": cmd_runtime, "models": cmd_models, "help": cmd_help}
+            "brief": cmd_brief, "coordinator": cmd_coordinator, "paths": cmd_paths, "start": cmd_start, "lock": cmd_lock, "runtime": cmd_runtime, "models": cmd_models, "help": cmd_help}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:

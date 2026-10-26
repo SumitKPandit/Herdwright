@@ -475,6 +475,20 @@ class ZedTests(unittest.TestCase):
         conn.execute("UPDATE sessions SET status='closed'")
         self.z.require_capacity(conn, "claude", 2)
 
+    def test_coordinator_command_per_mode_within_the_ceiling(self):
+        self.config({"order": ["claude"], "coordinator": {"routine": {"model": "cheap", "effort": "low"},
+                                                          "judgment": {"model": "top", "effort": "max"}},
+                     "runtimes": {"claude": {"ceiling": {"model": "top", "effort": "high"}}}})
+        self.z.MODEL_RANKING_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.z.MODEL_RANKING_PATH.write_text(json.dumps({"entries": [
+            {"model": "cheap", "intelligence": 1, "cost_per_task": 1}, {"model": "top", "intelligence": 2, "cost_per_task": 5}]}))
+        self.assertEqual(self.z.coordinator_command("routine"), ["claude", "--model", "cheap", "--effort", "low"])
+        self.assertEqual(self.z.coordinator_command("judgment"), ["claude", "--model", "top", "--effort", "high"])
+        with self.assertRaises(SystemExit):
+            self.z.coordinator_command("other")
+        self.z.cmd_coordinator(["--print"])
+        self.assertIn("/model cheap", self.output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
