@@ -489,6 +489,31 @@ class ZedTests(unittest.TestCase):
         self.z.cmd_coordinator(["--print"])
         self.assertIn("/model cheap", self.output.getvalue())
 
+    def test_quota_sums_window_tokens_across_sessions_and_warns_past_the_threshold(self):
+        import time as real_time
+        from datetime import datetime, timedelta, timezone
+        root = self.root / "projects"
+        stamp = lambda hours: (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        def row(mid, hours, out, inp=0):
+            return json.dumps({"timestamp": stamp(hours), "requestId": "r" + mid,
+                               "message": {"id": mid, "usage": {"output_tokens": out, "input_tokens": inp}}})
+        for name, rows in {"-a": [row("1", 1, 100, 10), row("1", 1, 100, 10), row("2", 9, 5000)],
+                           "-b": [row("3", 2, 200)]}.items():
+            (root / name).mkdir(parents=True)
+            (root / name / "s.jsonl").write_text("\n".join(rows) + "\n")
+        total, by_project = self.z.window_usage(5, root)
+        self.assertEqual((total["output"], total["input"]), (300, 10))  # deduplicated, 9h-old row excluded
+        self.assertEqual(by_project, {"-a": 100, "-b": 200})
+        self.config({"order": ["claude"], "quota": {"window_hours": 5, "threshold_tokens": 300}})
+        with patch.object(self.z, "window_usage", return_value=(total, by_project)):
+            self.assertIn("past quota.threshold_tokens", self.z.quota_warning())
+            self.config({"order": ["claude"], "quota": {"threshold_tokens": 10 ** 9}})
+            self.assertIsNone(self.z.quota_warning())
+            self.config({"order": ["claude"]})
+            self.assertIsNone(self.z.quota_warning())  # no threshold configured: never warns
+            self.z.cmd_quota([])
+        self.assertIn("no quota.threshold_tokens set", self.output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

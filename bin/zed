@@ -33,7 +33,7 @@ import statistics
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 ZED_HOME = Path(__file__).resolve().parent.parent
@@ -695,6 +695,79 @@ def claude_usage(worktree, sid):
     return total
 
 
+QUOTA_DEFAULT_WINDOW_HOURS = 5
+QUOTA_DEFAULT_COUNTS = ("output", "input", "cache_write")
+
+
+def quota_settings():
+    return runtime_config().get("quota", {})
+
+
+def window_usage(hours, root=None):
+    """Claude tokens used in the last `hours` hours by every session on this machine (Zed's workers, Zed itself,
+    the user's own), summed from the transcripts under ~/.claude/projects. Returns (totals, {project dir: output tokens})."""
+    root = root or Path.home() / ".claude" / "projects"
+    cutoff = time.time() - hours * 3600
+    since = datetime.fromtimestamp(cutoff, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    total, by_project, seen = {"output": 0, "input": 0, "cache_read": 0, "cache_write": 0}, {}, set()
+    for f in root.glob("**/*.jsonl"):
+        if f.stat().st_mtime < cutoff:
+            continue
+        project_dir = f.relative_to(root).parts[0]
+        with f.open(errors="replace") as fh:
+            for line in fh:
+                if '"usage"' not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                m = r.get("message")
+                u = m.get("usage") if isinstance(m, dict) else None
+                if not u or str(r.get("timestamp", ""))[:19] < since or (m.get("id"), r.get("requestId")) in seen:
+                    continue
+                seen.add((m.get("id"), r.get("requestId")))
+                for key, field in (("output", "output_tokens"), ("input", "input_tokens"),
+                                   ("cache_read", "cache_read_input_tokens"), ("cache_write", "cache_creation_input_tokens")):
+                    total[key] += u.get(field) or 0
+                by_project[project_dir] = by_project.get(project_dir, 0) + (u.get("output_tokens") or 0)
+    return total, by_project
+
+
+def quota_estimate():
+    """(counted tokens, threshold or None, window hours, totals, by_project) for the configured window."""
+    q = quota_settings()
+    hours = q.get("window_hours", QUOTA_DEFAULT_WINDOW_HOURS)
+    total, by_project = window_usage(hours)
+    counted = sum(total[k] for k in q.get("counts", QUOTA_DEFAULT_COUNTS))
+    return counted, q.get("threshold_tokens"), hours, total, by_project
+
+
+def quota_warning():
+    """A one-line warning when the estimate has passed the configured threshold; None otherwise (or if none is set)."""
+    counted, threshold, hours, _, _ = quota_estimate()
+    if threshold and counted >= threshold:
+        return (f"quota: ~{counted / 1e6:.1f}M tokens counted in the last {hours}h, past quota.threshold_tokens "
+                f"({threshold / 1e6:.1f}M): the plan may be close to its limit; consider waiting before starting more workers")
+    return None
+
+
+def cmd_quota(args):
+    """quota — estimate plan usage from the session transcripts: Claude tokens in the rolling window, per project."""
+    require_profile()
+    counted, threshold, hours, total, by_project = quota_estimate()
+    q = quota_settings()
+    print(f"window: last {hours}h, rolling" + ("" if "window_hours" in q else
+          f" (default; set quota.window_hours in runtimes.json: the plan's real window isn't known to Zed)"))
+    print(f"tokens: {total['output'] / 1e6:.2f}M output, {total['input'] / 1e6:.2f}M input, "
+          f"{total['cache_write'] / 1e6:.2f}M cache-write, {total['cache_read'] / 1e6:.0f}M cache-read")
+    print(f"counted ({'+'.join(q.get('counts', QUOTA_DEFAULT_COUNTS))}): {counted / 1e6:.2f}M" + (
+        f" of threshold {threshold / 1e6:.1f}M ({100 * counted / threshold:.0f}%)" if threshold else
+        " (no quota.threshold_tokens set: no warnings; Zed doesn't know the plan's limit)"))
+    for name, out in sorted(by_project.items(), key=lambda kv: -kv[1])[:5]:
+        print(f"  {out / 1e6:.2f}M output  {name}")
+
+
 def fmt_usage(u):
     return (f"{u['output'] / 1e6:.2f}M output, {(u['input'] + u['cache_write']) / 1e6:.1f}M input, "
             f"{u['cache_read'] / 1e6:.0f}M cache-read tokens")
@@ -1085,6 +1158,8 @@ def cmd_spawn(args, worktree=None):
     if missing:
         die(f"brief {brief.name} lacks {', '.join(missing)} (templates/brief.md); no worker starts without a plan")
     runtime = choose_runtime(kv.get("runtime", "auto"))
+    if runtime == "claude" and (warning := quota_warning()):
+        print(f"zed: warning: {warning}", file=sys.stderr)
     require_capacity(conn, runtime, tid)  # a handoff has already closed the session it replaces
     model, effort, model_why = pick_model(runtime)
     if "model" in kv:  # the policy's effort belongs to the policy's model
@@ -1765,6 +1840,8 @@ def cmd_start(args):
     watcher = watcher_alive()
     running = conn.execute("SELECT COUNT(*) FROM sessions WHERE status IN ('running','waiting_user')").fetchone()[0]
     out.append(f"watcher: {'alive, pid ' + str(watcher) if watcher else 'NOT RUNNING' + (' — arm it: bin/zed watch --once (background)' if running else '')}")
+    if quota_settings().get("threshold_tokens"):
+        out.append(quota_warning() or "quota: under the configured threshold (`bin/zed quota` for detail)")
     out += notes + render_brief(conn)
     print("\n".join(out))
 
@@ -1793,6 +1870,8 @@ def cmd_help(args):
                                      (writes a handoff note, closes the old session, spawns the new one)
   runtime status | runtime limited <rt> [until=<when>] [note...] | runtime ok <rt>
                                      which runtimes are usable; mark one limited / available again
+  quota                              estimate plan usage from session transcripts (rolling window, all Claude
+                                     sessions); spawn warns past runtimes.json quota.threshold_tokens
   coordinator [routine|judgment] [--print]
                                      start Zed's own session on the cheaper routine model/effort (default) or the
                                      stronger judgment one (runtimes.json coordinator.<mode>, within the ceiling)
@@ -1812,7 +1891,7 @@ Session states: """ + ", ".join(SESSION_STATES))
 
 COMMANDS = {"task": cmd_task, "log": cmd_log, "q": cmd_q, "spawn": cmd_spawn, "session": cmd_session,
             "close": cmd_close, "adopt": cmd_adopt, "handoff": cmd_handoff, "watch": cmd_watch, "status": cmd_status,
-            "brief": cmd_brief, "coordinator": cmd_coordinator, "paths": cmd_paths, "start": cmd_start, "lock": cmd_lock, "runtime": cmd_runtime, "models": cmd_models, "help": cmd_help}
+            "brief": cmd_brief, "coordinator": cmd_coordinator, "quota": cmd_quota, "paths": cmd_paths, "start": cmd_start, "lock": cmd_lock, "runtime": cmd_runtime, "models": cmd_models, "help": cmd_help}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:

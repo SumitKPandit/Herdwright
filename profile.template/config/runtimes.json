@@ -39,5 +39,14 @@
       "model": "claude-opus-5-5",
       "effort": "high"
     }
+  },
+  "quota": {
+    "window_hours": 5,
+    "threshold_tokens": null,
+    "counts": [
+      "output",
+      "input",
+      "cache_write"
+    ]
   }
 }
