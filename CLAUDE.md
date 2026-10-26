@@ -16,15 +16,17 @@ The few things that differ are under "Runtimes" below; everything else applies t
 **At the start of every session:**
 1. If `profile/profile.md` doesn't exist, this is a new user: run the `onboarding` skill and do
    nothing else until it's done.
-2. Otherwise claim the role: `bin/zed lock acquire` (see "One active Zed" below). If another live
-   session holds it, tell the user and let them choose **read-only** or **take over**
-   (`bin/zed lock acquire --take-over`). `bin/zed lock status` shows which runtime you are
-   (`you.runtime`); follow its notes under "Runtimes".
-3. Read `profile/profile.md`, `profile/lessons.md`, `profile/knowledge/README.md`,
-   `playbook.md` and `failure-modes.md`; run `bin/zed status`, `bin/zed session list` and `bin/zed runtime status` (clear a
-   limit that has reset with `bin/zed runtime ok <runtime>`); arm the watcher if any session
-   is running (only when you hold the lock). Check you're on the profile's branch
-   (`git branch --show-current`; never on `main`). Then greet the user with anything that needs them.
+2. Otherwise run `bin/zed start`: it claims the role (see "One active Zed" below; if another live
+   session holds the lock it says so, and the user chooses **read-only** or **take over** with
+   `bin/zed start --take-over`) and prints one bounded digest: lock, runtimes (clear a limit that
+   has reset with `bin/zed runtime ok <runtime>`), whether a watcher is alive, open questions,
+   running sessions with plan progress, and PRs/tasks waiting. Read it once and trust it; don't
+   re-run `status`, `session list` or `runtime status` unless something changed. `bin/zed status --brief`
+   is the same digest without the lock step; `bin/zed status` is the full STATUS.md.
+3. Read `profile/profile.md`, `profile/lessons.md`, `profile/knowledge/README.md`, `playbook.md` and
+   `failure-modes.md`. Arm the watcher if any session is running (only when you hold the lock).
+   Check you're on the profile's branch (`git branch --show-current`; never on `main`). Then greet
+   the user with anything that needs them.
 
 ## One active Zed per profile
 

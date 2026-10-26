@@ -404,6 +404,27 @@ class ZedTests(unittest.TestCase):
         self.assertIn("ZED:DONE · Added the digest label", out)
         self.assertEqual(conn.execute("SELECT pr_url FROM sessions").fetchone()[0], "https://github.com/org/repo/pull/7")
 
+    def test_brief_status_is_bounded_and_start_prints_a_digest(self):
+        conn = self.session()
+        for i in range(20):
+            conn.execute("INSERT INTO questions(task_id,session_id,question,asked_at) VALUES (1,1,?,'now')", (f"q{i}",))
+        conn.commit()
+        brief = "\n".join(self.z.render_brief(conn, live={"qa:p1": {"agent_status": "idle"}}))
+        self.assertIn("8 more omitted", brief)
+        self.assertIn("S1 T1 qa claude running/idle", brief)
+        with patch.object(self.z, "cmd_lock"), patch.object(self.z, "holds_lock", return_value=True), \
+                patch.object(self.z, "live_agents", return_value={}), patch.object(self.z, "watcher_alive", return_value=None):
+            self.output.truncate(0)
+            self.z.cmd_start([])
+        self.assertIn("watcher: NOT RUNNING", self.output.getvalue())
+
+    def test_second_watcher_is_refused(self):
+        with patch.object(self.z, "require_lock"), patch.object(self.z, "watcher_alive", return_value=999):
+            with self.assertRaises(SystemExit) as e:
+                self.z.cmd_watch(["--once"])
+        self.assertEqual(e.exception.code, 4)
+        self.assertIn("WATCH_ALREADY_RUNNING", self.output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,6 +21,7 @@ mutating commands and `watch` refuse. See `zed lock`.
 
 Run `zed help` for commands.
 """
+import atexit
 import fcntl
 import json
 import math
@@ -48,6 +49,7 @@ RUNTIMES_PATH = PROFILE_DIR / "config" / "runtimes.json"
 MODEL_RANKING_PATH = PROFILE_DIR / "config" / "model-ranking.json"
 RUNTIME_STATE_PATH = PROFILE_DIR / ".cache" / "runtime-state.json"
 WATCH_STATE_PATH = PROFILE_DIR / ".cache" / "watch-state.json"
+WATCHER_PID_PATH = PROFILE_DIR / ".cache" / "watch.pid"
 COPILOT_INSTRUCTIONS_DIR = PROFILE_DIR / ".cache" / "copilot-instructions"
 
 # What Zed needs to know about each agent CLI it can run on. Everything user-specific (which ones
@@ -685,8 +687,7 @@ def render_status(conn, live=None):
                 credits += f" · {fmt_usage(u)}" if u else ""
             out.append(f"- S{s['id']}{ext} `{s['agent']}` {s['repo']} `{s['branch']}` ← `{s['base']}` · {state}{rt}{credits}{pr}")
         for plan in plan_files(t["id"]):
-            text = plan.read_text()
-            done, todo = len(re.findall(r"^\s*- \[[xX]\]", text, re.M)), len(re.findall(r"^\s*- \[ \]", text, re.M))
+            done, todo = plan_progress(plan)
             out.append(f"- plan `{plan.name}`: {done}/{done + todo} steps done")
         last = conn.execute("SELECT * FROM events WHERE task_id=? ORDER BY id DESC LIMIT 3", (t["id"],)).fetchall()
         for e in reversed(last):
@@ -1398,6 +1399,15 @@ def lapse_tick(s, state, seq, alerts):
                     "(read its screen; it may be waiting on something or lost)")
 
 
+def watcher_alive():
+    """pid of a live `zed watch` for this profile, or None (a stale pid file or a reused pid doesn't count)."""
+    pid = read_json(WATCHER_PID_PATH, {}).get("pid")
+    if not pid or pid == os.getpid():
+        return None
+    r = run(["ps", "-o", "command=", "-p", str(pid)], check=False)
+    return pid if r.returncode == 0 and re.search(r"\bzed\b.*\bwatch\b", r.stdout) else None
+
+
 def cmd_watch(args):
     """Emit one line whenever a managed worker changes to a state that needs Zed's attention.
     Claude Code: run it under the Monitor tool. Copilot CLI: run `watch --once` as a detached shell; it
@@ -1408,6 +1418,13 @@ def cmd_watch(args):
     interval = float(rest[0]) if rest else 3.0
     db().close()
     require_lock()
+    other = watcher_alive()
+    if other:
+        print(f"WATCH_ALREADY_RUNNING pid {other}: one watcher is enough; it will wake Zed.", flush=True)
+        sys.exit(4)
+    WATCHER_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+    WATCHER_PID_PATH.write_text(json.dumps({"pid": os.getpid(), "started": now()}))
+    atexit.register(lambda: WATCHER_PID_PATH.unlink(missing_ok=True))
     saved = read_json(WATCH_STATE_PATH, None)
     prev = {int(k): v for k, v in saved.items()} if saved is not None else {}
     first = saved is None
@@ -1544,7 +1561,7 @@ def health_events(conn, s, a, state, alerts):
         if u:
             step = u["output"] // USAGE_ALERT_OUTPUT
             if step > seen.setdefault("usage_step", 0):
-                done = sum(len(re.findall(r"^\s*- \[[xX]\]", p.read_text(), re.M)) for p in plan_files(s["task_id"]))
+                done = sum(plan_progress(p)[0] for p in plan_files(s["task_id"]))
                 if done <= seen.get("usage_plan_done", -1):  # tokens spent with no plan progress: needs judgment
                     out.append(f"{tag} · USAGE without plan progress: {fmt_usage(u)}, still {done} steps done")
                 else:
@@ -1562,12 +1579,75 @@ def cmd_paths(args):
                       "model_ranking": str(MODEL_RANKING_PATH)}, indent=2))
 
 
+BRIEF_LINES = 12  # per section; the rest is "N more omitted"
+
+
+def capped(lines, limit=BRIEF_LINES):
+    return lines[:limit] + ([f"  … {len(lines) - limit} more omitted"] if len(lines) > limit else [])
+
+
+def render_brief(conn, live=None):
+    """Only what needs the user or Zed, in a bounded digest: open questions, sessions that need a look,
+    PRs waiting on review, tasks not started."""
+    live = live if live is not None else live_agents()
+    out = []
+    qs = [f"  Q{q['id']} T{q['task_id']} ({q['asked_at']}): {q['question'].splitlines()[0][:200]}"
+          for q in conn.execute("SELECT * FROM questions WHERE status='open' ORDER BY id")]
+    out += ["Waiting on the user:", *(capped(qs) or ["  nothing"])]
+    sess = []
+    for s in conn.execute("SELECT * FROM sessions WHERE status IN ('running','waiting_user') ORDER BY id"):
+        a = live.get(s["pane_id"])
+        state = a["agent_status"] if a else "GONE"
+        plan = [plan_progress(p) for p in plan_files(s["task_id"])]
+        note = f" · plan {plan[0][0]}/{plan[0][0] + plan[0][1]}" if plan else ""
+        sess.append(f"  S{s['id']} T{s['task_id']} {s['agent']} {s['runtime']} {s['status']}/{state}{note}")
+    out += ["Sessions running:", *(capped(sess) or ["  none"])]
+    other = [f"  T{t['id']} {t['status']} {t['jira'] or '-'} {t['title']}" for t in conn.execute(
+        "SELECT * FROM tasks WHERE status IN ('pr_open','intake','parked') ORDER BY id")]
+    out += ["PR open / not started / parked:", *(capped(other) or ["  none"])]
+    return out
+
+
+def plan_progress(plan):
+    text = plan.read_text()
+    return len(re.findall(r"^\s*- \[[xX]\]", text, re.M)), len(re.findall(r"^\s*- \[ \]", text, re.M))
+
+
 def cmd_status(args):
     conn = db()
+    if "--brief" in args:
+        print("\n".join(render_brief(conn)))
+        return
     text = render_status(conn)
     if holds_lock():
         STATUS_PATH.write_text(text)
     print(text)
+
+
+def cmd_start(args):
+    """start [--take-over] — session start in one command: claim the Zed lock, then print one bounded
+    digest (lock, runtimes, watcher, what needs the user, running sessions). Read it once and trust it."""
+    require_profile()
+    notes = []
+    try:
+        cmd_lock(["acquire", *(["--take-over"] if "--take-over" in args else [])])
+    except SystemExit as e:
+        notes.append("NOT THE ACTIVE ZED: the lock is held by another live session. Read-only: no watcher, "
+                     "no prompting workers, no commits. Ask the user: stay read-only or `bin/zed start --take-over`.")
+        if e.code not in (1, 2):
+            raise
+    conn = db()
+    lock = read_lock()
+    out = [f"Zed home {ZED_HOME} · profile {PROFILE_DIR}",
+           f"lock: {'held by this session (' + (me().get('runtime') or '?') + ')' if holds_lock() else describe(lock) if lock else 'none'}",
+           "runtimes: " + "; ".join(
+               f"{n} {'LIMITED ' + json.dumps(r['limited']) if r['limited'] else 'ok' if r['installed'] and r['enabled'] else 'unusable'}"
+               for n, r in ((n, runtime_report(n)) for n in runtime_config().get("order", [])))]
+    watcher = watcher_alive()
+    running = conn.execute("SELECT COUNT(*) FROM sessions WHERE status IN ('running','waiting_user')").fetchone()[0]
+    out.append(f"watcher: {'alive, pid ' + str(watcher) if watcher else 'NOT RUNNING' + (' — arm it: bin/zed watch --once (background)' if running else '')}")
+    out += notes + render_brief(conn)
+    print("\n".join(out))
 
 
 def cmd_help(args):
@@ -1593,7 +1673,8 @@ def cmd_help(args):
                                      the model ranking and what the policy picks per runtime
   watch [interval-seconds] [--once]  Claude: run under Monitor. Copilot: run `watch --once` as a
                                      detached shell; it exits after the first event(s)
-  status                             (regenerate + print STATUS.md)
+  status [--brief]                   (regenerate + print STATUS.md; --brief: only what needs attention)
+  start [--take-over]                (session start: claim the lock, print one bounded digest)
   paths                              (Zed home, profile dir, DB/STATUS/config/briefs locations)
   lock status | lock acquire [--take-over] | lock release
                                      one active Zed per profile; without the lock only
@@ -1604,7 +1685,7 @@ Session states: """ + ", ".join(SESSION_STATES))
 
 COMMANDS = {"task": cmd_task, "log": cmd_log, "q": cmd_q, "spawn": cmd_spawn, "session": cmd_session,
             "close": cmd_close, "adopt": cmd_adopt, "handoff": cmd_handoff, "watch": cmd_watch, "status": cmd_status,
-            "paths": cmd_paths, "lock": cmd_lock, "runtime": cmd_runtime, "models": cmd_models, "help": cmd_help}
+            "paths": cmd_paths, "start": cmd_start, "lock": cmd_lock, "runtime": cmd_runtime, "models": cmd_models, "help": cmd_help}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
