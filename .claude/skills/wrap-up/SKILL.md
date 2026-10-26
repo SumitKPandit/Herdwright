@@ -10,7 +10,8 @@ A session can be closed when **all** hold:
 - no open questions for it (`bin/zed q list`);
 - nobody is waiting for it to act (e.g. PR review fixes requested → keep it, or respawn later).
 
-Then `bin/zed close <S>` (refuses if the worktree has unpushed/uncommitted work; never pass
+First harvest the worker's `Learnings:` (from its ZED:DONE) into `knowledge/repos/<repo>.md`
+following `knowledge/README.md`. Then `bin/zed close <S>` (refuses if the worktree has unpushed/uncommitted work; never pass
 `force` without the user's OK). Tell the user it was closed and where to resume from (PR/branch).
 
 Mark the task: `pr_open` while PRs await review/merge; `done` only when the user says it's done

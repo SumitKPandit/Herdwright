@@ -16,10 +16,10 @@
 - <...>
 
 ## QA
-- Browser tool: <tool>
-- Environment / how to log in: <...>
+- Browser: playwright-cli (fallback agent-browser) — see conventions.md
+- Environment / how to log in: <from knowledge/repos/<repo>.md, or "ask Zed if unclear">
 
 ## Definition of done
 - <acceptance criteria>
-- QA done in the browser, self-review done, committed per convention, PR raised against <base>.
+- QA done in the browser, self-review done, committed and PR raised per conventions.md against <base>.
 - Finish with a ZED:DONE block.

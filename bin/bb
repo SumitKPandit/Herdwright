@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""bb — minimal Bitbucket Cloud helper for Zed workers (cm-api, cm_db, cm_lib).
+
+Auth: an Atlassian API token with Bitbucket scopes, stored in the macOS Keychain
+(never in this repo):
+  security add-generic-password -U -s zed-bitbucket -a <atlassian-email> -w
+Then check it with:  bin/bb whoami
+
+Usage
+  bb whoami
+  bb pr create --title T --source BRANCH --dest BRANCH [--body-file F] [--draft] [--reviewer NICK ...]
+  bb pr view <id> [--repo criticalmedianyc/cm_api]
+  bb pr list [--state OPEN] [--repo ...]
+  bb pr ready <id>                     (clear draft)
+Repo defaults to the `origin` remote of the current directory.
+"""
+import argparse
+import base64
+import json
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+API = "https://api.bitbucket.org/2.0"
+SERVICE = "zed-bitbucket"
+
+
+def die(msg):
+    print(f"bb: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def credentials():
+    r = subprocess.run(["security", "find-generic-password", "-s", SERVICE], capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"no Keychain item '{SERVICE}'. Store one with:\n"
+            f"  security add-generic-password -U -s {SERVICE} -a <atlassian-email> -w")
+    m = re.search(r'"acct"<blob>="([^"]*)"', r.stdout)
+    token = subprocess.run(["security", "find-generic-password", "-s", SERVICE, "-w"],
+                           capture_output=True, text=True).stdout.strip()
+    if not m or not token:
+        die("Keychain item is missing the account (email) or the token")
+    return m.group(1), token
+
+
+def call(method, path, body=None):
+    email, token = credentials()
+    req = urllib.request.Request(API + path, method=method,
+                                 data=json.dumps(body).encode() if body is not None else None)
+    req.add_header("Authorization", "Basic " + base64.b64encode(f"{email}:{token}".encode()).decode())
+    req.add_header("Accept", "application/json")
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        die(f"{method} {path} → HTTP {e.code}\n{e.read().decode(errors='replace')}")
+
+
+def repo_from_origin():
+    url = subprocess.run(["git", "remote", "get-url", "origin"], capture_output=True, text=True).stdout.strip()
+    m = re.search(r"bitbucket\.org[:/]([^/]+)/([^/.]+?)(?:\.git)?$", url)
+    if not m:
+        die(f"origin is not a Bitbucket repo: {url!r}; pass --repo workspace/slug")
+    return f"{m.group(1)}/{m.group(2)}"
+
+
+def user_uuid(nick):
+    """Bitbucket reviewers must be account UUIDs; names are not resolvable without admin scopes."""
+    if nick.startswith("{"):
+        return nick
+    die(f"pass reviewers as Bitbucket account UUIDs ({{...}}); '{nick}' is not one. "
+        "Ask Zed for the reviewer UUIDs (knowledge/people.md).")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="bb")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("whoami")
+    pr = sub.add_parser("pr").add_subparsers(dest="pr_cmd", required=True)
+    c = pr.add_parser("create")
+    c.add_argument("--title", required=True)
+    c.add_argument("--source", required=True)
+    c.add_argument("--dest", required=True)
+    c.add_argument("--body-file")
+    c.add_argument("--draft", action="store_true")
+    c.add_argument("--reviewer", action="append", default=[])
+    c.add_argument("--repo")
+    for name in ("view", "ready"):
+        p = pr.add_parser(name)
+        p.add_argument("id")
+        p.add_argument("--repo")
+    l = pr.add_parser("list")
+    l.add_argument("--state", default="OPEN")
+    l.add_argument("--repo")
+    a = ap.parse_args()
+
+    if a.cmd == "whoami":
+        u = call("GET", "/user")
+        print(f"{u.get('display_name')} ({u.get('nickname')}) {u.get('uuid')}")
+        return
+    repo = a.repo or repo_from_origin()
+    if a.pr_cmd == "create":
+        body = {"title": a.title,
+                "source": {"branch": {"name": a.source}},
+                "destination": {"branch": {"name": a.dest}},
+                "description": open(a.body_file).read() if a.body_file else "",
+                "draft": a.draft,
+                "reviewers": [{"uuid": user_uuid(r)} for r in a.reviewer]}
+        r = call("POST", f"/repositories/{repo}/pullrequests", body)
+        print(r["links"]["html"]["href"])
+    elif a.pr_cmd == "view":
+        r = call("GET", f"/repositories/{repo}/pullrequests/{a.id}")
+        print(json.dumps({k: r.get(k) for k in ("id", "title", "state", "draft")}
+                         | {"url": r["links"]["html"]["href"],
+                            "source": r["source"]["branch"]["name"],
+                            "dest": r["destination"]["branch"]["name"]}, indent=2))
+    elif a.pr_cmd == "ready":
+        r = call("PUT", f"/repositories/{repo}/pullrequests/{a.id}", {"draft": False})
+        print(f"ready: {r['links']['html']['href']}")
+    elif a.pr_cmd == "list":
+        r = call("GET", f"/repositories/{repo}/pullrequests?state={a.state}&pagelen=20")
+        for p in r.get("values", []):
+            print(f"#{p['id']} {p['source']['branch']['name']} → {p['destination']['branch']['name']}  {p['title']}")
+
+
+if __name__ == "__main__":
+    main()

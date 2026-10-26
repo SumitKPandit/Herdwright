@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   claude_session_id TEXT,
   pr_url TEXT,
   status TEXT NOT NULL DEFAULT 'running',
+  external INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -89,6 +90,9 @@ def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(sessions)")]
+    if "external" not in cols:  # migrate DBs created before session adoption existed
+        conn.execute("ALTER TABLE sessions ADD COLUMN external INTEGER NOT NULL DEFAULT 0")
     return conn
 
 
@@ -203,7 +207,8 @@ def render_status(conn, live=None):
                 a = live.get(s["pane_id"])
                 state += f" / agent {a['agent_status']}" if a else " / agent NOT FOUND"
             pr = f" · PR {s['pr_url']}" if s["pr_url"] else ""
-            out.append(f"- S{s['id']} `{s['agent']}` {s['repo']} `{s['branch']}` ← `{s['base']}` · {state}{pr}")
+            ext = " (external)" if s["external"] else ""
+            out.append(f"- S{s['id']}{ext} `{s['agent']}` {s['repo']} `{s['branch']}` ← `{s['base']}` · {state}{pr}")
         last = conn.execute("SELECT * FROM events WHERE task_id=? ORDER BY id DESC LIMIT 3", (t["id"],)).fetchall()
         for e in reversed(last):
             out.append(f"  - {e['ts']} [{e['kind']}] {e['text']}")
@@ -434,7 +439,9 @@ def cmd_spawn(args):
 
     # 3. hand over the brief
     pr = run(["herdr", "agent", "prompt", agent,
-              f"You are session S{sid} for Zed task T{tid}. Read your brief at {brief} and follow it.",
+              f"You are session S{sid} for Zed task T{tid}. Zed's home is {ZED_HOME}. "
+              f"Read your brief at {brief}, then {ZED_HOME}/knowledge/conventions.md, and "
+              f"{ZED_HOME}/knowledge/repos/{kv['repo']}.md if it exists. Then start.",
               "--wait", "--until", "working", "--until", "blocked", "--timeout", "30000"], check=False)
     print(json.dumps({"task": f"T{tid}", "session": f"S{sid}", "agent": agent, "pane": pane_id,
                       "workspace": ws_id, "worktree": str(worktree), "prompt_ok": pr.returncode == 0}))
@@ -474,6 +481,14 @@ def cmd_close(args):
     conn = db()
     ref = args[0][1:] if args[0].startswith("S") and args[0][1:].isdigit() else args[0]
     s = resolve_session(conn, ref)
+    if s["external"]:
+        # Not ours: never close the user's pane/workspace or touch their files.
+        conn.execute("UPDATE sessions SET status='closed', updated_at=? WHERE id=?", (now(), s["id"]))
+        log_event(conn, s["task_id"], "close", f"S{s['id']} external session untracked (left running)")
+        conn.commit()
+        write_status(conn)
+        print(f"untracked S{s['id']} (external session left running)")
+        return
     wt = Path(s["worktree"])
     if "keep-worktree" not in args and wt.exists():
         dirty = run(["git", "-C", str(wt), "status", "--porcelain"], check=False).stdout.strip()
@@ -492,6 +507,33 @@ def cmd_close(args):
     conn.commit()
     write_status(conn)
     print(f"closed S{s['id']}")
+
+
+def cmd_adopt(args):
+    """adopt <pane-id> <task-id> [repo=] — track a Claude session Zed didn't start. Never closed by Zed."""
+    if len(args) < 2:
+        die("adopt <pane-id> <task-id> [repo=<name>]")
+    pane_id, tid = args[0], int(args[1].lstrip("T"))
+    kv = parse_kv(args[2:])
+    conn = db()
+    get_task(conn, tid)
+    a = live_agents().get(pane_id)
+    if not a:
+        die(f"no live agent in pane {pane_id}")
+    cwd = a.get("cwd") or ""
+    branch = run(["git", "-C", cwd, "branch", "--show-current"], check=False).stdout.strip() or "-"
+    ts = now()
+    cur = conn.execute(
+        "INSERT INTO sessions(task_id,repo,base,branch,worktree,agent,workspace_id,pane_id,claude_session_id,status,external,created_at,updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?)",
+        (tid, kv.get("repo", Path(cwd).name), "-", branch, cwd, a.get("name") or pane_id, a["workspace_id"], pane_id,
+         (a.get("agent_session") or {}).get("value"), "running", ts, ts))
+    log_event(conn, tid, "adopt", f"S{cur.lastrowid} adopted external session in {pane_id} ({cwd})")
+    conn.execute("UPDATE tasks SET status='active' WHERE id=? AND status='intake'", (tid,))
+    touch_task(conn, tid)
+    conn.commit()
+    write_status(conn)
+    print(f"S{cur.lastrowid}")
 
 
 def cmd_watch(args):
@@ -538,7 +580,8 @@ def cmd_help(args):
   q add <T|-> <question...> [session=S] | q answer <Q> <answer...> | q list
   spawn <T> repo= base= branch= brief=<file> [name=<agent>]
   session list | session set <S|agent> key=value... (status pr_url claude_session_id pane_id workspace_id base)
-  close <S|agent> [keep-worktree] [force]
+  close <S|agent> [keep-worktree] [force]   (external sessions are only untracked)
+  adopt <pane-id> <T> [repo=]        track a session Zed didn't start (user's own)
   watch [interval-seconds]           (run under Monitor)
   status                             (regenerate + print STATUS.md)
 Task states:    """ + ", ".join(TASK_STATES) + """
@@ -546,7 +589,7 @@ Session states: """ + ", ".join(SESSION_STATES))
 
 
 COMMANDS = {"task": cmd_task, "log": cmd_log, "q": cmd_q, "spawn": cmd_spawn, "session": cmd_session,
-            "close": cmd_close, "watch": cmd_watch, "status": cmd_status, "help": cmd_help}
+            "close": cmd_close, "adopt": cmd_adopt, "watch": cmd_watch, "status": cmd_status, "help": cmd_help}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:

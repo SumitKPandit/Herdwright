@@ -2,10 +2,6 @@
 
 _Source: the user, 2026-10-26. Update when the user says otherwise._
 
-## The user
-Engineering manager of **Mention** (Onclusive). Wants oversight of all team-lead, EM, product and
-business decisions; workers handle engineering mechanics themselves.
-
 ## Apps
 Mention currently consists of two apps:
 
@@ -21,9 +17,12 @@ Mention currently consists of two apps:
   - `cm-fe` — frontend. Working base branch is `releases/vX.Y.Z`
     (as of 2026-10-26: `releases/v4.44.1`). Confirm the current one from recent PRs.
   - `cm-api` — backend (Bitbucket). Same convention (as of 2026-10-26: `releases/v6.2.1`).
-  - `cm_db` — DB procedures used by cm-api (Bitbucket).
+  - `cm_db` — DB procedures used by cm-api (Bitbucket; default branch `master`).
+  - `cm-lib` — business rules that cm-api needs (Python; Bitbucket `criticalmedianyc/cm_lib`,
+    default `master`). Note: the clone lives at `cm-lib/master/`, not `cm-lib/`.
 - **Shared**
-  - `cm-reports` — reports module, shared by CM and 360.
+  - `cm-reports` — reports module (Vue 2-compatible components), shared by CM and 360.
+    Base branch for new work depends on the consumer: CM → `main`, 360 → `medusa`.
     - `main` → linked into `cm-fe` to provide CM's reports.
     - `medusa` → consumed by 360; cm-reports builds medusa's dist files and pushes them into
       `onclusive-core-client`.
@@ -32,13 +31,15 @@ Mention currently consists of two apps:
   - `unified-mention/` — plans for truly merging into one app: one frontend repo, one backend
     repo, one DB.
 
-## Other folders in ~/codebase/mention (purpose not yet confirmed by the user)
-`claim`, `gum`, `iac`, `cm-lib`, `prompt-library`.
+## Other repos / folders
+- `claim` — CLAIM (Client, Account and Identity Management): Fastify/TS/Prisma service for managing
+  Auth0 users across Onclusive apps. GitHub `AirPR/claim`, default `main`. Has its own CLAUDE.md.
+- `gum` — GUM (Global User Management): predecessor/sibling of CLAIM, same stack. GitHub `AirPR/gum`,
+  default `main`. (Relationship to CLAIM inferred, unconfirmed.)
+- `iac` — not a git repo; the user's research notes/configs on 360's current infrastructure (Porter),
+  made for writing a disaster recovery plan.
+- `prompt-library` — the user's project to build an agentic engineering workflow (Claude Code /
+  Copilot instructions and skills) to scale across the team. GitHub `skpstg/prompt-library`, default `main`.
 
-## Conventions
-- Jira project: MENT. Branch: `<worktype>/<jira-id-lower>-<short-desc>`,
-  e.g. `story/ment-123-digest-ai-disclosure`.
-- Commit: `MENT-123 | Add AI Disclosure Label to Digest Summary` (affirmative, imperative).
-- Before commit/PR: browser QA + self-review for clean, readable, maintainable code.
-- Workers may raise PRs. Any other outward communication (Jira, Confluence, Slack, comments)
-  needs the user's approval first.
+
+Conventions (branches, commits, PRs, QA): see `conventions.md`.
