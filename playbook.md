@@ -93,3 +93,9 @@ Facts about a particular user or their work never go here (they go to the profil
   (`total_nano_aiu`) is not interchangeable with the CLI's displayed AI Credits. **How:** capture
   the completed session's `/usage`, record that total and its provenance, and label any interim
   telemetry separately instead of converting it into a claimed billed-credit figure.
+- **A worker's permission prompts can queue, and the watcher reports a block only once.** **Why:**
+  after I approved one prompt, more followed (6 queued), `watch --once` stayed silent because the
+  session was already reported as blocked, and the worker idled unnoticed. **How:** after every
+  approval, read the screen again until the agent is `working` and no prompt is showing, before
+  re-arming. Read each prompt before answering; never send a blind "don't ask again" or Down+Enter.
+  While a worker is blocked, check `bin/zed session list` for `agent=blocked` on every turn.
