@@ -124,8 +124,9 @@ or both) and in what order to use them; `bin/zed runtime status` shows which are
 Claude and Copilot have separate usage limits. When one is limited, new workers go to the next one
 and paused workers can be handed over with the user's OK (`switch-runtime` skill).
 
-- **Claude Code**: watch with the Monitor tool running `bin/zed watch` (timeout 1800000); re-arm
-  when it expires.
+- **Claude Code**: run `bin/zed watch --once` with Bash `run_in_background`. It exits on the first
+  event and wakes me; handle it and start it again. Unlike the Monitor tool, it never expires, so no
+  turns are spent re-arming it.
 - **Copilot CLI**: there is no Monitor. Run `bin/zed watch --once` with the bash tool as a
   **detached** background shell, then end your turn. When it exits (after the first event) you're
   notified ("Detached shell … completed"): read its output, handle the events, and start it again

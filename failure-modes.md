@@ -13,7 +13,8 @@ row here and, where possible, a check in `bin/zed`.
 | Model or effort above what the work needs | Limit hit early | Enforced: per-runtime `ceiling` and `max_effort` in `runtimes.json` |
 | Parallel fan-out bigger than the plan can sustain | Everything pauses at once | Practice: size the wave to the plan; Enforced: watcher `USAGE` every 0.5M output tokens |
 | Model used for deterministic work (checks, status, publishing) | Tokens burnt on clerical steps | Practice: scripts first, for me and workers (directive 9) |
-| I read long screens or files into my own context | My session hits the limit | Practice: `tail`/`grep` the part I need; delegate anything bigger |
+| I read long screens or files into my own context | My session hits the limit | Enforced: blocked events carry the prompt text. Practice: `tail`/`grep` the part I need; delegate anything bigger |
+| A model does work a script or API could do (publishing, checks, status) | Tokens and limits burnt on clerical steps | Practice: before every brief, list deterministic steps and the access needed to script them; ask the user for missing access at once |
 | Copilot credits spent without a cap | Surprise bill | Practice: per-task decision recorded in the profile |
 
 ## Silent stalls
