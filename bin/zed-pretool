@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""zed-pretool — Claude Code PreToolUse hook that keeps the Zed coordinator from doing the work itself.
+
+Ported from firstmate's fm-subagent-pretool-check / fm-cd-pretool-check / fm-primary-scope-lib. Prime directive 1:
+engineering work is delegated to worker sessions; the coordinator only does bookkeeping in Zed's own repo.
+
+It acts ONLY in the session that holds the profile's Zed lock (the hook payload's session_id must equal the
+lock's agent session). Workers, read-only sessions and every other tool call pass untouched. It is fail-open: a
+parse problem or an unexpected payload allows the call.
+
+For the coordinator it denies:
+  * Edit / Write / NotebookEdit of a file outside Zed's home, the profile and the temp dirs
+  * Bash: git commit/push/rebase/merge/cherry-pick/reset/revert/add/apply/am/tag/stash in a repo outside Zed's home,
+    a persistent top-level `cd` outside Zed's home (it silently changes where later commands run), writes
+    (`>`, `>>`, rm, mv, cp, touch, mkdir, tee, sed -i, perl -i) to paths outside the allowed roots
+  * Agent / Workflow tools (delegate with `bin/zed spawn`; pass --allow-subagents to permit them)
+Reads are never blocked.
+
+Register in .claude/settings.json (hooks.PreToolUse, matcher "*") with command `bin/zed-pretool`.
+Test a payload:  echo '<json>' | zed-pretool --explain
+"""
+import argparse
+import json
+import os
+import re
+import shlex
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import zedlib  # noqa: E402
+
+GIT_WRITE = {"commit", "push", "rebase", "merge", "cherry-pick", "reset", "revert", "add", "apply", "am", "tag", "stash", "rm", "mv", "restore"}
+FILE_WRITERS = {"rm", "mv", "cp", "touch", "mkdir", "tee", "ln", "rmdir", "truncate"}
+OPERATORS = {"&&", "||", ";", "|", "&", "(", ")"}
+REDIRECTS = {">", ">>", ">|"}
+
+
+def allowed_roots(zed_home=None, profile=None):
+    roots = [zed_home or zedlib.ZED_HOME, profile or zedlib.PROFILE_DIR, Path(tempfile.gettempdir()), Path("/tmp"), Path("/private/tmp")]
+    return [Path(os.path.realpath(r)) for r in roots]
+
+
+def inside(path, roots, cwd):
+    p = Path(os.path.expanduser(str(path)))
+    p = p if p.is_absolute() else Path(cwd) / p
+    p = Path(os.path.realpath(p))
+    return any(p == r or r in p.parents for r in roots)
+
+
+def lock_holder_session(lock_path=None):
+    lock = zedlib.read_json(lock_path or zedlib.PROFILE_DIR / ".cache" / "zed.lock", {}) or {}
+    return lock.get("agent_session") or lock.get("claude_session")
+
+
+def strip_heredocs(cmd):
+    return re.sub(r"<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n.*?\n\s*\1\s*(?=\n|$)", "\n", cmd, flags=re.S)
+
+
+def tokens(cmd):
+    lex = shlex.shlex(strip_heredocs(cmd).replace("\n", " ; "), posix=True, punctuation_chars=True)
+    lex.whitespace_split = False
+    return list(lex)
+
+
+def split_commands(toks):
+    """[(words, depth_zero)] — simple commands with redirections kept as words; depth_zero False inside ( ... )."""
+    cmds, cur, depth = [], [], 0
+    for t in toks:
+        if t in OPERATORS:
+            if cur:
+                cmds.append((cur, depth == 0))
+            cur = []
+            depth += 1 if t == "(" else -1 if t == ")" else 0
+        else:
+            cur.append(t)
+    if cur:
+        cmds.append((cur, depth == 0))
+    return cmds
+
+
+def git_target(words, cwd):
+    """(subcommand, repo dir) of a `git ...` command, skipping global options."""
+    i, target = 1, cwd
+    while i < len(words):
+        w = words[i]
+        if w == "-C" and i + 1 < len(words):
+            target = words[i + 1] if os.path.isabs(os.path.expanduser(words[i + 1])) else str(Path(target) / words[i + 1])
+            i += 2
+        elif w in ("-c", "--git-dir", "--work-tree") and i + 1 < len(words):
+            i += 2
+        elif w.startswith("-"):
+            i += 1
+        else:
+            return w, target
+    return None, target
+
+
+def bash_problem(cmd, cwd, roots):
+    try:
+        cmds = split_commands(tokens(cmd))
+    except ValueError:
+        return None  # unbalanced quotes etc.: fail open
+    for words, top in cmds:
+        words = [w for w in words if not re.fullmatch(r"\w+=.*", w)] if words and re.fullmatch(r"\w+=.*", words[0]) else words
+        if not words:
+            continue
+        if words[0] == "cd" and top and len(words) > 1 and words[1] != "-" and not inside(words[1], roots, cwd):
+            return f"don't `cd` into {words[1]}: it silently changes where later commands run. Use absolute paths or `git -C` for reads, and delegate changes to a worker (bin/zed spawn)."
+        if words[0] == "git":
+            sub, target = git_target(words, cwd)
+            if sub in GIT_WRITE and not inside(target, roots, cwd):
+                return f"`git {sub}` in {target}: project repos are changed only by workers (bin/zed spawn). Zed commits only in its own repo."
+        for i, w in enumerate(words):
+            if w in REDIRECTS and i + 1 < len(words) and not words[i + 1].startswith("&") and not inside(words[i + 1], roots, cwd):
+                return f"writing to {words[i + 1]} is outside Zed's repo/profile/tmp: that is a worker's job."
+        name = Path(words[0]).name
+        in_place = name in ("sed", "perl") and any(re.fullmatch(r"-\w*i\w*", w) or w.startswith("-i") for w in words[1:])
+        if name in FILE_WRITERS or in_place:
+            for w in words[1:]:
+                if not w.startswith("-") and (os.path.isabs(os.path.expanduser(w)) or w.startswith("~")) and not inside(w, roots, cwd):
+                    return f"`{name}` on {w}: outside Zed's repo/profile/tmp. Project files are changed by workers (bin/zed spawn)."
+    return None
+
+
+def decide(payload, holder=None, roots=None, allow_subagents=False):
+    """Reason to deny this tool call, or None to allow it."""
+    holder = holder if holder is not None else lock_holder_session()
+    if not holder or payload.get("session_id") != holder:
+        return None  # not the coordinator
+    roots = roots or allowed_roots()
+    tool, inp, cwd = payload.get("tool_name"), payload.get("tool_input") or {}, payload.get("cwd") or os.getcwd()
+    if tool in ("Edit", "Write", "NotebookEdit", "MultiEdit"):
+        path = inp.get("file_path") or inp.get("notebook_path")
+        if path and not inside(path, roots, cwd):
+            return f"{path} is outside Zed's repo, profile and temp dirs. Zed does not edit project files: put it in a brief and spawn a worker (bin/zed spawn)."
+    elif tool == "Bash":
+        return bash_problem(inp.get("command", ""), cwd, roots)
+    elif tool in ("Agent", "Task", "Workflow") and not allow_subagents:
+        return "Zed delegates engineering work to worker sessions in herdr (bin/zed spawn), not to in-process subagents."
+    return None
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="zed-pretool", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--allow-subagents", action="store_true")
+    ap.add_argument("--explain", action="store_true", help="print the decision in words instead of hook JSON")
+    a = ap.parse_args(argv)
+    try:
+        reason = decide(json.load(sys.stdin), allow_subagents=a.allow_subagents)
+    except Exception:  # fail open: a guard bug must never brick the coordinator
+        return 0
+    if a.explain:
+        print(f"deny: {reason}" if reason else "allow")
+    elif reason:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                 "permissionDecisionReason": f"zed-pretool: {reason}"}}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
