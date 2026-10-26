@@ -1,6 +1,6 @@
 # Zed status
 
-_Generated 2026-10-26 08:37 from db/zed.db. Do not edit by hand._
+_Generated 2026-10-26 08:41 from db/zed.db. Do not edit by hand._
 
 ## Waiting on you
 
@@ -18,7 +18,7 @@ _Generated 2026-10-26 08:37 from db/zed.db. Do not edit by hand._
 ### T2 · no-jira · Split Zed into shareable core (main) and per-user profile (branch)
 - status: **active** · worktype: chore · updated 2026-10-26 08:37
 - User wants anyone to clone Zed and onboard; Sumit's work lives on a separate branch
-- S2 `t2-zed` zed `chore/zed-core-profile-split` ← `main` · running / agent idle
+- S2 `t2-zed` zed `chore/zed-core-profile-split` ← `main` · running / agent working
   - 2026-10-26 08:36 [decision] decision: no history rewrite needed (user, 2026-10-26)
   - 2026-10-26 08:36 [decision] decision: strict no-assumption rule and browser QA before every PR are universal Zed traits (user, 2026-10-26)
   - 2026-10-26 08:37 [spawn] S2 t2-zed on zed chore/zed-core-profile-split ← main (/Users/sumitkumarpandit/codebase/mention/.worktrees/zed/zed-core-profile-split)
