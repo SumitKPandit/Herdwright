@@ -3,6 +3,7 @@
     "allow": [
       "Bash(bin/zed:*)",
       "Bash(./bin/zed:*)",
+      "Bash(bin/zed-setup:*)",
       "Bash(herdr agent:*)",
       "Bash(herdr pane read:*)",
       "Bash(herdr pane list:*)",

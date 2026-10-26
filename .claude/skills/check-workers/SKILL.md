@@ -22,4 +22,5 @@ description: Inspect worker sessions after a watcher event or when the user asks
      "Continue, or end with ZED:QUESTION / ZED:DONE / ZED:BLOCKED." Don't bother the user.
    - `GONE` → find out (pane closed? crash?), tell the user, propose resuming with a new
      session on the same branch.
-4. Commit the Zed repo if anything changed.
+   - `ZED:DONE` with a PR but no real QA in its `QA:` line → send it back to QA first (CLAUDE.md, directive 6).
+4. Commit the profile if anything changed.

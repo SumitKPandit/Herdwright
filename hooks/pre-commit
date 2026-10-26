@@ -1,0 +1,12 @@
+#!/bin/sh
+# Zed guard (installed by bin/zed-setup): `main` holds core only, so no commit on main may touch
+# profile/. Also runs as pre-merge-commit, which catches merging a profile branch into main.
+branch=$(git symbolic-ref --short -q HEAD)
+[ "$branch" = main ] || exit 0
+staged=$(git diff --cached --name-only -- profile/)
+if [ -n "$staged" ]; then
+  echo "zed guard: refusing to commit profile/ on main (main is core only):" >&2
+  echo "$staged" | sed 's/^/  /' >&2
+  echo "Commit it on your profile branch instead; core changes reach main via bin/zed-core-sync." >&2
+  exit 1
+fi

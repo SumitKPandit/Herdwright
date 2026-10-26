@@ -1,0 +1,14 @@
+{
+  "worktree_root": "~/code/.worktrees",
+  "repos": {
+    "example-app": {
+      "path": "~/code/example-app",
+      "role": "what this repo is",
+      "host": "github",
+      "dev_base": "main",
+      "branches": {
+        "main": "staging; base for new dev"
+      }
+    }
+  }
+}

@@ -1,0 +1,29 @@
+#!/bin/sh
+# zed-setup — check Zed's prerequisites and install its git guard hooks. Safe to re-run.
+cd "$(dirname "$0")/.." || exit 1
+missing=0
+for tool in claude herdr git gh python3; do
+  if command -v "$tool" >/dev/null 2>&1; then
+    echo "ok       $tool"
+  else
+    echo "MISSING  $tool"; missing=1
+  fi
+done
+command -v security >/dev/null 2>&1 || echo "note     no macOS 'security' tool: bin/bb (Bitbucket) needs the macOS Keychain"
+
+current=$(git config --get core.hooksPath)
+if [ -n "$current" ] && [ "$current" != hooks ]; then
+  echo "WARNING  core.hooksPath is '$current'; not changing it. Zed's guard hooks are in hooks/." >&2
+else
+  for h in .git/hooks/*; do
+    case "$h" in *.sample|'.git/hooks/*') ;; *) [ -f "$h" ] && echo "note     $h will no longer run (core.hooksPath=hooks)";; esac
+  done
+  git config core.hooksPath hooks && echo "ok       git guard hooks installed (core.hooksPath=hooks)"
+fi
+
+if [ -f profile/profile.md ]; then
+  echo "ok       profile/ present (branch: $(git branch --show-current))"
+else
+  echo "note     no profile yet: start 'claude' here (inside herdr) and Zed will onboard you"
+fi
+exit $missing

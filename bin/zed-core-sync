@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""zed-core-sync — carry core improvements from a profile branch to `main`.
+
+Run it on a profile branch (profile/<name>). It looks at the commits made on this branch since
+the last sync, and cherry-picks onto `main` every commit that touches nothing under profile/.
+It never moves a commit that touches profile/:
+  profile-only commits   are skipped (they stay on the profile branch);
+  mixed commits          stop the sync: split them (core part / profile part) and rerun, or
+                         skip one deliberately with --skip <sha>;
+  already on main        (same patch) are skipped.
+The cherry-picks happen in a temporary worktree of `main`, so this checkout is never switched
+away from the profile branch. The sync point is stored in refs/zed/core-sync/<branch>.
+
+Usage
+  bin/zed-core-sync                     show the plan (default; changes nothing)
+  bin/zed-core-sync --apply [--push]    cherry-pick onto main [and push main to --remote]
+  bin/zed-core-sync --mark [<rev>]      record <rev> (default HEAD) as synced without picking
+  options: --skip <sha> (repeatable), --remote <name> (default origin)
+"""
+import argparse
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ZED_HOME = Path(__file__).resolve().parent.parent
+CORE_BRANCH = "main"
+PROFILE_PREFIX = "profile/"
+
+
+def git(*args, cwd=ZED_HOME, check=True):
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        die(f"git {' '.join(args)} failed:\n{r.stdout}{r.stderr}")
+    return r
+
+
+def die(msg):
+    print(f"zed-core-sync: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def sync_ref(branch):
+    return f"refs/zed/core-sync/{branch}"
+
+
+def classify(sha):
+    files = git("diff-tree", "--no-commit-id", "--name-only", "-r", "--root", sha).stdout.split()
+    in_profile = [f for f in files if f.startswith(PROFILE_PREFIX)]
+    if not in_profile:
+        return "core", files
+    if len(in_profile) == len(files):
+        return "profile", files
+    return "mixed", files
+
+
+def plan(branch, skips):
+    ref = sync_ref(branch)
+    have_ref = git("rev-parse", "--verify", "--quiet", ref, check=False).returncode == 0
+    base = ref if have_ref else git("merge-base", CORE_BRANCH, "HEAD").stdout.strip()
+    # `git cherry` marks commits whose patch is already on main with "-".
+    on_main = {line[2:] for line in git("cherry", CORE_BRANCH, "HEAD", base).stdout.splitlines()
+               if line.startswith("- ")}
+    shas = git("rev-list", "--reverse", "--no-merges", f"{base}..HEAD").stdout.split()
+    steps = []
+    for sha in shas:
+        subject = git("log", "-1", "--format=%s", sha).stdout.strip()
+        kind, files = classify(sha)
+        if any(sha.startswith(s) for s in skips):
+            kind = "skip"
+        elif kind == "core" and sha in on_main:
+            kind = "on-main"
+        steps.append((sha, kind, subject, files))
+    return steps
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="zed-core-sync", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--push", action="store_true")
+    ap.add_argument("--remote", default="origin")
+    ap.add_argument("--skip", action="append", default=[])
+    ap.add_argument("--mark", nargs="?", const="HEAD")
+    a = ap.parse_args()
+
+    branch = git("branch", "--show-current").stdout.strip()
+    if not branch.startswith(PROFILE_PREFIX):
+        die(f"run this on a profile branch ({PROFILE_PREFIX}<name>), not '{branch or 'detached HEAD'}'")
+    if git("rev-parse", "--verify", "--quiet", CORE_BRANCH, check=False).returncode != 0:
+        die(f"no local '{CORE_BRANCH}' branch")
+
+    if a.mark:
+        sha = git("rev-parse", a.mark).stdout.strip()
+        git("update-ref", sync_ref(branch), sha)
+        print(f"marked {sha[:9]} as synced for {branch}")
+        return
+
+    steps = plan(branch, a.skip)
+    if not steps:
+        print("nothing new since the last sync")
+        return
+    picks, stop_at = [], None
+    for sha, kind, subject, files in steps:
+        print(f"{kind:<8} {sha[:9]} {subject}")
+        if kind == "mixed":
+            for f in files:
+                print(f"           {'profile' if f.startswith(PROFILE_PREFIX) else 'core   '} {f}")
+            if stop_at is None:
+                stop_at = sha
+        elif kind == "core" and stop_at is None:
+            picks.append(sha)
+    if stop_at:
+        print(f"\nstopping at mixed commit {stop_at[:9]}: split it into a core commit and a profile commit "
+              f"(or pass --skip {stop_at[:9]}), then rerun. Commits after it are not synced yet.")
+    if not a.apply:
+        print(f"\n{len(picks)} commit(s) would be cherry-picked onto {CORE_BRANCH}. Rerun with --apply.")
+        return
+
+    # The new sync point: the last commit before the first mixed one, or the last commit.
+    handled = steps[:[s[0] for s in steps].index(stop_at)] if stop_at else steps
+    upto = handled[-1][0] if handled else None
+    if picks:
+        tmp = Path(tempfile.mkdtemp(prefix="zed-core-sync-")) / "main"
+        r = git("worktree", "add", str(tmp), CORE_BRANCH, check=False)
+        if r.returncode != 0:
+            die(f"could not check out {CORE_BRANCH} in a temporary worktree "
+                f"(is it checked out elsewhere?):\n{r.stderr}")
+        try:
+            r = git("cherry-pick", "-x", *picks, cwd=tmp, check=False)
+            if r.returncode != 0:
+                git("cherry-pick", "--abort", cwd=tmp, check=False)
+                die(f"cherry-pick onto {CORE_BRANCH} failed and was aborted; {CORE_BRANCH} is unchanged:\n"
+                    f"{r.stdout}{r.stderr}")
+            print(f"\ncherry-picked {len(picks)} commit(s) onto {CORE_BRANCH}")
+            if a.push:
+                git("push", a.remote, CORE_BRANCH, cwd=tmp)
+                print(f"pushed {CORE_BRANCH} to {a.remote}")
+        finally:
+            git("worktree", "remove", "--force", str(tmp), check=False)
+    if upto:
+        git("update-ref", sync_ref(branch), upto)
+    print(f"Bring them back into this branch's history with: git merge {CORE_BRANCH}")
+
+
+if __name__ == "__main__":
+    main()

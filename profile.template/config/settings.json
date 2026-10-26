@@ -1,0 +1,6 @@
+{
+  "bitbucket": {
+    "keychain_service": "zed-bitbucket",
+    "check_repo": null
+  }
+}
