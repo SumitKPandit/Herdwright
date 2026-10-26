@@ -8,6 +8,7 @@ Then check it with:  bin/bb whoami
 
 Usage
   bb whoami
+  bb users <workspace/slug>... [--pages N]   (people seen on recent PRs, with UUIDs)
   bb check                             (diagnose auth: HTTP status per endpoint, no secrets shown)
   bb pr create --title T --source BRANCH --dest BRANCH [--body-file F] [--draft] [--reviewer NICK ...]
   bb pr view <id> [--repo criticalmedianyc/cm_api]
@@ -83,6 +84,26 @@ def check():
         print(f"{path}: basic={probe(path, 'basic')} bearer={probe(path, 'bearer')}")
 
 
+def users(repos, pages):
+    """List people seen as PR authors/reviewers/participants: display name, nickname, uuid."""
+    seen = {}
+    for repo in repos:
+        url = f"/repositories/{repo}/pullrequests?state=MERGED&state=OPEN&state=DECLINED&pagelen=50"
+        for _ in range(pages):
+            r = call("GET", url)
+            for pr in r.get("values", []):
+                full = call("GET", f"/repositories/{repo}/pullrequests/{pr['id']}")
+                for u in [full.get("author")] + full.get("reviewers", []) + [p["user"] for p in full.get("participants", [])]:
+                    if u and u.get("uuid"):
+                        seen[u["uuid"]] = (u.get("display_name"), u.get("nickname"))
+            nxt = r.get("next")
+            if not nxt:
+                break
+            url = nxt.replace(API, "")
+    for uuid, (name, nick) in sorted(seen.items(), key=lambda kv: kv[1][0] or ""):
+        print(f"{name}\t{nick}\t{uuid}")
+
+
 def repo_from_origin():
     url = subprocess.run(["git", "remote", "get-url", "origin"], capture_output=True, text=True).stdout.strip()
     m = re.search(r"bitbucket\.org[:/]([^/]+)/([^/.]+?)(?:\.git)?$", url)
@@ -104,6 +125,9 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("whoami")
     sub.add_parser("check")
+    us = sub.add_parser("users")
+    us.add_argument("repos", nargs="+", help="workspace/slug ...")
+    us.add_argument("--pages", type=int, default=1)
     pr = sub.add_parser("pr").add_subparsers(dest="pr_cmd", required=True)
     c = pr.add_parser("create")
     c.add_argument("--title", required=True)
@@ -125,6 +149,9 @@ def main():
     if a.cmd == "whoami":
         u = call("GET", "/user")
         print(f"{u.get('display_name')} ({u.get('nickname')}) {u.get('uuid')}")
+        return
+    if a.cmd == "users":
+        users(a.repos, a.pages)
         return
     if a.cmd == "check":
         check()
