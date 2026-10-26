@@ -23,5 +23,10 @@ content/rendering; for an assessment, the report and its acceptance, not an impl
 Local drafts, a finished worker turn, or a handoff to another task must not be counted as a
 completed user deliverable. Record transferred work against its continuing task explicitly.
 
+Keep historical source verification, current artifact verification and user approval distinct.
+Rewritten or split pages can lose context even when their source was verified: record checks
+against the final pages and their citations, rather than inheriting verification from the source
+material or from approval of the structure and style.
+
 Parking: if the user pauses a task with unpublished work, ask whether to push a WIP branch;
 otherwise keep the worktree (`bin/zed close <S> keep-worktree`) and set task status `parked`.
