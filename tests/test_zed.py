@@ -425,6 +425,30 @@ class ZedTests(unittest.TestCase):
         self.assertEqual(e.exception.code, 4)
         self.assertIn("WATCH_ALREADY_RUNNING", self.output.getvalue())
 
+    def test_brief_scaffold_and_spawn_refuses_placeholders(self):
+        conn = self.session()
+        conn.execute("UPDATE tasks SET jira='MENT-9', description='Add a label'")
+        conn.commit()
+        (self.root / "config").mkdir(exist_ok=True)
+        (self.root / "config" / "projects.json").write_text(json.dumps({
+            "worktree_root": str(self.root / "wt"), "repos": {"r": {"path": str(self.root / "r"), "role": "backend"}}}))
+        notes = self.root / "knowledge" / "repos"
+        notes.mkdir(parents=True)
+        (notes / "r.md").write_text("# r\n## Setup\nnpm ci\n## History\nold stuff\n## Test logins\nadmin / from vault\n")
+        self.z.cmd_brief(["T1", "repo=r", "base=main", "branch=story/ment-9-label"])
+        brief = (self.root / "briefs" / "T1-r.md").read_text()
+        self.assertIn("MENT-9", brief)
+        self.assertIn("admin / from vault", brief)
+        self.assertNotIn("old stuff", brief)
+        self.assertNotIn("{{", brief)
+        self.assertIn("Add a label", brief)
+        with patch.object(self.z, "require_lock"), patch.object(self.z, "choose_runtime", return_value="claude"):
+            with self.assertRaises(SystemExit):
+                self.z.cmd_brief(["T1", "repo=r", "base=main", "branch=b"])  # exists, no force
+            with self.assertRaises(SystemExit):
+                self.z.cmd_spawn(["T1", "repo=r", "base=main", "branch=b", f"brief={self.root / 'briefs' / 'T1-r.md'}"])
+        self.assertIn("unfilled placeholder", self.output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,8 +21,12 @@ description: Intake a new piece of work from the user, record it, write a brief 
 2. `bin/zed task add title="..." jira=<ticket-id> worktype=<worktype> description="..."` → T-id
    (`jira=` holds any ticket ID). Record each confirmed decision with
    `bin/zed log <T> "decision: ..." kind=decision`.
-3. Per repo, copy `templates/brief.md` to `profile/briefs/T<id>-<repo>.md` and fill it with confirmed
-   facts only. List open points explicitly so the worker asks rather than guesses.
+3. Per repo, `bin/zed brief <T> repo=<repo> base=<base> branch=<branch per profile/rules.md>`: it fills
+   everything mechanical (context, QA environment from the repo's knowledge file, plan block, done
+   criteria) into `profile/briefs/T<id>-<repo>.md` and lists the `<FILL: …>` spots. Write only those:
+   goal, decisions (verbatim), open points, acceptance criteria, from confirmed facts only. List open
+   points explicitly so the worker asks rather than guesses. `spawn` refuses a brief with any
+   `<FILL …>` left.
 4. If the model policy needs a ranking and `bin/zed models show` says it is missing or stale,
    refresh it (`models` skill) before spawning. If the source cannot be read, tell the user and
    get their model choice; never claim a CLI default is benchmark-optimal.

@@ -945,6 +945,64 @@ def prompt_worker(agent, text):
     return False, r.stderr or r.stdout
 
 
+def worktree_path(repo, branch):
+    return expand(projects()["worktree_root"]) / repo / slugify(branch.split("/")[-1], 60)
+
+
+FILL = re.compile(r"<FILL\b[^>\n]*>")  # what `zed brief` leaves for the model to write; spawn refuses it
+
+
+def knowledge_qa_notes(repo, limit=30):
+    """How to run and log in, from the repo's knowledge file: its QA/login/run/test sections, capped."""
+    path = PROFILE_DIR / "knowledge" / "repos" / f"{repo}.md"
+    if not path.exists():
+        return f"no notes yet at {path}; ask Zed if unclear"
+    keep, on = [], False
+    for line in path.read_text().splitlines():
+        if line.startswith("#"):
+            on = bool(re.search(r"\b(qa|log ?in|run|test|setup|start)", line, re.I))
+        if on:
+            keep.append(line)
+    if not keep:
+        return f"see {path}"
+    return f"from {path}:\n" + "\n".join(keep[:limit]) + (f"\n… ({len(keep) - limit} more lines in the file)" if len(keep) > limit else "")
+
+
+def cmd_brief(args):
+    """brief <T> repo= base= branch= [force] — scaffold profile/briefs/T<id>-<repo>.md from the task, projects.json,
+    the repo's knowledge file and the plan block. The model writes only what is marked <FILL: …>."""
+    if not args:
+        die("brief <T> repo=<repo> base=<branch> branch=<branch> [force]")
+    tid = int(args[0].lstrip("T"))
+    kv = parse_kv([a for a in args[1:] if a != "force"])
+    for k in ("repo", "base", "branch"):
+        if k not in kv:
+            die(f"brief needs {k}=")
+    conn = db()
+    t = get_task(conn, tid)
+    p = project(kv["repo"])
+    out = PROFILE_DIR / "briefs" / f"T{tid}-{kv['repo']}.md"
+    if out.exists() and "force" not in args:
+        die(f"{out} exists; pass `force` to overwrite it")
+    worktree = expand(p["path"]) if p.get("worktrees") is False else worktree_path(kv["repo"], kv["branch"])
+    values = {"TASK": tid, "JIRA": t["jira"] or "no ticket", "TITLE": t["title"], "REPO": kv["repo"],
+              "ROLE": p.get("role", "-"), "WORKTREE": worktree, "BRANCH": kv["branch"], "BASE": kv["base"],
+              "TICKET": f"{t['jira']} — read it for full details; ask Zed if you can't reach it" if t["jira"] else "none",
+              "QA_ENV": knowledge_qa_notes(kv["repo"]), "PLAN_FILE": PROFILE_DIR / "briefs" / f"T{tid}-{kv['repo']}-plan.md"}
+    text = (ZED_HOME / "templates" / "brief.md").read_text()
+    for k, v in values.items():
+        text = text.replace("{{" + k + "}}", str(v))
+    if t["description"]:
+        text = text.replace("<FILL: what the user wants, in their words where possible>",
+                            f"{t['description']}\n<FILL: anything the task description above leaves out, or \"nothing\">")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(text)
+    print(f"{out}\nfill these, then spawn:")
+    for n, line in enumerate(text.splitlines(), 1):
+        if FILL.search(line):
+            print(f"  line {n}: {FILL.search(line).group(0)}")
+
+
 def cmd_spawn(args, worktree=None):
     """spawn <task-id> repo=<repo> base=<branch> branch=<branch> brief=<path> [name=<agent>]
     [runtime=auto|claude|copilot] [model=] [effort=] [handoff=<note>]"""
@@ -964,6 +1022,9 @@ def cmd_spawn(args, worktree=None):
     brief = Path(kv["brief"]).resolve()
     if not brief.exists():
         die(f"brief not found: {brief}")
+    left = FILL.findall(brief.read_text())
+    if left:
+        die(f"brief {brief.name} still has {len(left)} unfilled placeholder(s), e.g. {left[0]}; fill them before spawning")
     missing = [h for h in ("## Plan", "## Definition of done") if h not in brief.read_text()]
     if missing:
         die(f"brief {brief.name} lacks {', '.join(missing)} (templates/brief.md); no worker starts without a plan")
@@ -982,11 +1043,10 @@ def cmd_spawn(args, worktree=None):
     agent = kv.get("name") or f"t{tid}-{slugify(kv['repo'], 12)}"
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", agent):
         die(f"bad agent name '{agent}'")
-    wt_root = expand(projects()["worktree_root"])
     reuse_worktree = worktree is not None
     if reuse_worktree and not worktree.is_dir():
         die(f"handoff worktree is missing: {worktree}")
-    worktree = worktree or wt_root / kv["repo"] / slugify(kv["branch"].split("/")[-1], 60)
+    worktree = worktree or worktree_path(kv["repo"], kv["branch"])
 
     # 1. worktree (projects with "worktrees": false, e.g. plain doc folders, run in place)
     if p.get("worktrees") is False:
@@ -1658,6 +1718,9 @@ def cmd_help(args):
   task show <T> | task list [--all]
   log <T|-> <text...> [kind=note]
   q add <T|-> <question...> [session=S] | q answer <Q> <answer...> | q list
+  brief <T> repo= base= branch= [force]
+                                     scaffold the brief from the task, projects.json, repo notes and plan
+                                     block; leaves <FILL: …> for the model, which spawn refuses
   spawn <T> repo= base= branch= brief=<file> [name=<agent>] [from=<start-ref, default origin/<base>>]
         [runtime=auto|claude|copilot] [model=] [effort=] [handoff=<note>]
                                      runtime/model/effort default to the profile's order and model policy
@@ -1685,7 +1748,7 @@ Session states: """ + ", ".join(SESSION_STATES))
 
 COMMANDS = {"task": cmd_task, "log": cmd_log, "q": cmd_q, "spawn": cmd_spawn, "session": cmd_session,
             "close": cmd_close, "adopt": cmd_adopt, "handoff": cmd_handoff, "watch": cmd_watch, "status": cmd_status,
-            "paths": cmd_paths, "start": cmd_start, "lock": cmd_lock, "runtime": cmd_runtime, "models": cmd_models, "help": cmd_help}
+            "brief": cmd_brief, "paths": cmd_paths, "start": cmd_start, "lock": cmd_lock, "runtime": cmd_runtime, "models": cmd_models, "help": cmd_help}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
