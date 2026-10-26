@@ -68,3 +68,8 @@ Facts about a particular user or their work never go here (they go to the profil
   coordinator lock and watcher duties, even in a throwaway profile. **How:** launch a separate,
   explicitly scoped coordinator fixture with its own instructions and the throwaway profile.
   Before any UI action, re-read the agent's current state and screen; never answer a stale dialog.
+- **Tool-call shells are not persistent coordinator identities.** **Why:** a terminal tool may
+  start a fresh shell for each call; a lock owned by that shell becomes stale when it exits.
+  **How:** use the runtime's persistent session identity. With `bin/zed`'s legacy PID fallback,
+  set `CLAUDE_PID` to the verified long-lived CLI process for every lock-protected command and
+  watcher. Verify ownership again from a separate tool call.
