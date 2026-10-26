@@ -1,18 +1,33 @@
 {
-  "order": ["claude", "copilot"],
+  "order": [
+    "claude",
+    "copilot"
+  ],
   "runtimes": {
     "claude": {
-      "enabled": true
+      "enabled": true,
+      "max_running": 3
     },
     "copilot": {
       "enabled": true,
       "permission_mode": "assisted",
-      "deny_tools": ["shell(gh pr merge)"]
+      "deny_tools": [
+        "shell(gh pr merge)"
+      ],
+      "max_running": 3
     }
   },
   "model_policy": {
     "method": "attractive-quadrant",
     "source": "Artificial Analysis: Intelligence Index vs Cost per task",
-    "max_age_days": 14
+    "max_age_days": 14,
+    "effort_by_kind": {
+      "story": "medium",
+      "bug": "medium",
+      "task": "medium",
+      "implementation": "medium",
+      "investigation": "high",
+      "design": "high"
+    }
   }
 }

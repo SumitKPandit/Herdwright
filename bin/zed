@@ -494,6 +494,38 @@ def apply_ceiling(runtime, model, effort, why):
     return model, effort, why
 
 
+def effort_for_kind(runtime, kind, effort, why):
+    """The profile's model_policy.effort_by_kind picks the reasoning effort by the kind of work (e.g. medium for a
+    well-specified story, high for investigation or design), never above model_policy.max_effort."""
+    policy = runtime_config().get("model_policy", {})
+    wanted = (policy.get("effort_by_kind") or {}).get(kind or "")
+    efforts = RUNTIMES[runtime]["efforts"]
+    if not wanted:
+        return effort, why
+    if wanted not in efforts:
+        die(f"effort_by_kind[{kind}]='{wanted}' is not an effort {runtime} accepts: {efforts}")
+    cap = policy.get("max_effort")
+    if cap in efforts and efforts.index(wanted) > efforts.index(cap):
+        wanted = cap
+    return wanted, why + f"; effort {wanted} for kind '{kind}' (model_policy.effort_by_kind)"
+
+
+def running_count(conn, runtime):
+    return conn.execute("SELECT COUNT(*) FROM sessions WHERE runtime=? AND external=0 AND status IN ('running','waiting_user')",
+                        (runtime,)).fetchone()[0]
+
+
+def require_capacity(conn, runtime, tid):
+    """At most runtimes.<rt>.max_running workers per runtime (a plan's limits are shared by all of them);
+    beyond it the task stays queued (exit 75, like firstmate's project capacity)."""
+    cap = runtime_settings(runtime).get("max_running")
+    n = running_count(conn, runtime)
+    if cap is not None and n >= cap:
+        print(f"zed: queued: {n} {runtime} workers running (max_running {cap} in runtimes.json). T{tid} stays queued; "
+              f"spawn it again when one finishes (`bin/zed session list`).", file=sys.stderr)
+        sys.exit(75)
+
+
 def cmd_models(args):
     """models show | models import <ranking.json>"""
     sub = args[0] if args else "show"
@@ -1005,10 +1037,10 @@ def cmd_brief(args):
 
 def cmd_spawn(args, worktree=None):
     """spawn <task-id> repo=<repo> base=<branch> branch=<branch> brief=<path> [name=<agent>]
-    [runtime=auto|claude|copilot] [model=] [effort=] [handoff=<note>]"""
+    [runtime=auto|claude|copilot] [model=] [effort=] [kind=<worktype|investigation|design…>] [handoff=<note>]"""
     if not args:
         die("spawn <task-id> repo=... base=... branch=... brief=<file> [name=...] [runtime=auto|claude|copilot] "
-            "[model=] [effort=] [from=] [handoff=<note>]")
+            "[model=] [effort=] [kind=] [from=] [handoff=<note>]")
     tid = int(args[0].lstrip("T"))
     kv = parse_kv(args[1:])
     for k in ("repo", "base", "branch", "brief"):
@@ -1029,11 +1061,14 @@ def cmd_spawn(args, worktree=None):
     if missing:
         die(f"brief {brief.name} lacks {', '.join(missing)} (templates/brief.md); no worker starts without a plan")
     runtime = choose_runtime(kv.get("runtime", "auto"))
+    require_capacity(conn, runtime, tid)  # a handoff has already closed the session it replaces
     model, effort, model_why = pick_model(runtime)
     if "model" in kv:  # the policy's effort belongs to the policy's model
         model, effort, model_why = kv["model"], kv.get("effort"), "given to spawn"
     elif "effort" in kv:
         effort, model_why = kv["effort"], model_why + "; effort given to spawn"
+    if "effort" not in kv and not runtime_settings(runtime).get("effort"):
+        effort, model_why = effort_for_kind(runtime, kv.get("kind") or t["worktype"], effort, model_why)
     if effort and effort not in RUNTIMES[runtime]["efforts"]:
         die(f"invalid effort '{effort}' for {runtime}: {RUNTIMES[runtime]['efforts']}")
     model, effort, model_why = apply_ceiling(runtime, model, effort, model_why)
@@ -1722,8 +1757,10 @@ def cmd_help(args):
                                      scaffold the brief from the task, projects.json, repo notes and plan
                                      block; leaves <FILL: …> for the model, which spawn refuses
   spawn <T> repo= base= branch= brief=<file> [name=<agent>] [from=<start-ref, default origin/<base>>]
-        [runtime=auto|claude|copilot] [model=] [effort=] [handoff=<note>]
-                                     runtime/model/effort default to the profile's order and model policy
+        [runtime=auto|claude|copilot] [model=] [effort=] [kind=] [handoff=<note>]
+                                     runtime/model/effort default to the profile's order and model policy;
+                                     kind (default: the task's worktype) picks the effort by model_policy.effort_by_kind;
+                                     beyond runtimes.<rt>.max_running the task is queued (exit 75)
   session list | session set <S|agent> key=value... (status pr_url claude_session_id pane_id workspace_id base brief)
   close <S|agent> [keep-worktree] [force]   (external sessions are only untracked)
   adopt <pane-id> <T> [repo=]        track a session Zed didn't start (user's own)

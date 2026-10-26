@@ -449,6 +449,32 @@ class ZedTests(unittest.TestCase):
                 self.z.cmd_spawn(["T1", "repo=r", "base=main", "branch=b", f"brief={self.root / 'briefs' / 'T1-r.md'}"])
         self.assertIn("unfilled placeholder", self.output.getvalue())
 
+    def test_effort_by_kind_is_capped_and_overridable(self):
+        policy = {"method": "default", "max_effort": "high",
+                  "effort_by_kind": {"story": "medium", "investigation": "high", "design": "max"}}
+        self.config({"order": ["claude"], "model_policy": policy})
+        self.assertEqual(self.z.effort_for_kind("claude", "story", "high", "w")[0], "medium")
+        self.assertEqual(self.z.effort_for_kind("claude", "investigation", "low", "w")[0], "high")
+        self.assertEqual(self.z.effort_for_kind("claude", "design", None, "w")[0], "high")  # capped by max_effort
+        self.assertEqual(self.z.effort_for_kind("claude", "unmapped", "low", "w")[0], "low")
+        self.assertEqual(self.z.effort_for_kind("claude", None, "low", "w")[0], "low")
+        # the ceiling still applies on top of the kind's effort
+        self.config({"order": ["claude"], "model_policy": policy,
+                     "runtimes": {"claude": {"ceiling": {"model": "m", "effort": "medium"}}}})
+        effort = self.z.effort_for_kind("claude", "investigation", None, "w")[0]
+        self.assertEqual(self.z.apply_ceiling("claude", "m", effort, "w")[1], "medium")
+
+    def test_max_running_queues_extra_spawns_per_runtime(self):
+        conn = self.session()
+        self.config({"order": ["claude", "copilot"], "runtimes": {"claude": {"max_running": 1}}})
+        with self.assertRaises(SystemExit) as e:
+            self.z.require_capacity(conn, "claude", 2)
+        self.assertEqual(e.exception.code, 75)
+        self.assertIn("queued: 1 claude workers running", self.output.getvalue())
+        self.z.require_capacity(conn, "copilot", 2)  # no cap configured
+        conn.execute("UPDATE sessions SET status='closed'")
+        self.z.require_capacity(conn, "claude", 2)
+
 
 if __name__ == "__main__":
     unittest.main()
