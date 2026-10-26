@@ -1258,7 +1258,7 @@ def cmd_watch(args):
     interval = float(rest[0]) if rest else 3.0
     db().close()
     require_lock()
-    saved = read_json(WATCH_STATE_PATH, None) if once else None
+    saved = read_json(WATCH_STATE_PATH, None)
     prev = {int(k): v for k, v in saved.items()} if saved is not None else {}
     first = saved is None
     alerts = {}  # per-session health alerts already reported (stall, usage step, long block)
@@ -1289,6 +1289,9 @@ def cmd_watch(args):
                     if line and state != "gone":
                         screen = read_screen(s["agent"])
                         record_credits(conn, s, screen)
+                        if state == "blocked":
+                            prompt = prompt_summary(screen)
+                            line += f" · prompt: {prompt}" if prompt else ""
                         hit = limit_line(s["runtime"], screen)
                         if hit:
                             line += f" · possible {s['runtime']} usage limit: {hit}"
@@ -1302,12 +1305,21 @@ def cmd_watch(args):
             print(f"watch error: {e}", file=sys.stderr, flush=True)
         for line in events:
             print(line, flush=True)
-        if once:
-            WATCH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            WATCH_STATE_PATH.write_text(json.dumps(prev))
-            if events:
-                return
+        WATCH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        WATCH_STATE_PATH.write_text(json.dumps(prev))
+        if once and events:
+            return
         time.sleep(interval)
+
+
+PROMPT_LINE = re.compile(r"(\?\s*$|^\s*(Read|Bash|Edit|Write|Fetch|Update|Agent|Skill)\(|Dangerous|^\s*❯?\s*\d\.\s)")
+
+
+def prompt_summary(screen):
+    """The pending permission prompt in a worker's screen, condensed to one line (what it wants, the options)."""
+    lines = [l.strip(" │┃") .strip() for l in (screen or "").splitlines()[-30:]]
+    keep = [l for l in lines if l and PROMPT_LINE.search(l) and "Tip:" not in l]
+    return " | ".join(keep)[:600]
 
 
 def health_events(conn, s, a, state, alerts):
