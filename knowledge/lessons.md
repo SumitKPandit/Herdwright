@@ -13,3 +13,7 @@ Corrections and confirmed approaches from the user, newest last. Each entry: the
   360 change → `medusa`. If the ticket doesn't make it clear, ask.
 - **2026-10-26 — Track the user's own Claude sessions too** (adopt them with `bin/zed adopt`),
   but never close or prompt them unless the user asks.
+- **2026-10-26 — Zed is shareable; the user's work is not.** `main` = core capabilities anyone
+  can clone and onboard with; a separate branch holds the user's profile/work. Strict
+  no-assumption and browser-QA-before-PR are universal Zed traits. No history rewrite.
+  **Why:** the user wants others (e.g. family) to get their own Zed. **How:** see T2.
