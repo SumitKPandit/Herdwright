@@ -1,6 +1,6 @@
 # Zed status
 
-_Generated 2026-10-26 08:41 from db/zed.db. Do not edit by hand._
+_Generated 2026-10-26 08:42 from db/zed.db. Do not edit by hand._
 
 ## Waiting on you
 
@@ -16,12 +16,12 @@ _Generated 2026-10-26 08:41 from db/zed.db. Do not edit by hand._
   - 2026-10-26 08:10 [adopt] S1 adopted external session in wC:p1 (/Users/sumitkumarpandit/codebase/mention/unified-mention)
 
 ### T2 · no-jira · Split Zed into shareable core (main) and per-user profile (branch)
-- status: **active** · worktype: chore · updated 2026-10-26 08:37
+- status: **active** · worktype: chore · updated 2026-10-26 08:42
 - User wants anyone to clone Zed and onboard; Sumit's work lives on a separate branch
 - S2 `t2-zed` zed `chore/zed-core-profile-split` ← `main` · running / agent working
-  - 2026-10-26 08:36 [decision] decision: no history rewrite needed (user, 2026-10-26)
   - 2026-10-26 08:36 [decision] decision: strict no-assumption rule and browser QA before every PR are universal Zed traits (user, 2026-10-26)
   - 2026-10-26 08:37 [spawn] S2 t2-zed on zed chore/zed-core-profile-split ← main (/Users/sumitkumarpandit/codebase/mention/.worktrees/zed/zed-core-profile-split)
+  - 2026-10-26 08:42 [plan] plan after worker's ZED:DONE: review branch, merge into local main, run bin/zed-migrate-profile on live checkout, create profile/sumit, make main core-only, push main + (with user OK if blocked) profile branch. Local commits with reviewer UUIDs are NOT pushed yet — they belong on profile/sumit.
 
 ## PR open
 
