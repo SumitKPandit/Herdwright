@@ -596,6 +596,56 @@ def live_agents():
     return {a["pane_id"]: a for a in agents}
 
 
+STALL_MINUTES = 30          # running with no plan progress for this long → watch event
+USAGE_ALERT_OUTPUT = 500_000  # report every time a Claude session passes another multiple of this many output tokens
+
+
+def note_session_id(conn, s, a):
+    """Remember the agent CLI's own session id (needed to find its transcript after it closes)."""
+    sid = (a or {}).get("agent_session", {}).get("value")
+    if sid and s["claude_session_id"] != sid:
+        conn.execute("UPDATE sessions SET claude_session_id=? WHERE id=?", (sid, s["id"]))
+        return sid
+    return s["claude_session_id"]
+
+
+def claude_usage(worktree, sid):
+    """Tokens a Claude Code session used, including its sub-agents and workflows, from its transcripts
+    (~/.claude/projects/<cwd>/<sid>.jsonl and <sid>/**). None if not found."""
+    if not worktree or not sid:
+        return None
+    root = Path.home() / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(worktree)) / sid
+    files = [root.with_suffix(".jsonl")] + sorted(root.glob("**/*.jsonl"))
+    if not files[0].exists():
+        return None
+    total, seen = {"output": 0, "input": 0, "cache_read": 0, "cache_write": 0}, set()
+    for f in files:
+        for line in f.read_text(errors="replace").splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            m = r.get("message")
+            u = m.get("usage") if isinstance(m, dict) else None
+            if not u or (m.get("id"), r.get("requestId")) in seen:
+                continue
+            seen.add((m.get("id"), r.get("requestId")))
+            total["output"] += u.get("output_tokens") or 0
+            total["input"] += u.get("input_tokens") or 0
+            total["cache_read"] += u.get("cache_read_input_tokens") or 0
+            total["cache_write"] += u.get("cache_creation_input_tokens") or 0
+    return total
+
+
+def fmt_usage(u):
+    return (f"{u['output'] / 1e6:.2f}M output, {(u['input'] + u['cache_write']) / 1e6:.1f}M input, "
+            f"{u['cache_read'] / 1e6:.0f}M cache-read tokens")
+
+
+def plan_files(task_id):
+    return sorted((PROFILE_DIR / "briefs").glob(f"T{task_id}-*-plan.md"))
+
+
 def render_status(conn, live=None):
     live = live if live is not None else live_agents()
     lines = ["# Zed status", "", f"_Generated {now()} from the task DB (`bin/zed status`). Do not edit by hand._", ""]
@@ -630,8 +680,11 @@ def render_status(conn, live=None):
             ext = " (external)" if s["external"] else ""
             rt = f" · {s['runtime']}" + (f" {s['model']}" if s["model"] else "") + (f" ({s['effort']})" if s["effort"] else "")
             credits = f" · {s['credits']:g} AI credits" if s["credits"] is not None else ""
+            if s["runtime"] == "claude":
+                u = claude_usage(s["worktree"], s["claude_session_id"])
+                credits += f" · {fmt_usage(u)}" if u else ""
             out.append(f"- S{s['id']}{ext} `{s['agent']}` {s['repo']} `{s['branch']}` ← `{s['base']}` · {state}{rt}{credits}{pr}")
-        for plan in sorted((PROFILE_DIR / "briefs").glob(f"T{t['id']}-*-plan.md")):
+        for plan in plan_files(t["id"]):
             text = plan.read_text()
             done, todo = len(re.findall(r"^\s*- \[[xX]\]", text, re.M)), len(re.findall(r"^\s*- \[ \]", text, re.M))
             out.append(f"- plan `{plan.name}`: {done}/{done + todo} steps done")
@@ -905,6 +958,9 @@ def cmd_spawn(args, worktree=None):
     brief = Path(kv["brief"]).resolve()
     if not brief.exists():
         die(f"brief not found: {brief}")
+    missing = [h for h in ("## Plan", "## Definition of done") if h not in brief.read_text()]
+    if missing:
+        die(f"brief {brief.name} lacks {', '.join(missing)} (templates/brief.md); no worker starts without a plan")
     runtime = choose_runtime(kv.get("runtime", "auto"))
     model, effort, model_why = pick_model(runtime)
     if "model" in kv:  # the policy's effort belongs to the policy's model
@@ -1204,6 +1260,7 @@ def cmd_watch(args):
     saved = read_json(WATCH_STATE_PATH, None) if once else None
     prev = {int(k): v for k, v in saved.items()} if saved is not None else {}
     first = saved is None
+    alerts = {}  # per-session health alerts already reported (stall, usage step, long block)
     while True:
         if not holds_lock():
             h = read_lock()
@@ -1219,6 +1276,8 @@ def cmd_watch(args):
                 a = live.get(s["pane_id"])
                 state = a["agent_status"] if a else "gone"
                 key = s["id"]
+                for line in health_events(conn, s, a, state, alerts):
+                    events.append(line)
                 snapshot = {"state": state, "sequence": a.get("state_change_seq") if a else None}
                 if prev.get(key) != snapshot:
                     line = None
@@ -1248,6 +1307,38 @@ def cmd_watch(args):
             if events:
                 return
         time.sleep(interval)
+
+
+def health_events(conn, s, a, state, alerts):
+    """Deterministic checks the watcher runs on every live session: no plan progress, token use, long blocks."""
+    out, seen = [], alerts.setdefault(s["id"], {})
+    tag = f"S{s['id']} T{s['task_id']} {s['agent']}"
+    now = datetime.now()
+    started = datetime.strptime(s["created_at"], "%Y-%m-%d %H:%M")
+    if state == "working":
+        plans = plan_files(s["task_id"])
+        last = max([started] + [datetime.fromtimestamp(p.stat().st_mtime) for p in plans])
+        idle = int((now - last).total_seconds() // 60)
+        what = "no plan file yet" if not plans else "no plan progress"
+        if idle >= STALL_MINUTES and seen.get("stall") != last:
+            seen["stall"] = last
+            out.append(f"{tag} · STALL: {what} for {idle} min while working (check for re-tooling or repeated work)")
+    if state == "blocked":
+        since = seen.setdefault("blocked_since", now)
+        if (now - since).total_seconds() >= 300 and not seen.get("block_reminded"):
+            seen["block_reminded"] = True
+            out.append(f"{tag} · still blocked after 5 min (queued prompt? read the screen again)")
+    else:
+        seen.pop("blocked_since", None)
+        seen.pop("block_reminded", None)
+    if s["runtime"] == "claude":
+        u = claude_usage(s["worktree"], note_session_id(conn, s, a))
+        if u:
+            step = u["output"] // USAGE_ALERT_OUTPUT
+            if step > seen.setdefault("usage_step", 0):
+                seen["usage_step"] = step
+                out.append(f"{tag} · USAGE: {fmt_usage(u)} so far (check delivered work against it)")
+    return out
 
 
 def cmd_paths(args):

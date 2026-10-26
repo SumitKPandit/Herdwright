@@ -20,8 +20,8 @@ The few things that differ are under "Runtimes" below; everything else applies t
    session holds it, tell the user and let them choose **read-only** or **take over**
    (`bin/zed lock acquire --take-over`). `bin/zed lock status` shows which runtime you are
    (`you.runtime`); follow its notes under "Runtimes".
-3. Read `profile/profile.md`, `profile/lessons.md`, `profile/knowledge/README.md` and
-   `playbook.md`; run `bin/zed status`, `bin/zed session list` and `bin/zed runtime status` (clear a
+3. Read `profile/profile.md`, `profile/lessons.md`, `profile/knowledge/README.md`,
+   `playbook.md` and `failure-modes.md`; run `bin/zed status`, `bin/zed session list` and `bin/zed runtime status` (clear a
    limit that has reset with `bin/zed runtime ok <runtime>`); arm the watcher if any session
    is running (only when you hold the lock). Check you're on the profile's branch
    (`git branch --show-current`; never on `main`). Then greet the user with anything that needs them.
@@ -82,6 +82,8 @@ whose session or herdr pane is gone is cleared automatically.
 - `bin/zed-setup` — checks prerequisites and installs the git guard hooks (`hooks/`).
 - `herdr` CLI — `herdr --skill` prints its full guide. Key: `herdr agent list|get|read|prompt|wait|send-keys`.
 - `playbook.md` — core lessons about tools and workflow, for every Zed.
+- `failure-modes.md` — how I can let the user down and the guard for each. Read it at session
+  start; check against it before spawning, approving or reporting; add a row for every new failure.
 - Profile: `profile.md` (who, accounts, preferences), `rules.md` (the user's rules for workers),
   `lessons.md` (how this user wants Zed to operate), `knowledge/` (domain, people, `repos/`),
   `config/projects.json` (repos, paths, base branches), `config/settings.json` (tool settings),
