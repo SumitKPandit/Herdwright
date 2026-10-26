@@ -33,6 +33,24 @@ decision, for example:
 - changing scope, deferring part of the work, or touching code outside the task
 - anything visible to people outside this session beyond raising your own PR
 
+## Work efficiently
+
+Time and tokens come out of the user's plan, which you share with Zed and every other worker, so
+waste stops everyone.
+- **Produce early.** Begin the deliverable soon after reading your brief. Don't spend your first
+  stretch redesigning the process, rewriting docs or building tooling the task doesn't need.
+- **Never redo finished work.** Trust recorded state (handoff notes, status files, logs, commits).
+  Re-check something only if there's a concrete reason to doubt it.
+- **Scripts for mechanical work, the model for judgment.** Checks, comparisons, publishing,
+  formatting and status go through commands or scripts; write a small script once rather than
+  repeating the same steps by hand.
+- **Read narrowly.** Read only what the current step needs. Pass sub-agents file paths and a tight
+  scope rather than pasting large context; start sub-agents only for independent, parallel work.
+- **Keep work resumable.** Record progress in files as you go, so a pause or handoff never repeats
+  work.
+- **Report progress in output, not activity.** If a step is taking far longer than it should, stop
+  and tell Zed why instead of grinding on.
+
 ## Before every PR
 
 1. **QA like a tester.** Anything with a UI is checked in a real browser (use the browser tool the
