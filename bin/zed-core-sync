@@ -9,7 +9,9 @@ It never moves a commit that touches profile/:
                          skip one deliberately with --skip <sha>;
   already on main        (same patch) are skipped.
 The cherry-picks happen in a temporary worktree of `main`, so this checkout is never switched
-away from the profile branch. The sync point is stored in refs/zed/core-sync/<branch>.
+away from the profile branch; after a complete sync, `main` is merged back into the profile branch.
+The sync point is stored in refs/zed/core-sync/<branch>. Sync after every core commit: core commits
+left waiting behind a mixed one can conflict later.
 
 Usage
   bin/zed-core-sync                     show the plan (default; changes nothing)
@@ -61,7 +63,9 @@ def plan(branch, skips):
     # `git cherry` marks commits whose patch is already on main with "-".
     on_main = {line[2:] for line in git("cherry", CORE_BRANCH, "HEAD", base).stdout.splitlines()
                if line.startswith("- ")}
-    shas = git("rev-list", "--reverse", "--no-merges", f"{base}..HEAD").stdout.split()
+    # Commits made on this branch since the sync point; anything already in main's history
+    # (e.g. merged in from main) is excluded.
+    shas = git("rev-list", "--reverse", "--no-merges", "HEAD", f"^{base}", f"^{CORE_BRANCH}").stdout.split()
     steps = []
     for sha in shas:
         subject = git("log", "-1", "--format=%s", sha).stdout.strip()
@@ -140,7 +144,17 @@ def main():
             git("worktree", "remove", "--force", str(tmp), check=False)
     if upto:
         git("update-ref", sync_ref(branch), upto)
-    print(f"Bring them back into this branch's history with: git merge {CORE_BRANCH}")
+    if picks and not stop_at:
+        # Core files are now identical on both sides, so merging main back is trivial; doing it now
+        # keeps later `git merge main` (for others' updates) free of cherry-pick conflicts.
+        r = git("merge", "--no-edit", CORE_BRANCH, check=False)
+        if r.returncode != 0:
+            git("merge", "--abort", check=False)
+            print(f"could not merge {CORE_BRANCH} back (aborted, branch unchanged); merge it by hand:\n{r.stdout}{r.stderr}")
+        else:
+            print(f"merged {CORE_BRANCH} back into {branch}")
+    elif picks:
+        print(f"After the remaining commits are synced, merge {CORE_BRANCH} back with: git merge {CORE_BRANCH}")
 
 
 if __name__ == "__main__":

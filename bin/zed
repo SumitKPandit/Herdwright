@@ -374,7 +374,7 @@ def cmd_task(args):
     if sub == "add":
         kv = parse_kv(rest)
         if "title" not in kv:
-            die("task add title=... [jira=MENT-123] [worktype=story] [description=...] [status=intake]")
+            die("task add title=... [jira=<ticket-id>] [worktype=<e.g. story>] [description=...] [status=intake]")
         ts = now()
         cur = conn.execute(
             "INSERT INTO tasks(title,jira,worktype,description,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
