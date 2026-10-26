@@ -278,7 +278,7 @@ class ZedTests(unittest.TestCase):
         agent = {"agent_status": "idle", "state_change_seq": 10}
         with patch.object(self.z, "require_lock"), patch.object(self.z, "holds_lock", return_value=True), \
                 patch.object(self.z, "live_agents", return_value={"qa:p1": agent}), \
-                patch.object(self.z, "read_screen", return_value="ZED:QUESTION\nWhich greeting?"):
+                patch.object(self.z, "read_screen", return_value="ZED:QUESTION\nWhich greeting?") as screen:
             self.z.cmd_watch(["--once", "0.01"])
             self.assertIn("at watch start", self.output.getvalue())
             self.output.truncate(0)
@@ -288,6 +288,7 @@ class ZedTests(unittest.TestCase):
                     self.z.cmd_watch(["--once", "0.01"])
             self.assertEqual(self.output.getvalue(), "")
             agent["state_change_seq"] = 12
+            screen.return_value = "ZED:QUESTION\nWhich colour?"  # a repeated block would not be an event
             self.z.cmd_watch(["--once"])
             self.assertIn("qa", self.output.getvalue())
 
@@ -298,6 +299,110 @@ class ZedTests(unittest.TestCase):
                 self.z.cmd_watch(["--once"])
         self.assertEqual(error.exception.code, 3)
         self.assertIn("LOCK LOST", self.output.getvalue())
+
+    DONE_SCREEN = """⏺ Done with the work.
+
+  ZED:DONE
+  Summary: Added the digest label
+  Branch: story/ment-1-x  Commits: abc123
+  PR: https://github.com/org/repo/pull/7  (draft)
+  QA: playwright-cli on localhost, happy path and empty digest
+  Follow-ups: none
+  Learnings: run npm ci first
+    then npm test
+────────────────────────
+❯ 
+  ⏵⏵ accept edits on"""
+
+    def test_parse_block_kinds_and_chrome(self):
+        b = self.z.parse_block(self.DONE_SCREEN)
+        self.assertEqual(b["kind"], "DONE")
+        self.assertEqual(b["fields"]["PR"], "https://github.com/org/repo/pull/7  (draft)")
+        self.assertEqual(b["fields"]["Learnings"], "run npm ci first\nthen npm test")
+        self.assertNotIn("accept edits", b["text"])
+        q = self.z.parse_block("ZED:QUESTION\n1. Which greeting?\n   Hello or Hi.\n2. Which colour?\n```\n")
+        self.assertEqual(q["items"], ["Which greeting?\nHello or Hi.", "Which colour?"])
+        self.assertEqual(self.z.parse_block("ZED:BLOCKED\nNeed credentials")["items"], ["Need credentials"])
+        self.assertIsNone(self.z.parse_block("no marker here, just prose mentioning ZED:DONE inline"))
+        self.assertIsNone(self.z.parse_block("ZED:DONE\n" + "line\n" * 100))
+        last = self.z.parse_block("ZED:QUESTION\n1. old\n\nZED:DONE\nSummary: s\nQA: q")
+        self.assertEqual(last["kind"], "DONE")
+
+    def test_record_block_done_sets_pr_status_and_flags_missing_qa(self):
+        conn = self.session()
+        conn.execute("UPDATE tasks SET status='active'")
+        s = conn.execute("SELECT * FROM sessions").fetchone()
+        text = self.z.record_block(conn, s, self.z.parse_block(self.DONE_SCREEN))
+        self.assertIn("PR: https://github.com/org/repo/pull/7", text)
+        self.assertNotIn("⚠", text)
+        row = conn.execute("SELECT s.pr_url, s.status, t.status FROM sessions s JOIN tasks t ON t.id=s.task_id").fetchone()
+        self.assertEqual(tuple(row), ("https://github.com/org/repo/pull/7", "finished", "pr_open"))
+        conn.execute("UPDATE tasks SET status='active'")
+        noqa = self.z.parse_block("ZED:DONE\nSummary: s2\nPR: https://github.com/o/r/pull/8\nQA: none")
+        self.assertIn("⚠", self.z.record_block(conn, s, noqa))
+        self.assertEqual(conn.execute("SELECT status FROM tasks").fetchone()[0], "active")
+
+    def test_record_block_questions_are_recorded_once(self):
+        conn = self.session()
+        s = conn.execute("SELECT * FROM sessions").fetchone()
+        block = self.z.parse_block("ZED:QUESTION\n1. Which greeting?\n2. Which colour?")
+        self.assertIn("Q1: Which greeting?", self.z.record_block(conn, s, block))
+        again = self.z.record_block(conn, s, block)
+        self.assertIn("already recorded", again)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0], 2)
+        self.assertEqual(conn.execute("SELECT status FROM sessions").fetchone()[0], "waiting_user")
+
+    def settle(self, screen, alerts, **kw):
+        conn = self.session() if not hasattr(self, "_conn") else self._conn
+        self._conn = conn
+        s = conn.execute("SELECT * FROM sessions").fetchone()
+        with patch.object(self.z, "read_screen", return_value=screen):
+            return self.z.settle_turn(conn, s, screen, alerts, "S1 T1 qa → idle", 5), s
+
+    def test_settle_turn_surfaces_a_new_block_once_then_treats_it_as_a_lapse(self):
+        alerts = {}
+        line, s = self.settle(self.DONE_SCREEN, alerts)
+        self.assertIn("ZED:DONE", line)
+        line, _ = self.settle(self.DONE_SCREEN, alerts)  # same block, still idle: nothing new
+        self.assertIsNone(line)
+        self.assertIn("lapse", alerts[s["id"]])
+
+    def test_limit_line_marks_runtime_limited_and_wakes_once(self):
+        self.config({"order": ["claude"]})
+        alerts = {}
+        screen = "working...\nYou've hit your session limit - resets 3pm"
+        line, s = self.settle(screen, alerts)
+        self.assertIn("claude marked limited", line)
+        self.assertIn("claude", json.loads(self.z.RUNTIME_STATE_PATH.read_text()))
+        again, _ = self.settle(screen, alerts)
+        self.assertIsNone(again)
+
+    def test_protocol_lapse_nudges_once_and_wakes_on_repeat(self):
+        conn = self.session()
+        s = conn.execute("SELECT * FROM sessions").fetchone()
+        alerts = {1: {"lapse": {"seq": 5, "since": 0}}}
+        with patch.object(self.z, "run") as run:
+            self.assertEqual(self.z.lapse_tick(s, "idle", 5, alerts)[0], "nudge")
+            self.assertIn("ZED:QUESTION", run.call_args.args[0][-1])
+            self.assertIsNone(self.z.lapse_tick(s, "idle", 5, alerts))  # lapse consumed
+            alerts[1]["lapse"] = {"seq": 6, "since": 0}
+            self.assertEqual(self.z.lapse_tick(s, "idle", 6, alerts)[0], "wake")
+            run.assert_called_once()  # no second nudge
+        alerts[1]["lapse"] = {"seq": 7, "since": 0}
+        self.assertIsNone(self.z.lapse_tick(s, "working", 7, alerts))  # woke up on its own
+        alerts[1]["lapse"] = {"seq": 7, "since": 10 ** 12}
+        self.assertIsNone(self.z.lapse_tick(s, "idle", 7, alerts))  # still inside the grace period
+
+    def test_watch_records_the_block_and_puts_it_in_the_event(self):
+        conn = self.session()
+        agent = {"agent_status": "idle", "state_change_seq": 10}
+        with patch.object(self.z, "require_lock"), patch.object(self.z, "holds_lock", return_value=True), \
+                patch.object(self.z, "live_agents", return_value={"qa:p1": agent}), \
+                patch.object(self.z, "read_screen", return_value=self.DONE_SCREEN):
+            self.z.cmd_watch(["--once", "0.01"])
+        out = self.output.getvalue()
+        self.assertIn("ZED:DONE · Added the digest label", out)
+        self.assertEqual(conn.execute("SELECT pr_url FROM sessions").fetchone()[0], "https://github.com/org/repo/pull/7")
 
 
 if __name__ == "__main__":

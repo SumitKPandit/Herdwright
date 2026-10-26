@@ -802,6 +802,19 @@ def cmd_log(args):
     write_status(conn)
 
 
+def add_question(conn, tid, sid, text):
+    """Record an open question for the user; marks the task and session as waiting on them."""
+    cur = conn.execute("INSERT INTO questions(task_id,session_id,question,asked_at) VALUES (?,?,?,?)",
+                       (tid, sid, text, now()))
+    if tid:
+        log_event(conn, tid, "question", f"Q{cur.lastrowid}: {text}")
+        conn.execute("UPDATE tasks SET status='waiting_user' WHERE id=? AND status='active'", (tid,))
+        touch_task(conn, tid)
+    if sid:
+        conn.execute("UPDATE sessions SET status='waiting_user', updated_at=? WHERE id=?", (now(), sid))
+    return cur.lastrowid
+
+
 def cmd_q(args):
     if not args:
         die("q add <task-id|-> <question> [session=S] | q answer <qid> <answer> | q list")
@@ -818,15 +831,7 @@ def cmd_q(args):
                 sid = int(a[8:].lstrip("S"))
             else:
                 parts.append(a)
-        cur = conn.execute("INSERT INTO questions(task_id,session_id,question,asked_at) VALUES (?,?,?,?)",
-                           (tid, sid, " ".join(parts), now()))
-        if tid:
-            log_event(conn, tid, "question", f"Q{cur.lastrowid}: {' '.join(parts)}")
-            conn.execute("UPDATE tasks SET status='waiting_user' WHERE id=? AND status='active'", (tid,))
-            touch_task(conn, tid)
-        if sid:
-            conn.execute("UPDATE sessions SET status='waiting_user', updated_at=? WHERE id=?", (now(), sid))
-        print(f"Q{cur.lastrowid}")
+        print(f"Q{add_question(conn, tid, sid, ' '.join(parts))}")
     elif sub == "answer":
         qid = int(rest[0].lstrip("Q"))
         ans = " ".join(rest[1:])
@@ -1226,8 +1231,9 @@ def cmd_handoff(args):
                       *[f"{k}={kv[k]}" for k in ("model", "effort") if k in kv]], worktree=Path(wt))
 
 
-def read_screen(agent):
-    return run(["herdr", "agent", "read", agent, "--source", "visible"], check=False).stdout
+def read_screen(agent, source="visible", lines=None):
+    r = run(["herdr", "agent", "read", agent, "--source", source, *(["--lines", str(lines)] if lines else [])], check=False)
+    return r.stdout if r.returncode == 0 else ""
 
 
 def limit_line(runtime, screen, last=25):
@@ -1246,6 +1252,150 @@ def record_credits(conn, s, screen=None):
     m = re.findall(pattern, screen if screen is not None else read_screen(s["agent"]))
     if m:
         conn.execute("UPDATE sessions SET credits=? WHERE id=?", (float(m[-1]), s["id"]))
+
+
+# ---------------------------------------------------------------- worker reports
+
+BLOCK_START = re.compile(r"^ZED:(QUESTION|DONE|BLOCKED)\s*$")
+BLOCK_END = re.compile(r"^(```|[─━╭╰❯⏵✻✢✽]|.*\bAIC used\b|.*\besc to\b)")  # closing fence or the CLI's prompt/footer chrome
+BLOCK_MAX_LINES = 80           # a marker with more text than this after it is old output, not a final report
+DONE_FIELDS = ("Summary", "Branch", "PR", "QA", "Follow-ups", "Learnings")
+NO_QA = re.compile(r"^\W*(none|n/?a|not (run|done|tested)|skipped|no qa|-)?\W*$", re.I)
+LAPSE_GRACE = 30               # seconds a worker must stay idle without a ZED block before it is nudged
+LAPSE_NUDGE = "Continue, or end with ZED:QUESTION / ZED:DONE / ZED:BLOCKED."
+
+
+def parse_block(screen):
+    """The worker's last ZED:QUESTION / ZED:DONE / ZED:BLOCKED block on its screen, or None:
+    {"kind", "text", "fingerprint", "items" (QUESTION) | "fields" (DONE)}."""
+    lines = [re.sub(r"^[\s⏺●│⎿]+", "", l).rstrip() for l in (screen or "").splitlines()]
+    starts = [i for i, l in enumerate(lines) if BLOCK_START.match(l)]
+    if not starts:
+        return None
+    i = starts[-1]
+    body = []
+    for l in lines[i + 1:]:
+        if BLOCK_END.match(l):
+            break
+        body.append(l)
+    while body and not body[-1]:
+        body.pop()
+    if len(body) > BLOCK_MAX_LINES:
+        return None
+    kind = BLOCK_START.match(lines[i]).group(1)
+    block = {"kind": kind, "text": "\n".join(body), "items": [], "fields": {}}
+    block["fingerprint"] = f"{kind}:{block['text'][:200]}"
+    if kind == "DONE":
+        field = None
+        for l in body:
+            m = re.match(rf"({'|'.join(DONE_FIELDS)}):\s*(.*)$", l)
+            if m:
+                field = m.group(1)
+                block["fields"][field] = m.group(2)
+            elif field and l:
+                block["fields"][field] += "\n" + l
+    else:
+        for l in body:
+            m = re.match(r"(\d+)[.)]\s+(.*)$", l)
+            if m:
+                block["items"].append(m.group(2))
+            elif block["items"] and l:
+                block["items"][-1] += "\n" + l
+        if not block["items"] and block["text"]:
+            block["items"] = [block["text"]]
+    return block
+
+
+def record_block(conn, s, block):
+    """Do the DB bookkeeping for a worker's report (what `check-workers` did by hand) and return the
+    text to put in the watcher event."""
+    sid, tid = s["id"], s["task_id"]
+    if block["kind"] in ("QUESTION", "BLOCKED"):
+        out = []
+        for text in block["items"] or ["(empty block)"]:
+            if block["kind"] == "BLOCKED":
+                text = f"BLOCKED: {text}"
+            known = conn.execute("SELECT id FROM questions WHERE session_id=? AND question=?", (sid, text)).fetchone()
+            qid = known["id"] if known else add_question(conn, tid, sid, text)
+            out.append(f"Q{qid}{' (already recorded)' if known else ''}: {text}")
+        return f"ZED:{block['kind']}\n" + "\n".join(out)
+    f = block["fields"]
+    summary = f.get("Summary", "").strip()
+    if not conn.execute("SELECT 1 FROM events WHERE task_id=? AND kind='done' AND text=?", (tid, summary)).fetchone():
+        log_event(conn, tid, "done", summary or "(no summary)")
+    conn.execute("UPDATE sessions SET status='finished', updated_at=? WHERE id=?", (now(), sid))
+    out = [f"ZED:DONE · {summary}"]
+    url = re.search(r"https?://\S+", f.get("PR", ""))
+    qa = f.get("QA", "").strip()
+    if url:
+        url = url.group(0).rstrip(".,;)")
+        conn.execute("UPDATE sessions SET pr_url=?, updated_at=? WHERE id=?", (url, now(), sid))
+        out.append(f"PR: {url}")
+        if NO_QA.match(qa):
+            out.append("⚠ PR with no real QA in its QA: line — send it back to QA before accepting (CLAUDE.md directive 6)")
+        else:
+            conn.execute("UPDATE tasks SET status='pr_open' WHERE id=? AND status IN ('active','waiting_user','in_review')", (tid,))
+    out.append(f"QA: {qa or '(missing)'}")
+    for k in ("Follow-ups", "Learnings"):
+        if f.get(k) and f[k].strip().lower() not in ("none", "-"):
+            out.append(f"{k}: {f[k]}")
+    touch_task(conn, tid)
+    return "\n".join(out)
+
+
+def mark_runtime_limited(conn, name, note):
+    state = runtime_state()
+    state[name] = {"since": now(), "until": None, "note": note}
+    log_event(conn, None, "runtime", f"{name} limited: {note}")
+    RUNTIME_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    RUNTIME_STATE_PATH.write_text(json.dumps(state, indent=2) + "\n")
+
+
+def settle_turn(conn, s, screen, alerts, line, seq):
+    """A worker's turn ended (idle/done). Returns the event text for Zed, or None when the watcher
+    dealt with it: a new ZED block is recorded and surfaced; a usage limit marks the runtime limited and
+    wakes Zed once; no block at all is a protocol lapse, nudged by `lapse_tick` after a grace period."""
+    seen = alerts.setdefault(s["id"], {})
+    block = parse_block(read_screen(s["agent"], "recent-unwrapped", 150) or screen)
+    if block and seen.get("block") != block["fingerprint"]:
+        seen["block"], seen["nudges"] = block["fingerprint"], 0
+        seen.pop("lapse", None)
+        return f"{line}\n{record_block(conn, s, block)}"
+    hit = limit_line(s["runtime"], screen)
+    if hit:
+        if seen.get("limit") == hit:
+            return None
+        seen["limit"] = hit
+        if not runtime_state().get(s["runtime"]):
+            mark_runtime_limited(conn, s["runtime"], hit)
+        return (f"{line} · USAGE LIMIT: {hit} · {s['runtime']} marked limited (undo: bin/zed runtime ok {s['runtime']}); "
+                "moving the worker needs the user's OK (switch-runtime skill)")
+    young = (datetime.now() - datetime.strptime(s["created_at"], "%Y-%m-%d %H:%M")).total_seconds() < 180
+    if not young:
+        seen["lapse"] = {"seq": seq, "since": time.time()}
+    return None
+
+
+def lapse_tick(s, state, seq, alerts):
+    """Protocol lapse: idle with no ZED block. The first one is nudged with the standard prompt without
+    waking Zed; one after a nudge is returned as an event line."""
+    seen = alerts.setdefault(s["id"], {})
+    lapse = seen.get("lapse")
+    if not lapse:
+        return None
+    if state not in ("idle", "done") or lapse["seq"] != seq:
+        seen.pop("lapse")
+        return None
+    if time.time() - lapse["since"] < LAPSE_GRACE:
+        return None
+    seen.pop("lapse")
+    if not seen.get("nudges"):
+        seen["nudges"] = 1
+        run(["herdr", "agent", "prompt", s["agent"], LAPSE_NUDGE], check=False)
+        return ("nudge", f"S{s['id']} idle with no ZED block; sent the standard nudge")
+    seen["nudges"] += 1
+    return ("wake", f"S{s['id']} T{s['task_id']} {s['agent']} · PROTOCOL LAPSE again: idle with no ZED block after a nudge "
+                    "(read its screen; it may be waiting on something or lost)")
 
 
 def cmd_watch(args):
@@ -1299,12 +1449,21 @@ def cmd_watch(args):
                                 line = None  # handled by rule; logged, no need to wake Zed
                             else:
                                 line += f" · prompt: {prompt}" if prompt else ""
-                        hit = line and limit_line(s["runtime"], screen)
+                        elif state in ("idle", "done"):
+                            line = settle_turn(conn, s, screen, alerts, line, snapshot["sequence"])
+                        hit = line and state not in ("idle", "done") and limit_line(s["runtime"], screen)
                         if hit:
                             line += f" · possible {s['runtime']} usage limit: {hit}"
                     if line:
                         events.append(line)
                     prev[key] = snapshot
+                lapse = lapse_tick(s, state, snapshot["sequence"], alerts)
+                if lapse:
+                    kind, text = lapse
+                    if kind == "nudge":
+                        log_event(conn, s["task_id"], "auto", text)
+                    else:
+                        events.append(text)
             first = False
             conn.commit()
             conn.close()
