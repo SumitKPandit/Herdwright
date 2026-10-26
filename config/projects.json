@@ -1,0 +1,65 @@
+{
+  "code_root": "~/codebase/mention",
+  "worktree_root": "~/codebase/mention/.worktrees",
+  "jira_project": "MENT",
+  "repos": {
+    "onclusive-core-client": {
+      "path": "~/codebase/mention/onclusive-core-client",
+      "app": "360",
+      "role": "360 frontend",
+      "host": "github",
+      "dev_base": "main",
+      "branches": {"main": "staging; base for new dev", "deploy": "production", "feat/mfe-unified-shell": "360 integration with unified-fe"}
+    },
+    "green-lantern": {
+      "path": "~/codebase/mention/green-lantern",
+      "app": "360",
+      "role": "360 backend",
+      "host": "github",
+      "dev_base": "velocity-build",
+      "branches": {"velocity-build": "staging; base for new dev", "velocity-deploy": "production"}
+    },
+    "cm-reports": {
+      "path": "~/codebase/mention/cm-reports",
+      "app": "shared",
+      "role": "reports module shared by CM and 360",
+      "host": "github",
+      "dev_base": null,
+      "branches": {"main": "linked into cm-fe for CM reports", "medusa": "consumed by 360; dist built and pushed into onclusive-core-client"}
+    },
+    "cm-fe": {
+      "path": "~/codebase/mention/cm-fe",
+      "app": "cm",
+      "role": "CM frontend",
+      "host": "github",
+      "dev_base": "releases/v4.44.1",
+      "dev_base_rule": "releases/vX.Y.Z; confirm current one from recent PRs",
+      "branches": {}
+    },
+    "cm-api": {
+      "path": "~/codebase/mention/cm-api",
+      "app": "cm",
+      "role": "CM backend",
+      "host": "bitbucket",
+      "dev_base": "releases/v6.2.1",
+      "dev_base_rule": "releases/vX.Y.Z; confirm current one from recent PRs",
+      "branches": {}
+    },
+    "cm_db": {
+      "path": "~/codebase/mention/cm_db",
+      "app": "cm",
+      "role": "DB procedures used by cm-api",
+      "host": "bitbucket",
+      "dev_base": null,
+      "branches": {}
+    },
+    "unified-fe": {
+      "path": "~/codebase/mention/unified-fe",
+      "app": "unified",
+      "role": "microfrontend shell bringing CM and 360 together",
+      "host": "github",
+      "dev_base": "main",
+      "branches": {"main": "base for new dev"}
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bin/zed:*)",
+      "Bash(./bin/zed:*)",
+      "Bash(herdr agent:*)",
+      "Bash(herdr pane read:*)",
+      "Bash(herdr pane list:*)",
+      "Bash(herdr workspace list:*)",
+      "Bash(herdr status:*)",
+      "Bash(git status:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh pr view:*)"
+    ]
+  }
+}

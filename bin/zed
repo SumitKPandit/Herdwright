@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+"""zed — Zed's task tracker and herdr session driver.
+
+Everything Zed knows about ongoing work lives in db/zed.db (SQLite).
+STATUS.md is regenerated from it on every write.
+
+Concepts
+  task     a unit of work the user asked for (usually one Jira ticket)
+  session  one Claude worker running in herdr, in its own git worktree, on one repo
+  question something a worker (or Zed) needs the user to decide
+  event    timestamped log line attached to a task (or global if no task)
+
+Run `zed help` for commands.
+"""
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+ZED_HOME = Path(__file__).resolve().parent.parent
+DB_PATH = ZED_HOME / "db" / "zed.db"
+STATUS_PATH = ZED_HOME / "STATUS.md"
+PROJECTS_PATH = ZED_HOME / "config" / "projects.json"
+BRIEFS_DIR = ZED_HOME / "briefs"
+WORKER_RULES = ZED_HOME / "templates" / "worker-rules.md"
+
+TASK_STATES = ["intake", "active", "waiting_user", "in_review", "pr_open", "parked", "done", "cancelled"]
+SESSION_STATES = ["running", "waiting_user", "finished", "closed"]
+OPEN_TASK_STATES = ["intake", "active", "waiting_user", "in_review", "pr_open", "parked"]
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS tasks (
+  id INTEGER PRIMARY KEY,
+  title TEXT NOT NULL,
+  jira TEXT,
+  worktype TEXT,
+  description TEXT,
+  status TEXT NOT NULL DEFAULT 'intake',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+  id INTEGER PRIMARY KEY,
+  task_id INTEGER NOT NULL REFERENCES tasks(id),
+  repo TEXT NOT NULL,
+  base TEXT NOT NULL,
+  branch TEXT NOT NULL,
+  worktree TEXT NOT NULL,
+  agent TEXT NOT NULL,
+  workspace_id TEXT,
+  pane_id TEXT,
+  claude_session_id TEXT,
+  pr_url TEXT,
+  status TEXT NOT NULL DEFAULT 'running',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS questions (
+  id INTEGER PRIMARY KEY,
+  task_id INTEGER REFERENCES tasks(id),
+  session_id INTEGER REFERENCES sessions(id),
+  question TEXT NOT NULL,
+  answer TEXT,
+  status TEXT NOT NULL DEFAULT 'open',
+  asked_at TEXT NOT NULL,
+  answered_at TEXT
+);
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY,
+  task_id INTEGER REFERENCES tasks(id),
+  ts TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  text TEXT NOT NULL
+);
+"""
+
+
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA)
+    return conn
+
+
+def die(msg):
+    print(f"zed: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd, check=True, cwd=None):
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+    if check and r.returncode != 0:
+        die(f"command failed: {' '.join(cmd)}\n{r.stdout}{r.stderr}")
+    return r
+
+
+def herdr_json(args):
+    r = run(["herdr", *args], check=False)
+    if r.returncode != 0:
+        die(f"herdr {' '.join(args)} failed:\n{r.stderr or r.stdout}")
+    return json.loads(r.stdout)
+
+
+def projects():
+    return json.loads(PROJECTS_PATH.read_text())
+
+
+def project(repo):
+    p = projects()["repos"].get(repo)
+    if not p:
+        die(f"unknown repo '{repo}'. Known: {', '.join(projects()['repos'])}")
+    return p
+
+
+def expand(path):
+    return Path(os.path.expandvars(os.path.expanduser(path)))
+
+
+def parse_kv(args):
+    out = {}
+    for a in args:
+        if "=" not in a:
+            die(f"expected key=value, got '{a}'")
+        k, v = a.split("=", 1)
+        out[k] = v
+    return out
+
+
+def log_event(conn, task_id, kind, text):
+    conn.execute("INSERT INTO events(task_id, ts, kind, text) VALUES (?,?,?,?)", (task_id, now(), kind, text))
+
+
+def touch_task(conn, task_id):
+    conn.execute("UPDATE tasks SET updated_at=? WHERE id=?", (now(), task_id))
+
+
+def get_task(conn, tid):
+    t = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+    if not t:
+        die(f"no task {tid}")
+    return t
+
+
+def resolve_session(conn, ref):
+    """Session by numeric id or agent name."""
+    if str(ref).isdigit():
+        s = conn.execute("SELECT * FROM sessions WHERE id=?", (int(ref),)).fetchone()
+    else:
+        s = conn.execute("SELECT * FROM sessions WHERE agent=? ORDER BY id DESC", (ref,)).fetchone()
+    if not s:
+        die(f"no session '{ref}'")
+    return s
+
+
+# ---------------------------------------------------------------- status
+
+def live_agents():
+    r = run(["herdr", "agent", "list"], check=False)
+    if r.returncode != 0:
+        return {}
+    try:
+        agents = json.loads(r.stdout)["result"]["agents"]
+    except (ValueError, KeyError):
+        return {}
+    return {a["pane_id"]: a for a in agents}
+
+
+def render_status(conn, live=None):
+    live = live if live is not None else live_agents()
+    lines = [f"# Zed status", "", f"_Generated {now()} from db/zed.db. Do not edit by hand._", ""]
+
+    open_q = conn.execute(
+        "SELECT q.*, t.jira, t.title FROM questions q LEFT JOIN tasks t ON t.id=q.task_id "
+        "WHERE q.status='open' ORDER BY q.id").fetchall()
+    lines.append("## Waiting on you")
+    lines.append("")
+    if open_q:
+        for q in open_q:
+            tag = f"T{q['task_id']} {q['jira'] or ''}".strip() if q["task_id"] else "general"
+            lines.append(f"- **Q{q['id']}** ({tag}, asked {q['asked_at']}): {q['question']}")
+    else:
+        lines.append("- Nothing.")
+    lines.append("")
+
+    def task_block(t):
+        out = [f"### T{t['id']} · {t['jira'] or 'no-jira'} · {t['title']}",
+               f"- status: **{t['status']}** · worktype: {t['worktype'] or '-'} · updated {t['updated_at']}"]
+        if t["description"]:
+            out.append(f"- {t['description']}")
+        for s in conn.execute("SELECT * FROM sessions WHERE task_id=? ORDER BY id", (t["id"],)):
+            state = s["status"]
+            if s["status"] in ("running", "waiting_user") and s["pane_id"]:
+                a = live.get(s["pane_id"])
+                state += f" / agent {a['agent_status']}" if a else " / agent NOT FOUND"
+            pr = f" · PR {s['pr_url']}" if s["pr_url"] else ""
+            out.append(f"- S{s['id']} `{s['agent']}` {s['repo']} `{s['branch']}` ← `{s['base']}` · {state}{pr}")
+        last = conn.execute("SELECT * FROM events WHERE task_id=? ORDER BY id DESC LIMIT 3", (t["id"],)).fetchall()
+        for e in reversed(last):
+            out.append(f"  - {e['ts']} [{e['kind']}] {e['text']}")
+        out.append("")
+        return out
+
+    for header, states in [("In progress", ["active", "waiting_user", "in_review"]),
+                           ("PR open", ["pr_open"]),
+                           ("Not started / parked", ["intake", "parked"])]:
+        rows = conn.execute(
+            f"SELECT * FROM tasks WHERE status IN ({','.join('?'*len(states))}) ORDER BY id", states).fetchall()
+        lines.append(f"## {header}")
+        lines.append("")
+        if not rows:
+            lines.append("- None.")
+            lines.append("")
+        for t in rows:
+            lines.extend(task_block(t))
+
+    done = conn.execute(
+        "SELECT * FROM tasks WHERE status IN ('done','cancelled') ORDER BY updated_at DESC LIMIT 20").fetchall()
+    lines.append("## Recently finished")
+    lines.append("")
+    if not done:
+        lines.append("- None.")
+    for t in done:
+        prs = [s["pr_url"] for s in conn.execute("SELECT pr_url FROM sessions WHERE task_id=? AND pr_url IS NOT NULL", (t["id"],))]
+        lines.append(f"- T{t['id']} {t['jira'] or ''} {t['title']} — {t['status']} {t['updated_at']}"
+                     + (f" — {', '.join(prs)}" if prs else ""))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_status(conn):
+    STATUS_PATH.write_text(render_status(conn))
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_task(args):
+    if not args:
+        die("task add|set|show|list")
+    sub, rest = args[0], args[1:]
+    conn = db()
+    if sub == "add":
+        kv = parse_kv(rest)
+        if "title" not in kv:
+            die("task add title=... [jira=MENT-123] [worktype=story] [description=...] [status=intake]")
+        ts = now()
+        cur = conn.execute(
+            "INSERT INTO tasks(title,jira,worktype,description,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+            (kv["title"], kv.get("jira"), kv.get("worktype"), kv.get("description"), kv.get("status", "intake"), ts, ts))
+        log_event(conn, cur.lastrowid, "created", kv["title"])
+        print(f"T{cur.lastrowid}")
+    elif sub == "set":
+        tid, kv = int(rest[0].lstrip("T")), parse_kv(rest[1:])
+        get_task(conn, tid)
+        for k, v in kv.items():
+            if k not in ("title", "jira", "worktype", "description", "status"):
+                die(f"cannot set '{k}' on a task")
+            if k == "status" and v not in TASK_STATES:
+                die(f"status must be one of {TASK_STATES}")
+            conn.execute(f"UPDATE tasks SET {k}=? WHERE id=?", (v, tid))
+            log_event(conn, tid, "update", f"{k} → {v}")
+        touch_task(conn, tid)
+    elif sub == "show":
+        tid = int(rest[0].lstrip("T"))
+        t = get_task(conn, tid)
+        print(json.dumps(dict(t), indent=2))
+        print("sessions:")
+        for s in conn.execute("SELECT * FROM sessions WHERE task_id=?", (tid,)):
+            print("  " + json.dumps(dict(s)))
+        print("questions:")
+        for q in conn.execute("SELECT * FROM questions WHERE task_id=?", (tid,)):
+            print(f"  Q{q['id']} [{q['status']}] {q['question']}" + (f"\n     → {q['answer']}" if q["answer"] else ""))
+        print("events:")
+        for e in conn.execute("SELECT * FROM events WHERE task_id=? ORDER BY id", (tid,)):
+            print(f"  {e['ts']} [{e['kind']}] {e['text']}")
+    elif sub == "list":
+        allrows = "--all" in rest
+        q = "SELECT * FROM tasks" + ("" if allrows else f" WHERE status IN ({','.join('?'*len(OPEN_TASK_STATES))})") + " ORDER BY id"
+        for t in conn.execute(q, () if allrows else OPEN_TASK_STATES):
+            print(f"T{t['id']:<4} {t['status']:<13} {t['jira'] or '-':<10} {t['title']}")
+    else:
+        die(f"unknown task subcommand {sub}")
+    conn.commit()
+    write_status(conn)
+
+
+def cmd_log(args):
+    if len(args) < 2:
+        die("log <task-id|-> <text> [kind=note]")
+    conn = db()
+    tid = None if args[0] == "-" else int(args[0].lstrip("T"))
+    kind = "note"
+    text_parts = []
+    for a in args[1:]:
+        if a.startswith("kind="):
+            kind = a[5:]
+        else:
+            text_parts.append(a)
+    log_event(conn, tid, kind, " ".join(text_parts))
+    if tid:
+        touch_task(conn, tid)
+    conn.commit()
+    write_status(conn)
+
+
+def cmd_q(args):
+    if not args:
+        die("q add <task-id|-> <question> [session=S] | q answer <qid> <answer> | q list")
+    sub, rest = args[0], args[1:]
+    conn = db()
+    if sub == "add":
+        tid = None if rest[0] == "-" else int(rest[0].lstrip("T"))
+        sid = None
+        parts = []
+        for a in rest[1:]:
+            if a.startswith("session="):
+                sid = int(a[8:].lstrip("S"))
+            else:
+                parts.append(a)
+        cur = conn.execute("INSERT INTO questions(task_id,session_id,question,asked_at) VALUES (?,?,?,?)",
+                           (tid, sid, " ".join(parts), now()))
+        if tid:
+            log_event(conn, tid, "question", f"Q{cur.lastrowid}: {' '.join(parts)}")
+            conn.execute("UPDATE tasks SET status='waiting_user' WHERE id=? AND status='active'", (tid,))
+            touch_task(conn, tid)
+        if sid:
+            conn.execute("UPDATE sessions SET status='waiting_user', updated_at=? WHERE id=?", (now(), sid))
+        print(f"Q{cur.lastrowid}")
+    elif sub == "answer":
+        qid = int(rest[0].lstrip("Q"))
+        ans = " ".join(rest[1:])
+        q = conn.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
+        if not q:
+            die(f"no question {qid}")
+        conn.execute("UPDATE questions SET answer=?, status='answered', answered_at=? WHERE id=?", (ans, now(), qid))
+        if q["task_id"]:
+            log_event(conn, q["task_id"], "answer", f"Q{qid}: {ans}")
+            touch_task(conn, q["task_id"])
+            still_open = conn.execute("SELECT COUNT(*) FROM questions WHERE task_id=? AND status='open'", (q["task_id"],)).fetchone()[0]
+            if not still_open:
+                conn.execute("UPDATE tasks SET status='active' WHERE id=? AND status='waiting_user'", (q["task_id"],))
+        if q["session_id"]:
+            still_open = conn.execute("SELECT COUNT(*) FROM questions WHERE session_id=? AND status='open'", (q["session_id"],)).fetchone()[0]
+            if not still_open:
+                conn.execute("UPDATE sessions SET status='running', updated_at=? WHERE id=? AND status='waiting_user'", (now(), q["session_id"]))
+    elif sub == "list":
+        for q in conn.execute("SELECT * FROM questions WHERE status='open' ORDER BY id"):
+            print(f"Q{q['id']} T{q['task_id']} S{q['session_id']} {q['asked_at']}: {q['question']}")
+    else:
+        die(f"unknown q subcommand {sub}")
+    conn.commit()
+    write_status(conn)
+
+
+def slugify(s, n=40):
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:n].strip("-")
+
+
+def cmd_spawn(args):
+    """spawn <task-id> repo=<repo> base=<branch> branch=<branch> brief=<path> [name=<agent>]"""
+    if not args:
+        die("spawn <task-id> repo=... base=... branch=... brief=<file> [name=...]")
+    tid = int(args[0].lstrip("T"))
+    kv = parse_kv(args[1:])
+    for k in ("repo", "base", "branch", "brief"):
+        if k not in kv:
+            die(f"spawn needs {k}=")
+    conn = db()
+    t = get_task(conn, tid)
+    p = project(kv["repo"])
+    repo_path = expand(p["path"])
+    brief = Path(kv["brief"]).resolve()
+    if not brief.exists():
+        die(f"brief not found: {brief}")
+
+    agent = kv.get("name") or f"t{tid}-{slugify(kv['repo'], 12)}"
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", agent):
+        die(f"bad agent name '{agent}'")
+    wt_root = expand(projects()["worktree_root"])
+    worktree = wt_root / kv["repo"] / slugify(kv["branch"].split("/")[-1], 60)
+
+    # 1. worktree
+    if worktree.exists():
+        print(f"reusing existing worktree {worktree}")
+    else:
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        run(["git", "-C", str(repo_path), "fetch", "origin", kv["base"]])
+        branch_exists = run(["git", "-C", str(repo_path), "rev-parse", "--verify", "--quiet", kv["branch"]], check=False).returncode == 0
+        if branch_exists:
+            run(["git", "-C", str(repo_path), "worktree", "add", str(worktree), kv["branch"]])
+        else:
+            run(["git", "-C", str(repo_path), "worktree", "add", "-b", kv["branch"], str(worktree), f"origin/{kv['base']}"])
+        # Don't let the new branch track the base branch; worker pushes with -u.
+        run(["git", "-C", str(worktree), "branch", "--unset-upstream"], check=False)
+
+    # 2. herdr workspace + claude
+    label = f"T{tid} {t['jira'] or ''} {kv['repo']}".strip()
+    ws = herdr_json(["workspace", "create", "--cwd", str(worktree), "--label", label, "--no-focus"])["result"]
+    ws_id, pane_id = ws["workspace"]["workspace_id"], ws["root_pane"]["pane_id"]
+    time.sleep(1.5)  # let the shell reach its prompt
+    claude_args = ["--permission-mode", "auto", "-n", agent,
+                   "--append-system-prompt-file", str(WORKER_RULES)]
+    r = run(["herdr", "agent", "start", agent, "--kind", "claude", "--pane", pane_id, "--timeout", "60000",
+             "--", *claude_args], check=False)
+    if r.returncode != 0 and "agent_not_ready" in r.stderr:
+        # A fresh worktree triggers Claude Code's folder-trust dialog. Zed created this worktree
+        # from a configured repo, so accept it; anything else stays blocked for Zed to inspect.
+        screen = run(["herdr", "agent", "read", agent, "--source", "visible"], check=False).stdout
+        if "Yes, I trust this folder" in screen:  # the pane was opened with cwd=worktree
+            run(["herdr", "agent", "send-keys", agent, "down", "enter"], check=False)
+            r = run(["herdr", "agent", "wait", agent, "--until", "idle", "--timeout", "60000"], check=False)
+    ts = now()
+    cur = conn.execute(
+        "INSERT INTO sessions(task_id,repo,base,branch,worktree,agent,workspace_id,pane_id,status,created_at,updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (tid, kv["repo"], kv["base"], kv["branch"], str(worktree), agent, ws_id, pane_id, "running", ts, ts))
+    sid = cur.lastrowid
+    conn.execute("UPDATE tasks SET status='active' WHERE id=? AND status IN ('intake','parked')", (tid,))
+    log_event(conn, tid, "spawn", f"S{sid} {agent} on {kv['repo']} {kv['branch']} ← {kv['base']} ({worktree})")
+    touch_task(conn, tid)
+    conn.commit()
+    write_status(conn)
+    if r.returncode != 0:
+        die(f"S{sid}: agent start did not report ready (pane {pane_id}). Inspect with: herdr agent read {agent}\n{r.stderr}")
+
+    # 3. hand over the brief
+    pr = run(["herdr", "agent", "prompt", agent,
+              f"You are session S{sid} for Zed task T{tid}. Read your brief at {brief} and follow it.",
+              "--wait", "--until", "working", "--until", "blocked", "--timeout", "30000"], check=False)
+    print(json.dumps({"task": f"T{tid}", "session": f"S{sid}", "agent": agent, "pane": pane_id,
+                      "workspace": ws_id, "worktree": str(worktree), "prompt_ok": pr.returncode == 0}))
+
+
+def cmd_session(args):
+    if not args:
+        die("session set <S|agent> key=value... | session list")
+    sub, rest = args[0], args[1:]
+    conn = db()
+    if sub == "set":
+        s = resolve_session(conn, rest[0].lstrip("S") if rest[0].startswith("S") and rest[0][1:].isdigit() else rest[0])
+        for k, v in parse_kv(rest[1:]).items():
+            if k not in ("status", "pr_url", "claude_session_id", "pane_id", "workspace_id", "base"):
+                die(f"cannot set '{k}' on a session")
+            if k == "status" and v not in SESSION_STATES:
+                die(f"status must be one of {SESSION_STATES}")
+            conn.execute(f"UPDATE sessions SET {k}=?, updated_at=? WHERE id=?", (v, now(), s["id"]))
+            log_event(conn, s["task_id"], "session", f"S{s['id']} {k} → {v}")
+        touch_task(conn, s["task_id"])
+    elif sub == "list":
+        live = live_agents()
+        for s in conn.execute("SELECT * FROM sessions WHERE status!='closed' ORDER BY id"):
+            a = live.get(s["pane_id"])
+            print(f"S{s['id']:<3} T{s['task_id']:<3} {s['agent']:<20} {s['status']:<13} "
+                  f"agent={a['agent_status'] if a else 'GONE':<8} {s['repo']} {s['branch']}")
+    else:
+        die(f"unknown session subcommand {sub}")
+    conn.commit()
+    write_status(conn)
+
+
+def cmd_close(args):
+    """close <S|agent> [keep-worktree] — stop the worker, close its herdr workspace, remove the worktree."""
+    if not args:
+        die("close <S|agent> [keep-worktree] [force]")
+    conn = db()
+    ref = args[0][1:] if args[0].startswith("S") and args[0][1:].isdigit() else args[0]
+    s = resolve_session(conn, ref)
+    wt = Path(s["worktree"])
+    if "keep-worktree" not in args and wt.exists():
+        dirty = run(["git", "-C", str(wt), "status", "--porcelain"], check=False).stdout.strip()
+        unpushed = run(["git", "-C", str(wt), "log", "--oneline", "@{u}..HEAD"], check=False)
+        if (dirty or unpushed.returncode != 0 or unpushed.stdout.strip()) and "force" not in args:
+            die(f"S{s['id']} worktree has uncommitted or unpushed work:\n{dirty}\n{unpushed.stdout}{unpushed.stderr}\n"
+                "Resolve it first, or pass 'keep-worktree' / 'force'.")
+    if s["workspace_id"]:
+        run(["herdr", "workspace", "close", s["workspace_id"]], check=False)
+    if "keep-worktree" not in args and wt.exists():
+        repo_path = expand(project(s["repo"])["path"])
+        run(["git", "-C", str(repo_path), "worktree", "remove", *(["--force"] if "force" in args else []), str(wt)])
+    conn.execute("UPDATE sessions SET status='closed', updated_at=? WHERE id=?", (now(), s["id"]))
+    log_event(conn, s["task_id"], "close", f"S{s['id']} {s['agent']} closed" + (" (worktree kept)" if "keep-worktree" in args else ""))
+    touch_task(conn, s["task_id"])
+    conn.commit()
+    write_status(conn)
+    print(f"closed S{s['id']}")
+
+
+def cmd_watch(args):
+    """Emit one line whenever a managed worker changes to a state that needs Zed's attention.
+    Meant to be run under Claude Code's Monitor tool."""
+    interval = float(args[0]) if args else 3.0
+    prev = {}
+    first = True
+    while True:
+        try:
+            conn = db()
+            sessions = conn.execute("SELECT * FROM sessions WHERE status IN ('running','waiting_user')").fetchall()
+            conn.close()
+            live = live_agents()
+            for s in sessions:
+                a = live.get(s["pane_id"])
+                state = a["agent_status"] if a else "gone"
+                key = s["id"]
+                if prev.get(key) != state:
+                    if not first and state in ("idle", "done", "blocked", "unknown", "gone"):
+                        print(f"S{s['id']} T{s['task_id']} {s['agent']} → {state}", flush=True)
+                    elif first and state in ("blocked", "gone"):
+                        print(f"S{s['id']} T{s['task_id']} {s['agent']} is {state} (at watch start)", flush=True)
+                    prev[key] = state
+            first = False
+        except Exception as e:  # keep the watch alive through transient failures
+            print(f"watch error: {e}", file=sys.stderr, flush=True)
+        time.sleep(interval)
+
+
+def cmd_status(args):
+    conn = db()
+    write_status(conn)
+    print(STATUS_PATH.read_text())
+
+
+def cmd_help(args):
+    print(__doc__)
+    print("""Commands
+  task add title=... [jira=] [worktype=] [description=] [status=]
+  task set <T> key=value...          (title jira worktype description status)
+  task show <T> | task list [--all]
+  log <T|-> <text...> [kind=note]
+  q add <T|-> <question...> [session=S] | q answer <Q> <answer...> | q list
+  spawn <T> repo= base= branch= brief=<file> [name=<agent>]
+  session list | session set <S|agent> key=value... (status pr_url claude_session_id pane_id workspace_id base)
+  close <S|agent> [keep-worktree] [force]
+  watch [interval-seconds]           (run under Monitor)
+  status                             (regenerate + print STATUS.md)
+Task states:    """ + ", ".join(TASK_STATES) + """
+Session states: """ + ", ".join(SESSION_STATES))
+
+
+COMMANDS = {"task": cmd_task, "log": cmd_log, "q": cmd_q, "spawn": cmd_spawn, "session": cmd_session,
+            "close": cmd_close, "watch": cmd_watch, "status": cmd_status, "help": cmd_help}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        cmd_help([])
+        sys.exit(0 if len(sys.argv) < 2 else 2)
+    COMMANDS[sys.argv[1]](sys.argv[2:])
