@@ -1292,8 +1292,11 @@ def cmd_watch(args):
                         record_credits(conn, s, screen)
                         if state == "blocked":
                             prompt = prompt_summary(screen)
-                            line += f" · prompt: {prompt}" if prompt else ""
-                        hit = limit_line(s["runtime"], screen)
+                            if auto_approve(conn, s, screen, alerts):
+                                line = None  # handled by rule; logged, no need to wake Zed
+                            else:
+                                line += f" · prompt: {prompt}" if prompt else ""
+                        hit = line and limit_line(s["runtime"], screen)
                         if hit:
                             line += f" · possible {s['runtime']} usage limit: {hit}"
                     if line:
@@ -1324,6 +1327,34 @@ def prompt_summary(screen):
     return " | ".join(keep)[:600]
 
 
+AUTO_APPROVE_PATH = PROFILE_DIR / "config" / "auto-approve.json"
+
+
+def auto_approve(conn, s, screen, alerts):
+    """Answer a routine permission prompt by rule, without waking Zed. Rules live in the profile's
+    config/auto-approve.json: [{"name", "prompt" (text that must appear), "path_prefixes" (the Read/Bash
+    target must start with one), "option" (text of the one-time option that must be offered), "key"}].
+    A prompt already answered once that is still showing is left for Zed."""
+    rules = read_json(AUTO_APPROVE_PATH, [])
+    tail = "\n".join((screen or "").splitlines()[-30:])
+    seen = alerts.setdefault(s["id"], {})
+    if seen.get("auto_last") == tail:
+        return False
+    for r in rules:
+        if r["prompt"] not in tail or r["option"] not in tail:
+            continue
+        targets = re.findall(r"(?:Read|Bash)\((.*?)\)\s*$", tail, re.M)
+        prefixes = [os.path.expanduser(x) for x in r.get("path_prefixes", [])]
+        targets = [os.path.normpath(t) for t in targets]  # no `..` escapes out of an allowed prefix
+        if not targets or not all(any(t.startswith(x) for x in prefixes) for t in targets):
+            continue
+        run(["herdr", "agent", "send-keys", s["agent"], r["key"]], check=False)
+        seen["auto_last"] = tail
+        log_event(conn, s["task_id"], "auto", f"S{s['id']}: answered '{r['name']}' with {r['key']} for {', '.join(targets)}")
+        return True
+    return False
+
+
 def health_events(conn, s, a, state, alerts):
     """Deterministic checks the watcher runs on every live session: no plan progress, token use, long blocks."""
     out, seen = [], alerts.setdefault(s["id"], {})
@@ -1351,8 +1382,12 @@ def health_events(conn, s, a, state, alerts):
         if u:
             step = u["output"] // USAGE_ALERT_OUTPUT
             if step > seen.setdefault("usage_step", 0):
-                seen["usage_step"] = step
-                out.append(f"{tag} · USAGE: {fmt_usage(u)} so far (check delivered work against it)")
+                done = sum(len(re.findall(r"^\s*- \[[xX]\]", p.read_text(), re.M)) for p in plan_files(s["task_id"]))
+                if done <= seen.get("usage_plan_done", -1):  # tokens spent with no plan progress: needs judgment
+                    out.append(f"{tag} · USAGE without plan progress: {fmt_usage(u)}, still {done} steps done")
+                else:
+                    log_event(conn, s["task_id"], "auto", f"S{s['id']} usage {fmt_usage(u)}; {done} plan steps done")
+                seen["usage_step"], seen["usage_plan_done"] = step, done
     return out
 
 
