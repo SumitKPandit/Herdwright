@@ -49,7 +49,8 @@ class DecideTests(unittest.TestCase):
             record = str(self.profile / "employees" / "quill" / "memory" / "repos" / "api.md")
             self.assertIn("zed-employee remember", self.call(hat, "Edit", file_path=record), hat)
             self.assertIn("denied", self.bash(hat, f"echo x >> {record}"), hat)
-            self.assertIsNone(self.call(hat, "Edit", file_path=str(self.profile / "config" / "projects.json")), hat)
+            config = self.call(hat, "Edit", file_path=str(self.profile / "config" / "projects.json"))
+            self.assertEqual(config is None, hat == "build", hat)  # only the hats that may edit reach profile config
 
     def test_outward_commands_are_denied_by_prefix_whatever_the_program_path_or_env(self):
         for hat in self.manifests:
@@ -83,6 +84,28 @@ class DecideTests(unittest.TestCase):
             self.assertIsNone(self.bash(hat, "cd $D && git log"), hat)
             self.assertIsNone(self.bash(hat, f"cd $D && git -C {self.evidence} commit -m x"), hat)
         self.assertIsNone(self.bash("build", "cd $D && git commit -m x"))
+
+    def test_review_and_qa_write_only_their_plan_findings_and_status_log_in_the_profile(self):
+        briefs, status = self.profile / "briefs", self.profile / ".cache" / "status"
+        with mock.patch.dict(os.environ, {"ZED_SESSION": "S76"}):
+            for hat in ("review", "qa"):
+                for allowed in (briefs / "T28-plan.md", briefs / "T24-rereview3-findings.md", status / "S76.log"):
+                    self.assertIsNone(self.call(hat, "Write", file_path=str(allowed)), (hat, allowed))
+                    self.assertIsNone(self.bash(hat, f"echo x >> {allowed}"), (hat, allowed))
+                for refused in (briefs / "T28-zed.md", status / "S1.log", self.profile / "lessons.md",
+                                self.profile / "employees" / "quill" / "employee-plan.md"):
+                    self.assertIn("denied", self.call(hat, "Edit", file_path=str(refused)), (hat, refused))
+                    self.assertIn("denied", self.bash(hat, f"echo x > {refused}"), (hat, refused))
+            self.assertIsNone(self.call("build", "Edit", file_path=str(briefs / "T28-zed.md")))  # build is not limited
+
+    def test_a_read_only_hat_may_not_commit_in_the_checkout_holding_the_profile(self):
+        home = self.profile.parent
+        for hat in ("review", "qa"):
+            for command in (f"git -C {home} commit -m x", f"git -C {self.profile} add briefs/x.md", f"cd {home} && git commit -m x"):
+                self.assertIn("denied", self.bash(hat, command), (hat, command))
+            self.assertIsNone(self.bash(hat, f"git -C {home} log"), hat)
+            self.assertIsNone(self.bash(hat, f"git -C {self.evidence} commit -m x"), hat)
+        self.assertIsNone(self.bash("build", f"git -C {home} commit -m x"))
 
     def test_a_variable_repo_after_dash_c_cannot_be_checked_for_a_read_only_hat(self):
         for hat in ("review", "qa"):

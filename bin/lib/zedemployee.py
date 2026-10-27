@@ -100,9 +100,9 @@ def validate_manifest(manifest, hat_dir=None):
         if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
             problems.append(f"{key}: must be a list of names")
     deny = manifest.get("deny")
-    if not isinstance(deny, dict) or set(deny) != {"edit", "commands"} \
+    if not isinstance(deny, dict) or not {"edit", "commands"} <= set(deny) <= {"edit", "commands", "except"} \
             or not all(isinstance(deny[k], list) and all(isinstance(x, str) for x in deny[k]) for k in deny):
-        problems.append("deny: must be {\"edit\": [globs], \"commands\": [prefixes]}")
+        problems.append("deny: must be {\"edit\": [globs], \"commands\": [prefixes]} and may add \"except\": [globs]")
     if manifest.get("subagents") not in SUBAGENT_MODES:
         problems.append(f"subagents: must be one of {SUBAGENT_MODES}")
     if not isinstance(manifest.get("kind"), str) or not manifest.get("kind"):

@@ -1,7 +1,8 @@
 {
   "scripts": ["zed-pr", "zed-review", "zed-checks", "zed-employee"],
   "skills": ["review-maintainability", "answer-peer", "finish"],
-  "deny": {"edit": ["**"], "commands": ["gh pr review", "gh pr comment", "bb pr comment"]},
+  "deny": {"edit": ["**", "profile/**"], "commands": ["gh pr review", "gh pr comment", "bb pr comment"],
+           "except": ["profile/briefs/*-plan.md", "profile/briefs/*-findings.md", "profile/.cache/status/{session}.log"]},
   "subagents": "none",
   "kind": "review"
 }

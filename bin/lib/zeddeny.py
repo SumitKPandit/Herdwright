@@ -36,17 +36,34 @@ def glob_regex(pattern):
     return re.compile(out + r"\Z")
 
 
-def denied_path(path, patterns, worktree, profile, cwd):
+def matches(p, pattern, worktree, profile):
+    """Whether the resolved path `p` matches `pattern`: one beginning `profile/` is relative to the profile folder, any
+    other to the worktree. `{session}` in a pattern is this session's id (ZED_SESSION)."""
+    pattern = pattern.replace("{session}", os.environ.get("ZED_SESSION", "-"))
+    base, rel_pattern = (Path(profile), pattern[len("profile/"):]) if pattern.startswith("profile/") else (Path(worktree), pattern)
+    base = Path(os.path.realpath(base))
+    return (p == base or base in p.parents) and bool(glob_regex(rel_pattern).match(str(p.relative_to(base))))
+
+
+def denied_path(path, patterns, worktree, profile, cwd, exceptions=()):
     """The pattern that denies `path`, or None. A pattern beginning `profile/` is relative to the profile folder,
-    any other to the worktree; paths outside both (scratch, evidence directories, /tmp) are never denied."""
+    any other to the worktree; paths outside both (scratch, evidence directories, /tmp) are never denied.
+    A path matching an exception is allowed, except under the employee records, which no exception reaches."""
     p = Path(os.path.expanduser(str(path)))
     p = Path(os.path.realpath(p if p.is_absolute() else Path(cwd) / p))
     for pattern in patterns:
-        base, rel_pattern = (Path(profile), pattern[len("profile/"):]) if pattern.startswith("profile/") else (Path(worktree), pattern)
-        base = Path(os.path.realpath(base))
-        if (p == base or base in p.parents) and glob_regex(rel_pattern).match(str(p.relative_to(base))):
+        if matches(p, pattern, worktree, profile) and not (
+                pattern != EMPLOYEE_DATA and any(matches(p, e, worktree, profile) for e in exceptions)):
             return pattern
     return None
+
+
+def holds_profile(repo, profile, cwd):
+    """True when `repo` is the checkout the profile lives in (or a folder above it): `git -C <that> commit` would
+    commit profile files, which a hat that may not edit them must not do."""
+    p = Path(os.path.expanduser(str(repo)))
+    p = Path(os.path.realpath(p if p.is_absolute() else Path(cwd) / p))
+    return p == Path(os.path.realpath(profile)) or p in Path(os.path.realpath(profile)).parents
 
 
 UNRESOLVED = re.compile(r"[$`]|^~[^/]")
@@ -68,7 +85,7 @@ def command_denied(words, prefixes):
 
 def shell_problem(cmd, manifest, worktree, profile, cwd):
     deny = manifest["deny"]
-    patterns = [EMPLOYEE_DATA, *deny["edit"]]
+    patterns, exceptions = [EMPLOYEE_DATA, *deny["edit"]], deny.get("except", [])
     try:
         cmds = zedshell.split_commands(zedshell.tokens(cmd))
     except ValueError:
@@ -103,14 +120,15 @@ def shell_problem(cmd, manifest, worktree, profile, cwd):
         for t in targets:
             if unresolved(t) or (cwd is None and not (Path(os.path.expanduser(t)).is_absolute())):
                 return f"writing {t} cannot be checked (the shell expands it or the directory is unknown): use a literal absolute path"
-            if pattern := denied_path(t, patterns, worktree, profile, cwd):
+            if pattern := denied_path(t, patterns, worktree, profile, cwd, exceptions):
                 return f"writing {t} is denied to this hat ({pattern})"
         if name == "git" and read_only:
             sub, repo = zedshell.git_target(words, cwd)
             if sub in zedshell.GIT_WRITE and (repo is None or unresolved(repo)):
                 return f"`git {sub}` cannot be checked (the directory is unknown): use `git -C <absolute path>`"
-            if sub in zedshell.GIT_WRITE and denied_path(repo, ["**"], worktree, profile, cwd):
-                return f"`git {sub}` in the worktree is denied: this hat does not change the repo"
+            if sub in zedshell.GIT_WRITE and (denied_path(repo, ["**", "profile/**"], worktree, profile, cwd)
+                                              or holds_profile(repo, profile, cwd)):
+                return f"`git {sub}` in the worktree or the profile is denied: this hat does not change the repo"
     return None
 
 
@@ -141,7 +159,8 @@ def _decide(payload, manifest, worktree, profile):
         if not paths:
             return "an edit that names no file cannot be checked, so it is denied" if "**" in manifest["deny"]["edit"] else None
         for path in paths:
-            if pattern := denied_path(path, [EMPLOYEE_DATA, *manifest["deny"]["edit"]], worktree, profile, cwd):
+            if pattern := denied_path(path, [EMPLOYEE_DATA, *manifest["deny"]["edit"]], worktree, profile, cwd,
+                                      manifest["deny"].get("except", [])):
                 return f"editing {path} is denied to this hat ({pattern})" + \
                        ("; use `zed-employee remember|refresh|drop`" if pattern == EMPLOYEE_DATA else "")
     elif tool == "bash":
