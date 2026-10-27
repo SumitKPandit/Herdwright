@@ -58,6 +58,18 @@ waste stops everyone.
 - **Report progress in output, not activity.** If a step is taking far longer than it should, stop
   and tell Zed why instead of grinding on.
 
+## Report status
+
+Besides the `ZED:` block you end your turn with, append one line per event to your status file (the
+path is in your spawn prompt: `{{PROFILE}}/.cache/status/S<your session number>.log`). Zed's watcher reads
+it in any state, even while you keep working (e.g. waiting on a background job), so a question is never
+missed. Use the **same words** as in the `ZED:` block.
+- `needs-decision: <one question, with options and your recommendation, on one line>` (one line per question)
+- `blocked: <what is blocking you and what you need>`
+- `done: <summary>; pr=<url or none>; qa=<what you verified and how>` (`qa=` last)
+
+Append with `echo 'needs-decision: …' >> <file>`. Do this **before** you print the block.
+
 ## Waits cost no turns
 
 Every turn you take resends your whole context, so a wait must cost as few turns as possible.

@@ -1293,11 +1293,13 @@ def cmd_spawn(args, worktree=None):
 
     # 3. hand over the brief
     require_lock()
+    STATUS_DIR.mkdir(parents=True, exist_ok=True)
     text = (f"You are the engineering worker, NOT the Zed coordinator, for session S{sid} / task T{tid}. "
             f"Do not onboard, acquire the coordinator lock, or change the coordinator's task database. "
             f"Zed's home is {ZED_HOME}; the user's profile is {PROFILE_DIR}. "
             f"Read your worker rules at {GENERATED_WORKER_RULES} and your brief at {brief}, then "
-            f"{PROFILE_DIR}/knowledge/repos/{kv['repo']}.md if it exists. ")
+            f"{PROFILE_DIR}/knowledge/repos/{kv['repo']}.md if it exists. "
+            f"Your status file is {STATUS_DIR}/S{sid}.log (see 'Report status' in your rules). ")
     if kv.get("handoff"):
         text += (f"You are taking over from an earlier session that stopped (see the handoff note at "
                  f"{Path(kv['handoff']).resolve()}): read it, check the worktree's git state, and continue "
@@ -1555,6 +1557,58 @@ def parse_block(screen):
     return block
 
 
+STATUS_DIR = PROFILE_DIR / ".cache" / "status"
+STATUS_LINE = re.compile(r"^(done|needs-decision|blocked):\s*(.*)$", re.I)
+
+
+def new_status_lines(s, alerts):
+    """Complete lines a worker has appended to its status file (profile/.cache/status/S<id>.log) since the last
+    look. The file is the primary report channel: it works in any agent state and needs no screen parsing."""
+    try:
+        text = (STATUS_DIR / f"S{s['id']}.log").read_text(errors="replace")
+    except FileNotFoundError:
+        return []
+    lines = text[:text.rfind("\n") + 1].splitlines()  # a half-written last line waits for its newline
+    seen = alerts.setdefault(s["id"], {})
+    new, seen["status_lines"] = lines[seen.get("status_lines", 0):], len(lines)
+    return new
+
+
+def status_blocks(lines):
+    """Fold status-file lines into blocks shaped like parse_block's:
+    `needs-decision: <question>` (one line each), `blocked: <what is needed>`,
+    `done: <summary>; pr=<url|none>; qa=<what was verified>`."""
+    questions, out = [], []
+    for line in lines:
+        m = STATUS_LINE.match(line.strip())
+        if not m:
+            continue
+        kind, text = m.group(1).lower(), m.group(2).strip()
+        if kind == "needs-decision":
+            questions.append(text)
+        elif kind == "blocked":
+            out.append({"kind": "BLOCKED", "items": [text], "fields": {}, "text": text})
+        else:
+            summary = re.split(r";\s*(?:pr|qa)=", text, maxsplit=1)[0].strip()
+            pr, qa = re.search(r";\s*pr=([^\s;]+)", text), re.search(r";\s*qa=(.*)$", text)
+            out.append({"kind": "DONE", "items": [], "text": text,
+                        "fields": {"Summary": summary, "PR": pr.group(1) if pr else "", "QA": qa.group(1).strip() if qa else ""}})
+    if questions:
+        out.insert(0, {"kind": "QUESTION", "items": questions, "fields": {}, "text": "\n".join(questions)})
+    return out
+
+
+def block_known(conn, s, block):
+    """Whether the bookkeeping for this block was already done (e.g. from the status file)."""
+    if block["kind"] == "DONE":
+        summary = block["fields"].get("Summary", "").strip()
+        return bool(conn.execute("SELECT 1 FROM events WHERE task_id=? AND kind='done' AND text=?",
+                                 (s["task_id"], summary)).fetchone())
+    prefix = "BLOCKED: " if block["kind"] == "BLOCKED" else ""
+    return all(conn.execute("SELECT 1 FROM questions WHERE session_id=? AND question=?", (s["id"], prefix + t)).fetchone()
+               for t in block["items"])
+
+
 def record_block(conn, s, block):
     """Do the DB bookkeeping for a worker's report (what `check-workers` did by hand) and return the
     text to put in the watcher event."""
@@ -1609,6 +1663,8 @@ def settle_turn(conn, s, screen, alerts, line, seq):
     if block and seen.get("block") != block["fingerprint"]:
         seen["block"], seen["nudges"] = block["fingerprint"], 0
         seen.pop("lapse", None)
+        if block_known(conn, s, block):  # already reported from the worker's status file
+            return None
         return f"{line}\n{record_block(conn, s, block)}"
     hit = limit_line(s["runtime"], screen)
     if hit:
@@ -1644,6 +1700,8 @@ def scan_working(conn, s, alerts):
     seen["block"], seen["nudges"] = block["fingerprint"], 0
     seen.pop("pending")
     seen.pop("lapse", None)
+    if block_known(conn, s, block):
+        return None
     return f"S{s['id']} T{s['task_id']} {s['agent']} · new ZED:{block['kind']} while still working\n{record_block(conn, s, block)}"
 
 
@@ -1740,6 +1798,11 @@ def cmd_watch(args):
                 key = s["id"]
                 for line in health_events(conn, s, a, state, alerts):
                     events.append(line)
+                for block in status_blocks(new_status_lines(s, alerts)):
+                    alerts[s["id"]]["nudges"] = 0
+                    alerts[s["id"]].pop("lapse", None)
+                    events.append(f"S{s['id']} T{s['task_id']} {s['agent']} · status file: ZED:{block['kind']}\n"
+                                  + record_block(conn, s, block))
                 snapshot = {"state": state, "sequence": a.get("state_change_seq") if a else None}
                 if prev.get(key) != snapshot:
                     line = None

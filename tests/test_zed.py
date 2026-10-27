@@ -626,6 +626,49 @@ class ZedTests(unittest.TestCase):
         self.assertIn("new ZED:BLOCKED while still working", self.output.getvalue())
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0], 1)
 
+    def test_status_file_is_read_in_any_state_and_not_reported_twice(self):
+        conn = self.session()
+        conn.execute("UPDATE sessions SET created_at=?", (self.z.now(),))
+        conn.commit()
+        s = conn.execute("SELECT * FROM sessions").fetchone()
+        self.z.STATUS_DIR.mkdir(parents=True)
+        path = self.z.STATUS_DIR / "S1.log"
+        path.write_text("needs-decision: Which greeting?\nneeds-decision: Which colour?\ndone: half writ")
+        alerts = {}
+        lines = self.z.new_status_lines(s, alerts)
+        self.assertEqual(lines, ["needs-decision: Which greeting?", "needs-decision: Which colour?"])  # no newline yet
+        blocks = self.z.status_blocks(lines)
+        self.assertEqual((blocks[0]["kind"], blocks[0]["items"]), ("QUESTION", ["Which greeting?", "Which colour?"]))
+        self.z.record_block(conn, s, blocks[0])
+        path.write_text(path.read_text() + "ten\nblocked: Need a login\n")
+        more = self.z.status_blocks(self.z.new_status_lines(s, alerts))
+        self.assertEqual([b["kind"] for b in more], ["DONE", "BLOCKED"])
+        self.assertEqual(self.z.new_status_lines(s, alerts), [])
+        done = self.z.status_blocks(["done: Added label; pr=https://github.com/o/r/pull/3; qa=playwright, happy path"])[0]
+        self.assertEqual(done["fields"], {"Summary": "Added label", "PR": "https://github.com/o/r/pull/3",
+                                          "QA": "playwright, happy path"})
+        # the same question later printed as a ZED block is already known: no second event
+        self.assertTrue(self.z.block_known(conn, s, self.z.parse_block("ZED:QUESTION\n1. Which greeting?")))
+        conn.commit()
+        self._conn = conn
+        line, _ = self.settle("ZED:QUESTION\n1. Which greeting?", {})
+        self.assertIsNone(line)
+
+    def test_watch_reports_status_file_lines_while_working(self):
+        conn = self.session()
+        conn.execute("UPDATE sessions SET created_at=?", (self.z.now(),))
+        conn.commit()
+        self.z.STATUS_DIR.mkdir(parents=True)
+        (self.z.STATUS_DIR / "S1.log").write_text("needs-decision: Which greeting?\n")
+        agent = {"agent_status": "working", "state_change_seq": 3}
+        with patch.object(self.z, "require_lock"), patch.object(self.z, "holds_lock", return_value=True), \
+                patch.object(self.z, "claim_watcher", return_value=True), \
+                patch.object(self.z, "live_agents", return_value={"qa:p1": agent}), \
+                patch.object(self.z, "read_screen", return_value="busy"):
+            self.z.cmd_watch(["--once", "0.01"])
+        self.assertIn("status file: ZED:QUESTION", self.output.getvalue())
+        self.assertIn("Q1: Which greeting?", self.output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
