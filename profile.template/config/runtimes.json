@@ -6,7 +6,8 @@
   "runtimes": {
     "claude": {
       "enabled": true,
-      "max_running": 3
+      "max_running": 3,
+      "context_refresh_tokens": 150000
     },
     "copilot": {
       "enabled": true,

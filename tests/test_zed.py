@@ -832,6 +832,48 @@ class ZedTests(unittest.TestCase):
         self.assertIn("was closed", self.output.getvalue())
         self.assertFalse(self.z.has_tracked_work())
 
+    def test_context_size_is_the_last_main_thread_turn_and_flags_once(self):
+        home = self.root / "home"
+        wt = self.root / "wt"
+        sid = "abc"
+        f = home / ".claude" / "projects" / self.z.re.sub(r"[^A-Za-z0-9]", "-", str(wt)) / f"{sid}.jsonl"
+        f.parent.mkdir(parents=True)
+        turn = lambda i, c, side=False: json.dumps({"isSidechain": side, "message": {"id": i, "usage": {
+            "input_tokens": 10, "cache_read_input_tokens": c, "cache_creation_input_tokens": 5, "output_tokens": 1}}})
+        f.write_text("\n".join([turn("1", 1000), turn("2", 200_000), turn("3", 999_999, side=True), "not json"]) + "\n")
+        with patch.object(self.z.Path, "home", return_value=home):
+            self.assertEqual(self.z.claude_context(str(wt), sid), 200_015)  # not the sub-agent's turn
+            conn = self.session()
+            s = {"id": 1, "runtime": "claude", "worktree": str(wt), "claude_session_id": sid}
+            alerts = {}
+            with patch.object(self.z, "CONTEXT_CHECK_SECONDS", 0):
+                self.assertEqual(self.z.context_check(s, None, alerts), 200_015)
+                self.assertIsNone(self.z.context_check(s, None, alerts))  # flagged once
+            self.assertIn("restart it fresh", self.z.context_note(s, alerts))
+            self.config({"order": ["claude"], "runtimes": {"claude": {"context_refresh_tokens": 300_000}}})
+            self.assertIsNone(self.z.context_check(s, None, {}))
+            self.assertIsNone(self.z.context_check({**s, "runtime": "copilot"}, None, {}))
+
+    def test_flagged_worker_restarts_only_when_idle_with_nothing_pending(self):
+        conn = self.session()
+        conn.execute("UPDATE sessions SET status='running'")
+        conn.commit()
+        self._conn = conn
+        s = conn.execute("SELECT * FROM sessions").fetchone()
+        alerts = {1: {"refresh": 180_000}}
+        with patch.object(self.z, "cmd_handoff", return_value=7) as handoff, patch.object(self.z, "read_screen", return_value="done thinking"):
+            conn.execute("INSERT INTO questions(task_id,session_id,question,asked_at) VALUES (1,1,'q','now')")
+            self.assertIsNone(self.z.settle_turn(conn, s, "x", alerts, "L", 5))  # a question is pending: wait
+            handoff.assert_not_called()
+            conn.execute("UPDATE questions SET status='answered'")
+            line = self.z.settle_turn(conn, s, "x", alerts, "L", 5)
+            handoff.assert_called_once_with(["1", "restart"])
+        self.assertIn("restarted fresh as S7", line)
+        self.assertIn("180k", line)
+        with patch.object(self.z, "cmd_handoff", side_effect=SystemExit(1)):
+            alerts = {1: {"refresh": 180_000}}
+            self.assertIn("restart FAILED", self.z.settle_turn(conn, s, "x", alerts, "L", 5))
+
 
 if __name__ == "__main__":
     unittest.main()
