@@ -768,6 +768,21 @@ class ZedTests(unittest.TestCase):
         with patch.object(self.z, "pr_snapshot", return_value=None):
             self.assertIn("PR state unknown", "\n".join(self.z.landed_blockers(conn, s())))
 
+    def test_unpushed_count_ignores_an_upstream_that_is_the_base_branch(self):
+        conn = self.session()
+        work, env = self.git_worktree()
+        conn.execute("UPDATE sessions SET worktree=?", (str(work),))
+        conn.commit()
+        subprocess.run(["git", "-C", str(work), "branch", "-u", "origin/feature/qa"], check=True, env=env)
+        s = conn.execute("SELECT * FROM sessions").fetchone()
+        self.assertEqual(self.z.landed_blockers(conn, s), [])
+        subprocess.run(["git", "-C", str(work), "checkout", "-qb", "feature/unpushed"], check=True, env=env)
+        (work / "n.txt").write_text("n")
+        subprocess.run(["git", "-C", str(work), "add", "."], check=True, env=env)
+        subprocess.run(["git", "-C", str(work), "commit", "-qm", "n"], check=True, env=env)
+        subprocess.run(["git", "-C", str(work), "branch", "-u", "origin/feature/qa"], check=True, env=env)  # upstream = another branch
+        self.assertIn("1 commit(s) not pushed", "\n".join(self.z.landed_blockers(conn, s)))
+
     def test_close_refuses_unlanded_worktree_but_keep_worktree_closes_the_session(self):
         conn = self.session()
         work, _ = self.git_worktree()

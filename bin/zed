@@ -1281,6 +1281,11 @@ def cmd_spawn(args, worktree=None):
     missing = [h for h in ("## Plan", "## Definition of done") if h not in brief.read_text()]
     if missing:
         die(f"brief {brief.name} lacks {', '.join(missing)} (templates/brief.md); no worker starts without a plan")
+    host = run([sys.executable, str(ZED_HOME / "bin" / "zed-hostload"), "check"], check=False)
+    if host.returncode == 2:
+        die(f"host is overloaded, not spawning (zed-hostload):\n{host.stdout.strip()}")
+    if host.returncode == 1:
+        print(f"zed: warning: host is under load (zed-hostload): {host.stdout.strip().splitlines()[0]}", file=sys.stderr)
     runtime = choose_runtime(kv.get("runtime", "auto"))
     if runtime == "claude" and (warning := quota_warning()):
         print(f"zed: warning: {warning}", file=sys.stderr)
@@ -1327,6 +1332,10 @@ def cmd_spawn(args, worktree=None):
         actual = run(["git", "-C", str(worktree), "branch", "--show-current"]).stdout.strip()
         if actual != kv["branch"]:
             die(f"worktree {worktree} is on '{actual}', not '{kv['branch']}'; left untouched")
+        guard = run([sys.executable, str(ZED_HOME / "bin" / "zed-guard"), "install", str(worktree), "--repo", kv["repo"],
+                     "--base", kv["base"], *(["--jira", t["jira"]] if t["jira"] else ["--no-commit-format"])], check=False)
+        if guard.returncode and "already pointing" not in guard.stderr:  # a reused worktree keeps its guard
+            die(f"could not install the git guard in {worktree}; no worker started:\n{guard.stderr.strip() or guard.stdout.strip()}")
 
     # 2. herdr workspace + agent CLI
     require_lock()
@@ -1459,11 +1468,10 @@ def landed_blockers(conn, s, git_checks=True):
         dirty = run(["git", "-C", str(wt), "status", "--porcelain"], check=False).stdout.strip().splitlines()
         if dirty:
             out.append(f"{len(dirty)} uncommitted file(s): " + ", ".join(l[3:] for l in dirty[:5]) + (" …" if len(dirty) > 5 else ""))
-        ahead = run(["git", "-C", str(wt), "log", "--oneline", "@{u}..HEAD"], check=False)
-        if ahead.returncode:
-            out.append(f"branch {s['branch']} has no upstream: nothing was pushed")
-        elif ahead.stdout.strip():
-            out.append(f"{len(ahead.stdout.splitlines())} commit(s) not pushed")
+        # Commits no remote has: `@{u}..HEAD` is wrong when the upstream is the base branch (or none is set).
+        ahead = run(["git", "-C", str(wt), "rev-list", "HEAD", "--not", "--remotes"], check=False).stdout.split()
+        if ahead:
+            out.append(f"{len(ahead)} commit(s) not pushed")
     if s["pr_url"]:
         snap = pr_snapshot(s["pr_url"])
         if snap is None:
@@ -2393,6 +2401,15 @@ def cmd_status(args):
     print(text)
 
 
+def script_findings(label, script, *args, limit=6):
+    """Run a bin/zed-* check for `start`: exit 0 or a failure = nothing to show; exit 1 = its lines are the findings."""
+    r = run([sys.executable, str(ZED_HOME / "bin" / script), *args], check=False)
+    lines = [l for l in r.stdout.splitlines() if l.strip()]
+    if r.returncode != 1 or not lines:
+        return []
+    return [f"{label}:", *(f"  {l[:200]}" for l in lines[:limit]), *([f"  … {len(lines) - limit} more (bin/{script})"] if len(lines) > limit else [])]
+
+
 def cmd_start(args):
     """start [--take-over] — session start in one command: claim the Zed lock, then print one bounded
     digest (lock, runtimes, watcher, what needs the user, running sessions). Read it once and trust it."""
@@ -2419,6 +2436,11 @@ def cmd_start(args):
     if quota_settings().get("threshold_tokens"):
         out.append(quota_warning() or "quota: under the configured threshold (`bin/zed quota` for detail)")
     out += notes + render_brief(conn)
+    if holds_lock():  # read-only sessions only report what the DB says
+        out += script_findings("reality differs from the DB (zed-crew)", "zed-crew", "reconcile")
+        out += script_findings("git guard (zed-guard)", "zed-guard", "audit")
+        out += script_findings("core updates waiting (zed-update; `bin/zed-update apply` merges)", "zed-update", "check", "--no-fetch")
+        out += script_findings("housekeeping (zed-hygiene)", "zed-hygiene", "report")
     pending = [f"  [E{e['id']}] {e['ts']} {e['text'].splitlines()[0][:160]}" for e in queue_pending()]
     if pending:
         out += ["Un-acked wake events (handle, then `bin/zed ack E<id>…`):", *capped(pending)]
