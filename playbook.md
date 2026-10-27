@@ -28,6 +28,32 @@ Facts about a particular user or their work never go here (they go to the profil
   in-flight API calls may fail — after a wake, run `check-workers` and nudge any worker that
   stopped on an error. To survive lid-close, the Mac must be on power with an external display
   (clamshell) — don't change system power settings without the user's OK.
+- **Quota limits are runtime/account-specific; connectors must follow runtime handoffs.**
+  Workers sharing an account draw on that account's limit, not every available runtime's quota.
+  **Why:** a model-client limit does not establish that an independent runtime or MCP service is
+  unavailable. **How:** use the available approved runtime and verify its own MCP configuration
+  and authenticated tools. Resolve missing supported connector setup instead of waiting for the
+  other runtime's reset; surface the exact OAuth/consent step if needed. Never transfer credentials
+  between clients or bypass authentication. Stop the old writer before resuming its replacement.
+- **Tool-call shells are not persistent coordinator identities.** **Why:** a terminal tool may
+  start a fresh shell for each call; a lock owned by that shell becomes stale when it exits.
+  **How:** `bin/zed` takes the identity from the runtime's persistent session (Claude Code:
+  `CLAUDE_CODE_SESSION_ID` / `CLAUDE_PID`; Copilot CLI: `COPILOT_AGENT_SESSION_ID` /
+  `COPILOT_LOADER_PID`), so no manual override is needed; don't set `CLAUDE_PID` by hand under
+  Copilot. Verify ownership again from a separate tool call (`bin/zed lock status`).
+- **A one-shot watcher event is work to handle, not monitoring left running.** **Why:** the
+  watcher exits after delivering a checkpoint; replying to another message without processing
+  it and re-arming leaves workers silently paused. **How:** inspect every affected worker,
+  resolve already-authorized routine requests or surface the exact decision needed, verify the
+  resulting state, then re-arm exactly one watcher while tracked work remains. Check that it
+  is waiting, not merely that it printed a startup line before exiting with another event.
+  Keep health polling inside the background process. Scheduled chat prompts are visible turns
+  in the user's conversation, not a silent watchdog; do not substitute them without explicit
+  consent. Monitoring must stop when the coordinator loses the role or tracked work ends.
+- **Use native usage reports for Copilot AI-credit totals.** **Why:** raw session telemetry
+  (`total_nano_aiu`) is not interchangeable with the CLI's displayed AI Credits. **How:** capture
+  the completed session's `/usage`, record that total and its provenance, and label any interim
+  telemetry separately instead of converting it into a claimed billed-credit figure.
 - **Usage limits are shared per runtime.** Zed and every worker (and their sub-agents) on the same
   runtime draw on the same plan: all Claude sessions share the claude.ai plan limit, all Copilot
   sessions share the Copilot plan's AI credits. Hitting a limit pauses everything on that runtime
@@ -68,31 +94,6 @@ Facts about a particular user or their work never go here (they go to the profil
   coordinator lock and watcher duties, even in a throwaway profile. **How:** launch a separate,
   explicitly scoped coordinator fixture with its own instructions and the throwaway profile.
   Before any UI action, re-read the agent's current state and screen; never answer a stale dialog.
-- **Quota limits are runtime/account-specific; connectors must follow runtime handoffs.**
-  Workers sharing an account draw on that account's limit, not every available runtime's quota.
-  **Why:** a model-client limit does not establish that an independent runtime or MCP service is
-  unavailable. **How:** use the available approved runtime and verify its own MCP configuration
-  and authenticated tools. Resolve missing supported connector setup instead of waiting for the
-  other runtime's reset; surface the exact OAuth/consent step if needed. Never transfer credentials
-  between clients or bypass authentication. Stop the old writer before resuming its replacement.
-- **Tool-call shells are not persistent coordinator identities.** **Why:** a terminal tool may
-  start a fresh shell for each call; a lock owned by that shell becomes stale when it exits.
-  **How:** use the runtime's persistent session identity. With `bin/zed`'s legacy PID fallback,
-  set `CLAUDE_PID` to the verified long-lived CLI process for every lock-protected command and
-  watcher. Verify ownership again from a separate tool call.
-- **A one-shot watcher event is work to handle, not monitoring left running.** **Why:** the
-  watcher exits after delivering a checkpoint; replying to another message without processing
-  it and re-arming leaves workers silently paused. **How:** inspect every affected worker,
-  resolve already-authorized routine requests or surface the exact decision needed, verify the
-  resulting state, then re-arm exactly one watcher while tracked work remains. Check that it
-  is waiting, not merely that it printed a startup line before exiting with another event.
-  Keep health polling inside the background process. Scheduled chat prompts are visible turns
-  in the user's conversation, not a silent watchdog; do not substitute them without explicit
-  consent. Monitoring must stop when the coordinator loses the role or tracked work ends.
-- **Use native usage reports for Copilot AI-credit totals.** **Why:** raw session telemetry
-  (`total_nano_aiu`) is not interchangeable with the CLI's displayed AI Credits. **How:** capture
-  the completed session's `/usage`, record that total and its provenance, and label any interim
-  telemetry separately instead of converting it into a claimed billed-credit figure.
 - **A worker's permission prompts can queue, and the watcher reports a block only once.** **Why:**
   after I approved one prompt, more followed (6 queued), `watch --once` stayed silent because the
   session was already reported as blocked, and the worker idled unnoticed. **How:** after every

@@ -2243,6 +2243,7 @@ def cmd_watch(args):
                         events.append(text)
             for s in open_prs:
                 events.extend(pr_events(conn, s, alerts))
+            events += delivery_events(alerts)
             first = False
             conn.commit()
             conn.close()
@@ -2373,7 +2374,7 @@ def health_events(conn, s, a, state, alerts):
         if u:
             step = u["output"] // USAGE_ALERT_OUTPUT
             if step > seen.setdefault("usage_step", 0):
-                done = sum(len(re.findall(r"^\s*- \[[xX]\]", p.read_text(), re.M)) for p in plan_files(s["task_id"]))
+                done = sum(plan_progress(p)[0] for p in plan_files(s["task_id"]))
                 since = seen.get("usage_at", 0)
                 wrote = output_files_since(s["worktree"], since)
                 if done <= seen.get("usage_plan_done", -1) and not wrote:  # tokens spent, nothing produced: needs judgment
