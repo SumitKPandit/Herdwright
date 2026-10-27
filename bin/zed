@@ -1474,6 +1474,17 @@ def pr_snapshot(url):
     return None
 
 
+def main_checkout_heads(repo, worktree):
+    """The branch checked out in the repo's own folder, as a list for `rev-list --not`: work merged into it survives
+    removing the worktree. Empty when the repo is unknown, has no folder, or its HEAD is detached."""
+    path = (projects()["repos"].get(repo) or {}).get("path") if PROJECTS_PATH.exists() else None
+    main = expand(path) if path else None
+    if not main or not main.is_dir() or main.resolve() == Path(worktree).resolve():
+        return []
+    ref = run(["git", "-C", str(main), "symbolic-ref", "-q", "HEAD"], check=False).stdout.strip()
+    return [ref] if ref else []
+
+
 def landed_blockers(conn, s, git_checks=True):
     """Why a session's work isn't landed yet, as a list of exact reasons (empty = safe to close): uncommitted or
     unpushed work, a PR that is still open, a plan with steps left, open questions."""
@@ -1483,7 +1494,9 @@ def landed_blockers(conn, s, git_checks=True):
         if dirty:
             out.append(f"{len(dirty)} uncommitted file(s): " + ", ".join(l[3:] for l in dirty[:5]) + (" …" if len(dirty) > 5 else ""))
         # Commits no remote has: `@{u}..HEAD` is wrong when the upstream is the base branch (or none is set).
-        ahead = run(["git", "-C", str(wt), "rev-list", "HEAD", "--not", "--remotes"], check=False).stdout.split()
+        # Commits already in the main checkout's branch (e.g. merged into a local-only profile branch) are kept safe.
+        ahead = run(["git", "-C", str(wt), "rev-list", "HEAD", "--not", "--remotes", *main_checkout_heads(s["repo"], wt)],
+                    check=False).stdout.split()
         if ahead:
             out.append(f"{len(ahead)} commit(s) not pushed")
     if s["pr_url"]:

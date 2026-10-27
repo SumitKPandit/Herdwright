@@ -795,6 +795,26 @@ class ZedTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(work), "branch", "-u", "origin/feature/qa"], check=True, env=env)  # upstream = another branch
         self.assertIn("1 commit(s) not pushed", "\n".join(self.z.landed_blockers(conn, s)))
 
+    def test_work_merged_into_the_main_checkouts_branch_is_not_unpushed(self):
+        conn = self.session()
+        main, env = self.git_worktree()  # the repo's own folder, on a branch with an upstream
+        wt = self.root / "wt"
+        git = lambda path, *a: subprocess.run(["git", "-C", str(path), *a], check=True, env=env, capture_output=True)
+        git(main, "worktree", "add", "-q", "-b", "feature/done", str(wt))
+        (wt / "n.txt").write_text("n")
+        git(wt, "add", ".")
+        git(wt, "commit", "-qm", "n")
+        conn.execute("UPDATE sessions SET worktree=?", (str(wt),))
+        conn.commit()
+        s = conn.execute("SELECT * FROM sessions").fetchone()
+        (self.root / "config").mkdir(exist_ok=True)
+        (self.root / "config" / "projects.json").write_text(json.dumps({"repos": {"scratch": {"path": str(main)}}}))
+        self.assertEqual(self.z.main_checkout_heads("scratch", wt), ["refs/heads/feature/qa"])
+        self.assertIn("1 commit(s) not pushed", "\n".join(self.z.landed_blockers(conn, s)))
+        git(main, "merge", "-q", "feature/done")  # merged into the local-only branch: nothing is lost by removing wt
+        self.assertEqual(self.z.landed_blockers(conn, s), [])
+        self.assertEqual(self.z.main_checkout_heads("unknown", wt), [])
+
     def test_close_refuses_unlanded_worktree_but_keep_worktree_closes_the_session(self):
         conn = self.session()
         work, _ = self.git_worktree()
