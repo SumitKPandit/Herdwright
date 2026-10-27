@@ -38,7 +38,8 @@ REDIRECTS = {">", ">>", ">|"}
 
 
 def allowed_roots(zed_home=None, profile=None):
-    roots = [zed_home or zedlib.ZED_HOME, profile or zedlib.PROFILE_DIR, Path(tempfile.gettempdir()), Path("/tmp"), Path("/private/tmp")]
+    roots = [zed_home or zedlib.ZED_HOME, profile or zedlib.PROFILE_DIR, Path(tempfile.gettempdir()), Path("/tmp"), Path("/private/tmp"),
+             Path("/dev/null"), Path("/dev/stdout"), Path("/dev/stderr")]  # discarding output is not a write
     return [Path(os.path.realpath(r)) for r in roots]
 
 
