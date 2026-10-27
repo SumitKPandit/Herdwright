@@ -723,6 +723,77 @@ class ZedTests(unittest.TestCase):
             self.z.cmd_doctor(["--quiet"])
         self.assertEqual(e.exception.code, 0)
 
+    def git_worktree(self):
+        """A throwaway clone with an upstream, clean and pushed."""
+        remote, work = self.root / "remote.git", self.root / "work"
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        for cmd in (["git", "init", "-q", "--bare", str(remote)], ["git", "init", "-q", "-b", "feature/qa", str(work)]):
+            subprocess.run(cmd, check=True, env=env)
+        (work / "a.txt").write_text("a")
+        for cmd in (["add", "."], ["commit", "-qm", "a"], ["remote", "add", "origin", str(remote)], ["push", "-qu", "origin", "feature/qa"]):
+            subprocess.run(["git", "-C", str(work), *cmd], check=True, env=env)
+        return work, env
+
+    def test_landed_work_test_lists_exactly_what_blocks_closing(self):
+        conn = self.session()
+        work, env = self.git_worktree()
+        conn.execute("UPDATE sessions SET worktree=?", (str(work),))
+        conn.commit()
+        s = lambda: conn.execute("SELECT * FROM sessions").fetchone()
+        self.assertEqual(self.z.landed_blockers(conn, s()), [])
+        (work / "b.txt").write_text("b")
+        (work / "a.txt").write_text("changed")
+        subprocess.run(["git", "-C", str(work), "commit", "-qam", "local"], check=True, env=env)
+        (work / "c.txt").write_text("c")
+        conn.execute("UPDATE sessions SET pr_url='https://github.com/o/r/pull/1'")
+        conn.execute("INSERT INTO questions(task_id,session_id,question,asked_at) VALUES (1,1,'q','now')")
+        (self.root / "briefs").mkdir(exist_ok=True)
+        (self.root / "briefs" / "T1-scratch-plan.md").write_text("- [x] a\n- [ ] b\n")
+        with patch.object(self.z, "pr_snapshot", return_value={"state": "open", "reviews": 0, "checks": None}):
+            blockers = self.z.landed_blockers(conn, s())
+        text = "\n".join(blockers)
+        for part in ("2 uncommitted file(s): b.txt, c.txt", "1 commit(s) not pushed", "PR still open", "plan has 1 of 2 steps left",
+                     "1 open question(s)"):
+            self.assertIn(part, text)
+        with patch.object(self.z, "pr_snapshot", return_value={"state": "merged", "reviews": 0, "checks": None}):
+            self.assertNotIn("PR still open", "\n".join(self.z.landed_blockers(conn, s())))
+        with patch.object(self.z, "pr_snapshot", return_value=None):
+            self.assertIn("PR state unknown", "\n".join(self.z.landed_blockers(conn, s())))
+
+    def test_close_refuses_unlanded_worktree_but_keep_worktree_closes_the_session(self):
+        conn = self.session()
+        work, _ = self.git_worktree()
+        (work / "dirty.txt").write_text("x")
+        conn.execute("UPDATE sessions SET worktree=?", (str(work),))
+        conn.commit()
+        conn.close()
+        with patch.object(self.z, "require_lock"), patch.object(self.z, "project", return_value={}), \
+                patch.object(self.z, "close_workspace") as close_ws:
+            with self.assertRaises(SystemExit):
+                self.z.cmd_close(["1"])
+            self.assertIn("not landed", self.output.getvalue())
+            self.assertIn("dirty.txt", self.output.getvalue())
+            close_ws.assert_not_called()
+            self.z.cmd_close(["1", "keep-worktree"])
+        self.assertIn("note: S1 is not landed yet", self.output.getvalue())
+        close_ws.assert_called_once()
+        self.assertTrue(work.exists())
+
+    def test_pr_snapshot_for_github_and_bitbucket(self):
+        gh = json.dumps({"state": "OPEN", "reviews": [{}], "comments": [{}, {}],
+                         "statusCheckRollup": [{"conclusion": "SUCCESS"}, {"conclusion": "FAILURE"}]})
+        with patch.object(self.z, "run", return_value=subprocess.CompletedProcess([], 0, gh, "")):
+            self.assertEqual(self.z.pr_snapshot("https://github.com/o/r/pull/1"),
+                             {"state": "open", "reviews": 3, "checks": "failing"})
+        bb = json.dumps({"state": "MERGED", "comment_count": 2, "approvals": 1, "build_failed": False})
+        with patch.object(self.z, "run", return_value=subprocess.CompletedProcess([], 0, bb, "")) as run:
+            self.assertEqual(self.z.pr_snapshot("https://bitbucket.org/ws/repo/pull-requests/7"),
+                             {"state": "merged", "reviews": 3, "checks": None})
+            self.assertEqual(run.call_args.args[0][-4:], ["view", "7", "--repo", "ws/repo"])
+        with patch.object(self.z, "run", return_value=subprocess.CompletedProcess([], 1, "", "no")):
+            self.assertIsNone(self.z.pr_snapshot("https://github.com/o/r/pull/1"))
+        self.assertIsNone(self.z.pr_snapshot("https://example.com/x"))
+
 
 if __name__ == "__main__":
     unittest.main()

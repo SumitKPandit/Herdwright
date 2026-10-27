@@ -1349,6 +1349,77 @@ def close_workspace(ws_id):
         die(f"could not close herdr workspace {ws_id}:\n{r.stdout}{r.stderr}")
 
 
+def pr_snapshot(url):
+    """State of a PR as {"state": open|merged|closed, "reviews": n (reviews + comments), "checks": failing|passing|pending|None},
+    or None if it can't be read. GitHub through `gh`, Bitbucket through bin/bb; no model tokens."""
+    try:
+        if "github.com" in url:
+            r = run(["gh", "pr", "view", url, "--json", "state,reviews,comments,statusCheckRollup"], check=False)
+            if r.returncode:
+                return None
+            d = json.loads(r.stdout)
+            rollup = d.get("statusCheckRollup") or []
+            results = [(c.get("conclusion") or c.get("state") or "").upper() for c in rollup]
+            checks = (None if not results else
+                      "failing" if any(x in ("FAILURE", "TIMED_OUT", "CANCELLED", "ERROR", "STARTUP_FAILURE") for x in results) else
+                      "pending" if any(x in ("", "PENDING", "IN_PROGRESS", "QUEUED", "EXPECTED") for x in results) else "passing")
+            return {"state": d["state"].lower(), "reviews": len(d.get("reviews") or []) + len(d.get("comments") or []),
+                    "checks": checks}
+        m = re.match(r"https://bitbucket\.org/([^/]+/[^/]+)/pull-requests/(\d+)", url)
+        if m:
+            r = run([str(ZED_HOME / "bin" / "bb"), "pr", "view", m.group(2), "--repo", m.group(1)], check=False)
+            if r.returncode:
+                return None
+            d = json.loads(r.stdout)
+            state = {"OPEN": "open", "MERGED": "merged"}.get(d.get("state"), "closed")
+            return {"state": state, "reviews": (d.get("comment_count") or 0) + (d.get("approvals") or 0),
+                    "checks": "failing" if d.get("build_failed") else None}
+    except (ValueError, KeyError, OSError):
+        pass
+    return None
+
+
+def landed_blockers(conn, s, git_checks=True):
+    """Why a session's work isn't landed yet, as a list of exact reasons (empty = safe to close): uncommitted or
+    unpushed work, a PR that is still open, a plan with steps left, open questions."""
+    out, wt = [], Path(s["worktree"])
+    if git_checks and wt.exists():
+        dirty = run(["git", "-C", str(wt), "status", "--porcelain"], check=False).stdout.strip().splitlines()
+        if dirty:
+            out.append(f"{len(dirty)} uncommitted file(s): " + ", ".join(l[3:] for l in dirty[:5]) + (" …" if len(dirty) > 5 else ""))
+        ahead = run(["git", "-C", str(wt), "log", "--oneline", "@{u}..HEAD"], check=False)
+        if ahead.returncode:
+            out.append(f"branch {s['branch']} has no upstream: nothing was pushed")
+        elif ahead.stdout.strip():
+            out.append(f"{len(ahead.stdout.splitlines())} commit(s) not pushed")
+    if s["pr_url"]:
+        snap = pr_snapshot(s["pr_url"])
+        if snap is None:
+            out.append(f"PR state unknown (could not read {s['pr_url']})")
+        elif snap["state"] == "open":
+            out.append(f"PR still open: {s['pr_url']} (needs to be merged or closed)")
+    done, total = task_plan_progress(s["task_id"])
+    if done < total:
+        out.append(f"plan has {total - done} of {total} steps left")
+    open_q = conn.execute("SELECT COUNT(*) FROM questions WHERE session_id=? AND status='open'", (s["id"],)).fetchone()[0]
+    if open_q:
+        out.append(f"{open_q} open question(s) for the user")
+    return out
+
+
+def cmd_landed(args):
+    """landed <S|agent> — the landed-work test `close` applies, without closing. Exit 1 and the reasons if not landed."""
+    if not args:
+        die("landed <S|agent>")
+    conn = db()
+    s = resolve_session(conn, args[0][1:] if args[0].startswith("S") and args[0][1:].isdigit() else args[0])
+    blockers = landed_blockers(conn, s, git_checks=project(s["repo"]).get("worktrees") is not False and not s["external"])
+    if blockers:
+        print(f"S{s['id']} is not landed:\n" + "\n".join(f"  - {b}" for b in blockers))
+        sys.exit(1)
+    print(f"S{s['id']} is landed: pushed, nothing uncommitted, PR merged/closed or none, plan complete, no open questions")
+
+
 def cmd_close(args):
     """close <S|agent> [keep-worktree] — stop the worker, close its herdr workspace, remove the worktree."""
     if not args:
@@ -1369,12 +1440,13 @@ def cmd_close(args):
     in_place = project(s["repo"]).get("worktrees") is False
     if in_place:
         args = [*args, "keep-worktree"]  # the project folder itself; never remove it
-    if "keep-worktree" not in args and wt.exists():
-        dirty = run(["git", "-C", str(wt), "status", "--porcelain"], check=False).stdout.strip()
-        unpushed = run(["git", "-C", str(wt), "log", "--oneline", "@{u}..HEAD"], check=False)
-        if (dirty or unpushed.returncode != 0 or unpushed.stdout.strip()) and "force" not in args:
-            die(f"S{s['id']} worktree has uncommitted or unpushed work:\n{dirty}\n{unpushed.stdout}{unpushed.stderr}\n"
-                "Resolve it first, or pass 'keep-worktree' / 'force'.")
+    blockers = landed_blockers(conn, s, git_checks=not in_place and wt.exists())
+    if blockers and "force" not in args:
+        report = "\n".join(f"  - {b}" for b in blockers)
+        if "keep-worktree" not in args:
+            die(f"S{s['id']} is not landed, so its worktree stays:\n{report}\n"
+                "Resolve these, or pass 'keep-worktree' (close the session only) / 'force'.")
+        print(f"note: S{s['id']} is not landed yet (worktree kept):\n{report}")
     record_credits(conn, s)
     record_spend(conn, s)
     if s["workspace_id"]:
@@ -2247,7 +2319,10 @@ def cmd_help(args):
                                      kind (default: the task's worktype) picks the effort by model_policy.effort_by_kind;
                                      beyond runtimes.<rt>.max_running the task is queued (exit 75)
   session list | session set <S|agent> key=value... (status pr_url claude_session_id pane_id workspace_id base brief)
-  close <S|agent> [keep-worktree] [force]   (external sessions are only untracked)
+  close <S|agent> [keep-worktree] [force]   (external sessions are only untracked; the landed-work test below
+                                     must pass before the worktree is removed)
+  landed <S|agent>                   landed-work test: pushed, nothing uncommitted, PR merged/closed, plan
+                                     complete, no open questions; prints exactly what blocks closing
   adopt <pane-id> <T> [repo=]        track a session Zed didn't start (user's own)
   handoff <S|agent> [runtime=] [brief=] [model=] [effort=] [restart]
                                      move a stopped worker to another runtime, same worktree
@@ -2281,7 +2356,7 @@ Session states: """ + ", ".join(SESSION_STATES))
 
 COMMANDS = {"task": cmd_task, "log": cmd_log, "q": cmd_q, "spawn": cmd_spawn, "session": cmd_session,
             "close": cmd_close, "adopt": cmd_adopt, "handoff": cmd_handoff, "watch": cmd_watch, "status": cmd_status,
-            "brief": cmd_brief, "coordinator": cmd_coordinator, "quota": cmd_quota, "doctor": cmd_doctor, "ack": cmd_ack, "hook": cmd_hook, "paths": cmd_paths, "start": cmd_start, "lock": cmd_lock, "runtime": cmd_runtime, "models": cmd_models, "help": cmd_help}
+            "brief": cmd_brief, "coordinator": cmd_coordinator, "quota": cmd_quota, "landed": cmd_landed, "doctor": cmd_doctor, "ack": cmd_ack, "hook": cmd_hook, "paths": cmd_paths, "start": cmd_start, "lock": cmd_lock, "runtime": cmd_runtime, "models": cmd_models, "help": cmd_help}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:

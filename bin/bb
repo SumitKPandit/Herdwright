@@ -185,8 +185,11 @@ def main():
         print(r["links"]["html"]["href"])
     elif a.pr_cmd == "view":
         r = call("GET", f"/repositories/{repo}/pullrequests/{a.id}")
-        print(json.dumps({k: r.get(k) for k in ("id", "title", "state", "draft")}
-                         | {"url": r["links"]["html"]["href"],
+        statuses = call("GET", f"/repositories/{repo}/pullrequests/{a.id}/statuses?pagelen=50").get("values", [])
+        print(json.dumps({k: r.get(k) for k in ("id", "title", "state", "draft", "comment_count")}
+                         | {"approvals": sum(1 for p in r.get("participants", []) if p.get("approved")),
+                            "build_failed": any(x.get("state") == "FAILED" for x in statuses),
+                            "url": r["links"]["html"]["href"],
                             "source": r["source"]["branch"]["name"],
                             "dest": r["destination"]["branch"]["name"]}, indent=2))
     elif a.pr_cmd == "ready":

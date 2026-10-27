@@ -5,14 +5,15 @@ description: Decide whether a worker session/worktree can be closed and close it
 
 # Wrap up
 
-A session can be closed when **all** hold:
-- its work is published (branch pushed and/or PR raised) — `git -C <worktree> status` clean and no unpushed commits;
-- no open questions for it (`bin/zed q list`);
-- nobody is waiting for it to act (e.g. PR review fixes requested → keep it, or respawn later).
+A session can be closed when `bin/zed landed <S>` passes (exit 0). It is the script's landed-work test,
+so don't re-derive it by hand: commits pushed, nothing uncommitted, its PR merged or closed (or no PR),
+the task's plan complete, no open questions. If it fails it prints exactly what blocks closing; tell the
+user, or fix it (e.g. a worker finishes the plan), rather than forcing. Also check that nobody is waiting
+for the worker to act (e.g. PR review fixes requested → keep it, or respawn later).
 
 First harvest the worker's `Learnings:` (from its ZED:DONE) into `profile/knowledge/repos/<repo>.md`
-following the `learn` skill. Then `bin/zed close <S>` (refuses if the worktree has unpushed/uncommitted work; never pass
-`force` without the user's OK). Tell the user it was closed and where to resume from (PR/branch).
+following the `learn` skill. Then `bin/zed close <S>` (runs the same test and refuses to remove a worktree that isn't landed; `keep-worktree`
+closes just the session; never pass `force` without the user's OK). Tell the user it was closed and where to resume from (PR/branch).
 
 Mark the task: `pr_open` while PRs await review/merge; `done` only when the user says it's done
 or the PR is merged (e.g. `gh pr view <url> --json state`). Commit the profile.
