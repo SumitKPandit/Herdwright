@@ -22,7 +22,14 @@ repeat), and marks a runtime limited when a worker hits its usage limit. Each ev
    - `USAGE LIMIT … marked limited` → `switch-runtime` skill (the marking is already done).
    - `PROTOCOL LAPSE again` → read the worker's screen (`herdr agent read <agent> --source recent-unwrapped
      --lines 150`) and decide: re-prompt, ask the user, or treat as gone.
-   - `STALL` / `USAGE without plan progress` / `still blocked` → read the screen and redirect the worker.
+   - `STALL` / `USAGE without plan progress` / `still blocked` → `bin/zed-crew state <S>` (branch, dirty and
+     unpushed counts, diffstat, PR, plan progress) and `bin/zed-plan progress T<id>` (exit 1 = a step ran past
+     twice its estimate); use `bin/zed-crew peek <S>` only if those facts are not enough, then redirect the worker.
+   - a worker's first event, or a plan you haven't checked → `bin/zed-plan lint T<id>`; send a plan with
+     problems back before it goes further.
+   - a PR URL → `bin/zed-pr state <url>` instead of reading the PR by hand. Before accepting a PR as ready
+     for review: `bin/zed-pr ready-check <url>`; send the worker back if it lists problems.
+   - when the DB and reality may disagree → `bin/zed-crew reconcile` (also run by `bin/zed start`).
    - a `blocked` prompt the watcher left to me → read it with `--source visible`. If the user or the
      profile already authorizes this routine, in-scope operation, answer with `herdr agent send-keys`
      (a one-time approval, never a remembered blanket permission) and verify. Otherwise describe exactly

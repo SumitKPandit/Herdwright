@@ -16,7 +16,12 @@ following the `learn` skill. Then `bin/zed close <S>` (runs the same test and re
 closes just the session; never pass `force` without the user's OK). Tell the user it was closed and where to resume from (PR/branch).
 
 Mark the task: `pr_open` while PRs await review/merge; `done` only when the user says it's done
-or the PR is merged (e.g. `gh pr view <url> --json state`). Commit the profile.
+or the PR is merged (`bin/zed-pr state <url>`: verdict `merged`). Commit the profile.
+
+Housekeeping at wrap-up: `bin/zed-hygiene report --fetch` lists orphan/prunable worktrees, merged or
+gone branches and stale clones; tell the user what it finds. `--apply` fast-forwards clones and prunes, so
+run it only with the user's OK, each time. Back up the record with `bin/zed-export export profile/db/backup.json`
+(commit it with the profile).
 
 Closing or untracking a session is not delivery of its task. Check the original acceptance
 criteria and record the actual output: for published documentation, its live URL and verified

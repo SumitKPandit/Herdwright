@@ -80,12 +80,15 @@ Append with `echo 'needs-decision: …' >> <file>`. Do this **before** you print
 Every turn you take resends your whole context, so a wait must cost as few turns as possible.
 - After a `ZED:QUESTION` or `ZED:BLOCKED`, end your turn at once. Don't poll, sleep or "check back".
 - Wait for CI, builds, deploys or a PR check with **one blocking command** that returns when the
-  thing is done: `gh pr checks --watch`, or `until <condition>; do sleep 30; done` (the Bash tool's
-  timeout is at most 600000 ms; for a longer wait, run it again once it returns).
+  thing is done. For a PR's CI use `bin/zed-pr wait <pr-url>` (exit 0 green, 1 failing, 3 still pending
+  at its timeout: run it again). For anything else, `until <condition>; do sleep 30; done` (the Bash
+  tool's timeout is at most 600000 ms; for a longer wait, run it again once it returns).
 - Never `sleep` and then check by hand, and never start something in the background and poll it
   with repeated tool calls.
 
 ## Before every PR
+0. Once the PR is open, `bin/zed-pr ready-check <pr-url>` must pass before you mark it ready
+   (CI green, no conflicts, title format, base branch, reviewers requested).
 
 1. **QA like a tester.** Anything with a UI is checked in a real browser (use the browser tool the
    user's rules name; if none is named or available, ask Zed). Work without a UI is exercised for

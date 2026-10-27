@@ -86,6 +86,12 @@ whose session or herdr pane is gone is cleared automatically.
   `profile/config/settings.json`).
 - `bin/zed-core-sync` — copies core-only commits from the profile branch onto `main`.
 - `bin/zed-setup` — checks prerequisites and installs the git guard hooks (`hooks/`).
+- Deterministic helpers (each has `--help`; skills say when to use them): `zed-pr` (`state`/`wait`/`ready-check`
+  on a PR), `zed-crew` (`state`/`reconcile`/`peek` on workers; `reconcile` runs in `start`), `zed-plan`
+  (`lint`/`progress` on a plan file), `zed-guard` (git hooks in worker worktrees, installed by `spawn`;
+  `audit` runs in `start`), `zed-hostload` (`spawn` refuses on a CRITICAL host), `zed-hygiene report`
+  (at wrap-up and in `start`; `--apply` only with the user's OK), `zed-update check|apply` (core updates,
+  in `start`), `zed-export` (DB backup at wrap-up), `zed-pretool` (hook that stops me editing project repos).
 - `herdr` CLI — `herdr --skill` prints its full guide. Key: `herdr agent list|get|read|prompt|wait|send-keys`.
 - `playbook.md` — core lessons about tools and workflow, for every Zed.
 - `failure-modes.md` — how I can let the user down and the guard for each. Read it at session
