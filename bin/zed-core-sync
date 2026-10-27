@@ -17,9 +17,12 @@ Usage
   bin/zed-core-sync                     show the plan (default; changes nothing)
   bin/zed-core-sync --apply [--push]    cherry-pick onto main [and push main to --remote]
   bin/zed-core-sync --mark [<rev>]      record <rev> (default HEAD) as synced without picking
+  bin/zed-core-sync --check [--json]    list core commits not on main yet; exit 1 when there are any (`zed start`
+                                        shows it, the watcher raises an event after an hour)
   options: --skip <sha> (repeatable), --remote <name> (default origin)
 """
 import argparse
+import json
 import subprocess
 import sys
 import tempfile
@@ -78,6 +81,12 @@ def plan(branch, skips):
     return steps
 
 
+def unsynced(branch):
+    """Core commits made on this branch that are not on main yet: [(sha, subject, commit_epoch)], oldest first."""
+    return [(sha, subject, int(git("log", "-1", "--format=%ct", sha).stdout))
+            for sha, kind, subject, _ in plan(branch, []) if kind == "core"]
+
+
 def main():
     ap = argparse.ArgumentParser(prog="zed-core-sync", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -86,6 +95,8 @@ def main():
     ap.add_argument("--remote", default="origin")
     ap.add_argument("--skip", action="append", default=[])
     ap.add_argument("--mark", nargs="?", const="HEAD")
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
 
     branch = git("branch", "--show-current").stdout.strip()
@@ -100,6 +111,16 @@ def main():
         print(f"marked {sha[:9]} as synced for {branch}")
         return
 
+    if a.check:
+        waiting = unsynced(branch)
+        if a.json:
+            print(json.dumps({"count": len(waiting), "oldest": waiting[0][2] if waiting else None}))
+        else:
+            for sha, subject, _ in waiting:
+                print(f"{sha[:9]} {subject}")
+            if waiting:
+                print("run bin/zed-core-sync, then --apply (and push) as profile.md says")
+        sys.exit(1 if waiting else 0)
     steps = plan(branch, a.skip)
     if not steps:
         print("nothing new since the last sync")

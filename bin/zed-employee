@@ -25,7 +25,7 @@ Usage
       verify, then the deterministic memory pack, written to profile/.cache/employees/<name>/<session>-pack.md
 
   Assignments (what bin/zed spawn employee= hat= starts; `finish` runs inside the employee's session):
-  zed-employee finish [--verdict clean|blockers] [--draft FILE] (--lesson TEXT ... | --none WHY) [--idea TEXT ...]
+  zed-employee finish [--verdict clean|blockers] [--draft FILE] (--lesson TEXT ... | --none WHY) [--idea TEXT ... | --no-idea WHY]
                       [--note TEXT] [--session S] [-e NAME]
       the write-back before ZED:DONE: lessons to the hat's craft file, the work entry from the DB and the plan, the
       verdict on the session (review/qa; `blockers` needs the findings --draft), a log.md line, ideas to ideas.md.
@@ -140,6 +140,8 @@ def cmd_pack(args):
 
 
 def cmd_finish(args):
+    if args.lesson and not args.idea and not args.no_idea:
+        raise emp.EmployeeError(emp.CODE_FIRST_QUESTION)
     print("\n".join(emp.finish(employee_name(args), verdict=args.verdict, lessons=args.lesson, none_reason=args.none,
                                draft=args.draft, ideas=args.idea, note=args.note,
                                session=args.session or os.environ.get("ZED_SESSION"))))
@@ -268,6 +270,7 @@ def build_parser():
     s.add_argument("--lesson", action="append", default=[])
     s.add_argument("--none")
     s.add_argument("--idea", action="append", default=[])
+    s.add_argument("--no-idea", help="why none of the lessons can be a script, hook or check")
     s.add_argument("--note")
     s.add_argument("--session")
     return p

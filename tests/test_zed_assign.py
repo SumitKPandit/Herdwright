@@ -212,8 +212,8 @@ class SpawnWithEmployeeTests(AssignCase):
         edit.write_text(edit.read_text().replace("runtime: auto", "runtime: copilot"))
         with patch.object(self.z, "choose_runtime", return_value="copilot") as choose, \
                 patch.object(self.z, "set_copilot_permissions", return_value=None):
-            self.finish(self.spawn("juno", "build"))
-            self.spawn("quill", "review")
+            self.finish(self.spawn("juno", "build", copilot_reason="test"))
+            self.spawn("quill", "review", copilot_reason="test")
         self.assertEqual([c.args[0] for c in choose.call_args_list], ["auto", "copilot"])
 
     def test_findings_of_earlier_assignments_are_named_in_the_first_prompt(self):

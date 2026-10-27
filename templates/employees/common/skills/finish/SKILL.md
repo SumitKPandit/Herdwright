@@ -11,7 +11,8 @@ verdict, appends your log line, and refuses what is missing:
   `--draft <your findings file>`: whoever fixes starts from it
 - `--lesson "..."` for each thing that would make you better at this hat next time (zero or more), or
   `--none "why nothing new"`
-- `--idea "..."` for each thing you did by hand more than once that a script could do; it becomes a script request
+- `--idea "..."` for each thing you did by hand more than once, or each lesson, that a script, hook or check could do;
+  it becomes a script request. With any `--lesson`, finish needs an `--idea` or `--no-idea "why none of it can be code"`
 - `--note "..."` one line of what was tricky, added to the work entry
 
 It also refuses while a fact of this repo is still listed as stale: `zed-employee refresh <id>` or

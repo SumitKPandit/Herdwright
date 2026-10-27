@@ -35,6 +35,8 @@ class PilotFlow(AssignCase):
 
     def end(self, sid, *argv):
         employee = self.session(sid)["employee"]
+        if "--lesson" in argv and not {"--idea", "--no-idea"} & set(argv):
+            argv += ("--no-idea", "nothing here can be code")
         code, out, err = run("finish", "-e", employee, "--session", f"S{sid}", *argv)
         self.assertEqual(code, 0, err)
         self.say(f"S{sid}: {employee} finishes", *out.splitlines())

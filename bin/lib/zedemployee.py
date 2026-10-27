@@ -8,6 +8,7 @@ import contextlib
 import json
 import re
 import sqlite3
+import subprocess
 import sys
 from datetime import date
 from pathlib import Path
@@ -303,8 +304,19 @@ VERDICT_HATS = ("review", "qa")
 IDEAS_QUESTION = "Did you do anything by hand more than once that a script could do? Add `--idea \"...\"` for each."
 
 
+CODE_FIRST_QUESTION = ("A lesson in prose only repeats the mistake: can any of it be a script, hook or check? "
+                       "Add `--idea \"...\"` for each that can (it goes to ideas.md for Zed to build), "
+                       "or `--no-idea \"why none can\"`.")
+
+
 class FinishRefused(zedmem.MemoryRefused):
     """`finish` refused: the message says what to add before running it again."""
+
+
+def head_sha(worktree):
+    """The commit a verdict is about: HEAD of the session's worktree (None when it is not a git checkout)."""
+    r = subprocess.run(["git", "-C", str(worktree), "rev-parse", "HEAD"], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
 
 
 def open_assignment(conn, name, session=None):
@@ -381,7 +393,7 @@ def finish(name, *, verdict=None, lessons=(), none_reason=None, draft=None, idea
         written = [zedmem.remember(edir, "lesson", text, f"T{tid} S{sid}", hat=hat).id for text in lessons]
         work = zedmem.remember(edir, "work", body, f"T{tid} S{sid}" + (f" {s['pr_url']}" if s["pr_url"] else ""), repo=repo, hat=hat)
         if verdict:
-            conn.execute("UPDATE sessions SET verdict=? WHERE id=?", (verdict, sid))
+            conn.execute("UPDATE sessions SET verdict=?, verdict_sha=? WHERE id=?", (verdict, head_sha(s["worktree"]), sid))
         if draft:
             conn.execute("INSERT INTO events(task_id, ts, kind, text) VALUES (?,?,?,?)",
                          (tid, today, "findings", f"S{sid} {name} {hat} {verdict or 'notes'}: {draft}"))

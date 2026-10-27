@@ -128,7 +128,7 @@ CREATE TABLE IF NOT EXISTS employees (
 );
 """
 # an assignment is a session: who wore which hat, how it ended, and who asked for it
-EMPLOYEE_SESSION_COLUMNS = [("employee", "TEXT"), ("hat", "TEXT"), ("verdict", "TEXT"), ("origin", "TEXT"),
+EMPLOYEE_SESSION_COLUMNS = [("employee", "TEXT"), ("hat", "TEXT"), ("verdict", "TEXT"), ("verdict_sha", "TEXT"), ("origin", "TEXT"),
                             ("direct", "INTEGER NOT NULL DEFAULT 0")]
 
 

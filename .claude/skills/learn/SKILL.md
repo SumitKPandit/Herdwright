@@ -28,6 +28,12 @@ Ask: *would this be true and useful for a Zed serving someone else?*
 - **Both** (e.g. "Bitbucket reviewers must be UUIDs" + this team's UUIDs) → split it: the general
   lesson to core, the specifics to the profile.
 
+## 1b. Can it be code?
+Before writing prose, ask: **can this be a script, hook, check or refusal?** (capability order: hooks, skills,
+agents, MCP). If yes, build it (or, if it is more than a few minutes, record it as a task/idea for an employee) and make
+the lesson a one-line pointer to the code that enforces it, with the file and test. Prose-only is for judgment that
+code cannot decide. Employees answer the same question at `zed-employee finish` (`--idea` or `--no-idea WHY`).
+
 ## 2. Write it well
 1. **One home per fact.** Before writing, look for an existing entry; edit it in place instead of
    adding a contradicting line. Link from elsewhere rather than copying.

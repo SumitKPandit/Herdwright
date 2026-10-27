@@ -16,6 +16,9 @@ Usage
   bb pr view <id> [--repo workspace/slug]
   bb pr list [--state OPEN] [--repo ...]
   bb pr ready <id>                     (clear draft)
+  bb pr approve <id> [--repo ...]      (approve as the Keychain account; needs write:pullrequest)
+  bb pr comment <id> (--body TEXT | --body-file F) [--repo ...]
+                                       (a general PR comment; post only what the user approved)
 Repo defaults to the `origin` remote of the current directory.
 """
 import argparse
@@ -158,6 +161,15 @@ def main():
         p = pr.add_parser(name)
         p.add_argument("id")
         p.add_argument("--repo")
+    ap_ = pr.add_parser("approve")
+    ap_.add_argument("id")
+    ap_.add_argument("--repo")
+    cm = pr.add_parser("comment")
+    cm.add_argument("id")
+    cm.add_argument("--repo")
+    text = cm.add_mutually_exclusive_group(required=True)
+    text.add_argument("--body")
+    text.add_argument("--body-file")
     l = pr.add_parser("list")
     l.add_argument("--state", default="OPEN")
     l.add_argument("--repo")
@@ -195,6 +207,15 @@ def main():
     elif a.pr_cmd == "ready":
         r = call("PUT", f"/repositories/{repo}/pullrequests/{a.id}", {"draft": False})
         print(f"ready: {r['links']['html']['href']}")
+    elif a.pr_cmd == "approve":
+        r = call("POST", f"/repositories/{repo}/pullrequests/{a.id}/approve")
+        print(f"approved #{a.id} as {r.get('user', {}).get('display_name', '?')}")
+    elif a.pr_cmd == "comment":
+        raw = a.body if a.body is not None else open(a.body_file).read()
+        if not raw.strip():
+            die("the comment is empty")
+        r = call("POST", f"/repositories/{repo}/pullrequests/{a.id}/comments", {"content": {"raw": raw}})
+        print(r.get("links", {}).get("html", {}).get("href", f"commented on #{a.id}"))
     elif a.pr_cmd == "list":
         r = call("GET", f"/repositories/{repo}/pullrequests?state={a.state}&pagelen=20")
         for p in r.get("values", []):

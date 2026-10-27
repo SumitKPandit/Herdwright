@@ -119,15 +119,17 @@ Facts about a particular user or their work never go here (they go to the profil
   `ZED_PROFILE_DIR`s, and stop your own background runs by PID or `TaskStop`, never `pkill -f` on a
   pattern that other sessions' processes (watchers, hooks) also match.
 - **PR review posting.** `gh pr review <n> -R <owner>/<repo> --approve -b "<text>"` prints nothing on
-  success; verify with `gh pr view --json reviews`. `bin/bb` has no approve/comment subcommands yet;
-  workers have been calling the Bitbucket REST API (`POST …/pullrequests/<id>/approve`, `…/comments`)
-  with bb's Keychain credential. Adding `bb pr approve|comment` is the deterministic fix (directive 9).
+  success; verify with `gh pr view --json reviews`. Bitbucket: `bin/bb pr approve <id>` and
+  `bin/bb pr comment <id> --body-file F` (tests/test_zed_gates.py); no raw REST calls.
 - **Relaying an OK to post (auto-mode classifier).** A worker restarted via `handoff restart` had
   `gh pr review --approve` denied as "Unrequested Commit in a Connected App": the user's OK only lived
   in the handoff note. Workers that got the OK as a direct prompt posted fine. **How:** relay posting
   approvals as a direct prompt to the posting session, quoting the user's words verbatim plus the
-  exact action (repo, PR/issue, text). Don't `handoff restart` a worker between the user's OK and its posting.
+  exact action (repo, PR/issue, text). Don't `handoff restart` a worker between the user's OK and its posting. Enforced: `bin/zed relay-post` (bin/lib/zedgates.py `relay_prompt`).
 - **Don't prompt a `working` session unless redirecting it.** The runtime probe (docs/runtimes/*.md) showed
   `herdr agent prompt` to a working agent is injected at the next tool boundary and the model may drop
   the rest of its plan. Send routine answers/info only to `idle`/`done` sessions; prompt a working one
-  only when you mean to change what it's doing.
+  only when you mean to change what it's doing. Enforced: `bin/zed prompt` refuses `working` without `--redirect`.
+- **Rules that live only in prose get broken.** Enforced in code (bin/lib/zedgates.py, tests/test_zed_gates.py): `spawn` needs `employee=` or
+  `ephemeral=<why>` while one is free; `runtime=copilot` needs Claude limited or `copilot_reason=`; `bin/zed merge`/`gate check` need a clean review and
+  qa by non-authors at the head sha; `start`/watcher flag core commits unsynced over an hour; `finish --lesson` needs `--idea` or `--no-idea WHY`.

@@ -41,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 import zedassign  # noqa: E402
 import zeddeny  # noqa: E402
 import zedemployee as emp  # noqa: E402
+import zedgates  # noqa: E402
 import zedlib  # noqa: E402
 
 ZED_HOME = Path(__file__).resolve().parent.parent
@@ -1299,7 +1300,8 @@ def cmd_brief(args):
 def cmd_spawn(args, worktree=None):
     """spawn <task-id> repo=<repo> base=<branch> branch=<branch> brief=<path> [name=<agent>]
     [runtime=auto|claude|copilot] [model=] [effort=] [kind=<worktype|investigation|design…>] [handoff=<note>]
-    [employee=<name> hat=<build|review|qa|…> [tags=a,b] [origin=zed|user|schedule]]  (an employee's assignment)"""
+    [employee=<name> hat=<build|review|qa|…> [tags=a,b] [origin=zed|user|schedule]]  (an employee's assignment)
+    [ephemeral=<why no employee fits>] [copilot_reason=<why Copilot while Claude is usable>]"""
     if not args:
         die("spawn <task-id> repo=... base=... branch=... brief=<file> [name=...] [runtime=auto|claude|copilot] "
             "[model=] [effort=] [kind=] [from=] [handoff=<note>] [employee= hat= tags= origin=]")
@@ -1328,6 +1330,8 @@ def cmd_spawn(args, worktree=None):
     if kv.get("origin", "zed") not in ASSIGN_ORIGINS:
         die(f"origin must be one of {', '.join(ASSIGN_ORIGINS)}")
     tags = [x for x in kv.get("tags", "").split(",") if x]
+    if reason := zedgates.spawn_without_employee(zedassign.free_employees(conn), kv):
+        die(f"refused: {reason}")
     sid = hat_kind = employee_runtime = None
     if employee:
         try:
@@ -1347,6 +1351,8 @@ def cmd_spawn(args, worktree=None):
     if host.returncode == 1:
         print(f"zed: warning: host is under load (zed-hostload): {host.stdout.strip().splitlines()[0]}", file=sys.stderr)
     runtime = choose_runtime(kv.get("runtime") or (employee_runtime if employee_runtime != "auto" else None) or "auto")
+    if reason := zedgates.copilot_before_claude(runtime, runtime_report("claude"), kv):
+        die(f"refused: {reason}")
     if runtime == "claude" and (warning := quota_warning()):
         print(f"zed: warning: {warning}", file=sys.stderr)
     require_capacity(conn, runtime, tid)  # a handoff has already closed the session it replaces
@@ -1491,6 +1497,103 @@ def employee_intro(conn, name, hat, kit, tid):
     if findings:
         text += "Findings drafts from earlier assignments on this task, read them: " + "; ".join(findings) + ". "
     return text
+
+
+def session_agent_state(s):
+    a = live_agents().get(s["pane_id"])
+    return a["agent_status"] if a else "gone"
+
+
+def send_prompt(conn, s, text, redirect, what):
+    """The one way Zed prompts a worker: refuses a `working` session unless redirect (lesson: don't derail a working session)."""
+    if s["external"]:
+        die(f"S{s['id']} is external (the user's own session): not prompted")
+    state = session_agent_state(s)
+    if state == "gone":
+        die(f"S{s['id']} has no live agent")
+    if reason := zedgates.prompt_refusal(state, redirect):
+        die(f"refused: S{s['id']} {reason}")
+    ok, err = prompt_worker(s["agent"], text)
+    if not ok:
+        die(f"prompt to S{s['id']} failed: {err.strip()}")
+    log_event(conn, s["task_id"], "prompt", f"S{s['id']} {what}" + (" (redirect)" if redirect else ""))
+    conn.commit()
+    print(f"prompted S{s['id']} ({state}): {what}")
+
+
+def cmd_prompt(args):
+    """prompt <S|agent> [--redirect] (<text> | --file <path>) — prompt a worker; refuses a session that is `working`
+    unless --redirect (a prompt mid-task is injected at the next tool boundary and can drop the rest of its plan)."""
+    redirect, args = "--redirect" in args, [a for a in args if a != "--redirect"]
+    if len(args) < 2:
+        die("prompt <S|agent> [--redirect] (<text> | --file <path>)")
+    conn = db()
+    require_lock()
+    s = resolve_session(conn, args[0].lstrip("S") if args[0][1:].isdigit() and args[0][0] == "S" else args[0])
+    text = Path(args[2]).read_text() if args[1] == "--file" and len(args) > 2 else " ".join(args[1:])
+    send_prompt(conn, s, text.strip(), redirect, "prompted by Zed")
+
+
+def cmd_relay_post(args):
+    """relay-post <S|agent> <user-words-file> --action "<exact action>" [--redirect] [--print] — relay the user's OK to
+    post (a PR review, comment, ticket edit): the prompt carries their words verbatim plus the exact action, so the
+    auto-mode classifier sees the request. Never `handoff restart` a worker between the OK and its posting."""
+    redirect, show = "--redirect" in args, "--print" in args
+    args = [a for a in args if a not in ("--redirect", "--print")]
+    if "--action" not in args or len(args) != 4 or args.index("--action") != 2:
+        die('relay-post <S|agent> <user-words-file> --action "<exact action>" [--redirect] [--print]')
+    words_file = Path(args[1])
+    if not words_file.is_file():
+        die(f"no such file: {words_file}")
+    try:
+        text = zedgates.relay_prompt(words_file.read_text(), args[3])
+    except ValueError as e:
+        die(str(e))
+    conn = db()
+    if show:
+        print(text)
+        return
+    require_lock()
+    s = resolve_session(conn, args[0][1:] if args[0][0] == "S" and args[0][1:].isdigit() else args[0])
+    send_prompt(conn, s, text, redirect, f"relay-post: {args[3][:120]}")
+
+
+def cmd_gate(args):
+    """gate check <sha|branch> [repo-dir] — exit 0 when the commit has a clean review and a clean qa verdict (both by
+    employees who did not author it); else print what is missing and exit 1. Read-only: usable by git hooks."""
+    if len(args) < 2 or args[0] != "check":
+        die("gate check <sha|branch> [repo-dir]")
+    sha = run(["git", "-C", args[2] if len(args) > 2 else ".", "rev-parse", "--verify", args[1] + "^{commit}"]).stdout.strip()
+    problems = zedgates.merge_problems(db(), sha)
+    for p in problems:
+        print(f"merge gate: {p}", file=sys.stderr)
+    sys.exit(1 if problems else 0)
+
+
+def cmd_merge(args):
+    """merge <branch> [repo-dir] [--override "<reason>"] — merge a worker branch into the current branch of repo-dir
+    (default: Zed's checkout) with `git merge --no-ff`, only when the merge gate passes (clean review + clean qa by
+    non-authors at the branch head). --override records the reason in the task log (the user's decision)."""
+    override = args[args.index("--override") + 1] if "--override" in args and args.index("--override") + 1 < len(args) else None
+    args = [a for i, a in enumerate(args) if a != "--override" and (i == 0 or args[i - 1] != "--override")]
+    if not args:
+        die('merge <branch> [repo-dir] [--override "<reason>"]')
+    repo_dir = args[1] if len(args) > 1 else str(ZED_HOME)
+    conn = db()
+    require_lock()
+    sha = run(["git", "-C", repo_dir, "rev-parse", "--verify", args[0] + "^{commit}"]).stdout.strip()
+    problems = zedgates.merge_problems(conn, sha)
+    if problems and not override:
+        die("refused: " + "; ".join(problems) + '. Get the review and qa done, or pass --override "<reason>" (the user\'s call)')
+    row = conn.execute("SELECT task_id FROM sessions WHERE branch=? ORDER BY id DESC", (args[0],)).fetchone()
+    log_event(conn, row["task_id"] if row else None, "merge",
+              f"{args[0]} {sha[:10]} into {run(['git', '-C', repo_dir, 'branch', '--show-current']).stdout.strip()}"
+              + (f"; gate overridden: {override}" if problems else "; gate passed"))
+    conn.commit()
+    os.environ["ZED_MERGE_GATE_DONE"] = "1"  # the git hook (hooks/pre-merge-commit) must not ask the gate a second time
+    r = run(["git", "-C", repo_dir, "merge", "--no-ff", args[0]], check=False)
+    print((r.stdout + r.stderr).strip())
+    sys.exit(r.returncode)
 
 
 def cmd_session(args):
@@ -1772,7 +1875,10 @@ def cmd_handoff(args):
     return cmd_spawn([str(s["task_id"]), f"repo={s['repo']}", f"base={s['base']}", f"branch={s['branch']}",
                       f"brief={brief}", f"runtime={target}", f"handoff={note}", f"name={s['agent']}",
                       *[f"{k}={kv[k]}" for k in ("model", "effort") if k in kv],
-                      *[f"{k}={s[k]}" for k in ("employee", "hat", "origin") if s[k]]], worktree=Path(wt))
+                      *[f"{k}={s[k]}" for k in ("employee", "hat", "origin") if s[k]],
+                      *([] if s["employee"] else ["ephemeral=handoff of a session that had no employee"]),
+                      *([f"copilot_reason=handoff approved by the user ({s['runtime']} stopped)"] if target == "copilot" else [])],
+                     worktree=Path(wt))
 
 
 def read_screen(agent, source="visible", lines=None):
@@ -2244,6 +2350,7 @@ def cmd_watch(args):
             for s in open_prs:
                 events.extend(pr_events(conn, s, alerts))
             events += delivery_events(alerts)
+            events += core_sync_events(alerts)
             first = False
             conn.commit()
             conn.close()
@@ -2344,6 +2451,28 @@ def auto_approve(conn, s, screen, alerts):
         log_event(conn, s["task_id"], "auto", f"S{s['id']}: answered '{r['name']}' with {r['key']} for {', '.join(targets)}")
         return True
     return False
+
+
+CORE_SYNC_CHECK_SECONDS = 300
+
+
+def core_sync_events(alerts):
+    """One event when core commits have waited for `main` over an hour (lesson: core sync after every core commit).
+    Checked every few minutes; reported once per oldest waiting commit."""
+    seen = alerts.setdefault("core_sync", {})
+    if time.time() - seen.get("checked", 0) < CORE_SYNC_CHECK_SECONDS:
+        return []
+    seen["checked"] = time.time()
+    r = run([sys.executable, str(ZED_HOME / "bin" / "zed-core-sync"), "--check", "--json"], check=False)
+    try:
+        found = json.loads(r.stdout)
+    except ValueError:  # not on a profile branch, or no main: nothing to flag
+        return []
+    if not zedgates.core_sync_stale(found.get("oldest"), time.time()) or seen.get("reported") == found["oldest"]:
+        return []
+    seen["reported"] = found["oldest"]
+    return [f"core sync: {found['count']} core commit(s) have waited over an hour for main "
+            "(`bin/zed-core-sync --check` lists them; sync, then push as profile.md says)"]
 
 
 def health_events(conn, s, a, state, alerts):
@@ -2584,6 +2713,7 @@ def cmd_start(args):
     if holds_lock():  # read-only sessions only report what the DB says
         out += script_findings("employees: who is free, what waits (zed-employee board)", "zed-employee", "board", "--brief")
         out += script_findings("reality differs from the DB (zed-crew)", "zed-crew", "reconcile")
+        out += script_findings("core commits not on main yet (zed-core-sync)", "zed-core-sync", "--check")
         out += script_findings("git guard (zed-guard)", "zed-guard", "audit")
         out += script_findings("core updates waiting (zed-update; `bin/zed-update apply` merges)", "zed-update", "check", "--no-fetch")
         out += script_findings("housekeeping (zed-hygiene)", "zed-hygiene", "report")
@@ -2619,6 +2749,15 @@ def cmd_help(args):
                                      folder is removed too unless it holds unique work)
   landed <S|agent>                   landed-work test: pushed, nothing uncommitted, PR merged/closed, plan
                                      complete, no open questions; prints exactly what blocks closing
+        [ephemeral=<why>] [copilot_reason=<why>]   without employee= a free employee blocks spawn unless
+                                     ephemeral= says why none fits; runtime=copilot needs claude limited or copilot_reason=
+  prompt <S|agent> [--redirect] <text | --file F>
+                                     the way to prompt a worker: refused while it is `working` unless --redirect
+  relay-post <S|agent> <words-file> --action "<exact action>" [--redirect] [--print]
+                                     relay the user's OK to post: their words verbatim + the exact action
+  gate check <sha|branch> [dir]      exit 1 unless the commit has a clean review and qa by non-authors (read-only)
+  merge <branch> [dir] [--override "<reason>"]
+                                     `git merge --no-ff` only past the gate; --override is the user's call, logged
   adopt <pane-id> <T> [repo=]        track a session Zed didn't start (user's own)
   handoff <S|agent> [runtime=] [brief=] [model=] [effort=] [restart]
                                      move a stopped worker to another runtime, same worktree
@@ -2651,7 +2790,7 @@ Session states: """ + ", ".join(SESSION_STATES))
 
 
 COMMANDS = {"task": cmd_task, "log": cmd_log, "q": cmd_q, "spawn": cmd_spawn, "assign": cmd_assign, "session": cmd_session,
-            "close": cmd_close, "adopt": cmd_adopt, "handoff": cmd_handoff, "watch": cmd_watch, "status": cmd_status,
+            "prompt": cmd_prompt, "relay-post": cmd_relay_post, "gate": cmd_gate, "merge": cmd_merge, "close": cmd_close, "adopt": cmd_adopt, "handoff": cmd_handoff, "watch": cmd_watch, "status": cmd_status,
             "brief": cmd_brief, "coordinator": cmd_coordinator, "quota": cmd_quota, "landed": cmd_landed, "doctor": cmd_doctor, "ack": cmd_ack, "hook": cmd_hook, "paths": cmd_paths, "start": cmd_start, "lock": cmd_lock, "runtime": cmd_runtime, "models": cmd_models, "help": cmd_help}
 
 if __name__ == "__main__":

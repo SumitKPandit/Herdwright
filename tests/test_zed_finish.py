@@ -44,6 +44,8 @@ class AssignDb(ProfileCase):
 
 class FinishTests(AssignDb):
     def finish(self, *argv):
+        if "--lesson" in argv and not {"--idea", "--no-idea"} & set(argv):  # the code-first ask is tested in test_zed_gates
+            argv += ("--no-idea", "nothing here can be code")
         return run("finish", *argv)
 
     def test_a_build_finishes_with_a_lesson_and_writes_everything_back(self):
