@@ -51,6 +51,7 @@ MODEL_RANKING_PATH = PROFILE_DIR / "config" / "model-ranking.json"
 RUNTIME_STATE_PATH = PROFILE_DIR / ".cache" / "runtime-state.json"
 WATCH_STATE_PATH = PROFILE_DIR / ".cache" / "watch-state.json"
 SPEND_LEDGER_PATH = PROFILE_DIR / "db" / "spend.jsonl"
+WAKE_QUEUE_PATH = PROFILE_DIR / ".cache" / "wake-queue.json"
 WATCHER_PID_PATH = PROFILE_DIR / ".cache" / "watch.pid"
 WATCHER_LOCK_PATH = PROFILE_DIR / ".cache" / "watch.lock"
 ARM_STAMP_PATH = PROFILE_DIR / ".cache" / "hook-arm.stamp"  # touched by the Stop hook's arm step on every firing
@@ -1730,6 +1731,66 @@ def lapse_tick(s, state, seq, alerts):
 _watcher_lock = None  # held open for the life of this watcher; the kernel drops it when the process dies
 
 
+MAX_SHOWS = 3  # an un-acked wake is re-presented by `watch` until it has been shown this many times
+
+
+@contextlib.contextmanager
+def wake_queue():
+    """The durable wake queue ({"next": n, "events": [{"id", "ts", "text", "shown", "acked"}]}), under a file lock
+    because the watcher appends while Zed acks. Changes are saved on exit."""
+    WAKE_QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(WAKE_QUEUE_PATH.with_suffix(".guard"), "w") as guard:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        q = read_json(WAKE_QUEUE_PATH, {"next": 1, "events": []})
+        yield q
+        WAKE_QUEUE_PATH.write_text(json.dumps(q))
+
+
+def queue_add(lines):
+    """Append actionable events to the queue; returns them as `[E<id>] text` lines."""
+    out = []
+    with wake_queue() as q:
+        for text in lines:
+            q["events"].append({"id": q["next"], "ts": now(), "text": text, "shown": 1, "acked": False})
+            out.append(f"[E{q['next']}] {text}")
+            q["next"] += 1
+    return out
+
+
+def queue_represent():
+    """Un-acked events to show again (a handling turn that crashed or hit a limit never acked them). Each is
+    re-presented at most MAX_SHOWS times in total so a forgotten ack can't wake Zed forever; `zed start` lists
+    them regardless."""
+    with wake_queue() as q:
+        again = [e for e in q["events"] if not e["acked"] and e["shown"] < MAX_SHOWS]
+        for e in again:
+            e["shown"] += 1
+        return [f"[E{e['id']}] (again, un-acked since {e['ts']}) {e['text']}" for e in again]
+
+
+def queue_pending():
+    with wake_queue() as q:
+        return [e for e in q["events"] if not e["acked"]]
+
+
+def cmd_ack(args):
+    """ack <E-id>... | ack --all — retire handled wake events (shown again by `watch` and `start` until acked)."""
+    if not args:
+        die("ack <E-id>... | ack --all")
+    require_profile()
+    require_lock()
+    wanted = {int(a.lstrip("Ee")) for a in args if a != "--all"}
+    with wake_queue() as q:
+        hit = [e for e in q["events"] if not e["acked"] and ("--all" in args or e["id"] in wanted)]
+        for e in hit:
+            e["acked"] = True
+        left = sum(not e["acked"] for e in q["events"])
+        missing = wanted - {e["id"] for e in q["events"]}
+    if missing:
+        die(f"no such wake event: {', '.join(f'E{i}' for i in sorted(missing))}")
+    print(f"acked {len(hit)}; {left} still un-acked")
+
+
 def watcher_alive():
     """pid of a live watcher for this profile (`watch` or the Stop hook's `hook arm`), or None. Decided by an
     flock the watcher holds, so a stale pid file or a reused pid can't fool it."""
@@ -1775,6 +1836,11 @@ def cmd_watch(args):
     if not claim_watcher():
         print(f"WATCH_ALREADY_RUNNING pid {watcher_alive()}: one watcher is enough; it will wake Zed.", flush=True)
         sys.exit(4)
+    again = queue_represent()
+    for line in again:
+        print(line, flush=True)
+    if once and again:
+        return True
     saved = read_json(WATCH_STATE_PATH, None)
     prev = {int(k): v for k, v in saved.items()} if saved is not None else {}
     first = saved is None
@@ -1844,7 +1910,7 @@ def cmd_watch(args):
             conn.close()
         except Exception as e:  # keep the watch alive through transient failures
             print(f"watch error: {e}", file=sys.stderr, flush=True)
-        for line in events:
+        for line in queue_add(events):
             print(line, flush=True)
         WATCH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         WATCH_STATE_PATH.write_text(json.dumps(prev))
@@ -2101,6 +2167,9 @@ def cmd_start(args):
     if quota_settings().get("threshold_tokens"):
         out.append(quota_warning() or "quota: under the configured threshold (`bin/zed quota` for detail)")
     out += notes + render_brief(conn)
+    pending = [f"  [E{e['id']}] {e['ts']} {e['text'].splitlines()[0][:160]}" for e in queue_pending()]
+    if pending:
+        out += ["Un-acked wake events (handle, then `bin/zed ack E<id>…`):", *capped(pending)]
     print("\n".join(out))
 
 
@@ -2130,6 +2199,8 @@ def cmd_help(args):
                                      which runtimes are usable; mark one limited / available again
   hook arm | hook stop-guard         Claude Stop hooks (.claude/settings.json): tokenless watcher re-arm and a
                                      turn-end guard; act only in the session holding the lock
+  ack <E-id>... | ack --all          retire handled watcher events; un-acked ones are shown again by `watch`
+                                     (up to 3 times) and always by `start`
   quota                              estimate plan usage from session transcripts (rolling window, all Claude
                                      sessions); spawn warns past runtimes.json quota.threshold_tokens
   coordinator [routine|judgment] [--print]
@@ -2151,7 +2222,7 @@ Session states: """ + ", ".join(SESSION_STATES))
 
 COMMANDS = {"task": cmd_task, "log": cmd_log, "q": cmd_q, "spawn": cmd_spawn, "session": cmd_session,
             "close": cmd_close, "adopt": cmd_adopt, "handoff": cmd_handoff, "watch": cmd_watch, "status": cmd_status,
-            "brief": cmd_brief, "coordinator": cmd_coordinator, "quota": cmd_quota, "hook": cmd_hook, "paths": cmd_paths, "start": cmd_start, "lock": cmd_lock, "runtime": cmd_runtime, "models": cmd_models, "help": cmd_help}
+            "brief": cmd_brief, "coordinator": cmd_coordinator, "quota": cmd_quota, "ack": cmd_ack, "hook": cmd_hook, "paths": cmd_paths, "start": cmd_start, "lock": cmd_lock, "runtime": cmd_runtime, "models": cmd_models, "help": cmd_help}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:

@@ -282,6 +282,7 @@ class ZedTests(unittest.TestCase):
                 patch.object(self.z, "read_screen", return_value="ZED:QUESTION\nWhich greeting?") as screen:
             self.z.cmd_watch(["--once", "0.01"])
             self.assertIn("at watch start", self.output.getvalue())
+            self.z.cmd_ack(["--all"])  # handled; an un-acked event would be shown again
             self.output.truncate(0)
             self.output.seek(0)
             with patch.object(self.z.time, "sleep", side_effect=InterruptedError):
@@ -668,6 +669,40 @@ class ZedTests(unittest.TestCase):
             self.z.cmd_watch(["--once", "0.01"])
         self.assertIn("status file: ZED:QUESTION", self.output.getvalue())
         self.assertIn("Q1: Which greeting?", self.output.getvalue())
+
+    def test_wake_queue_keeps_events_until_acked_and_never_loops_forever(self):
+        self.assertEqual(self.z.queue_add(["S1 finished", "S2 asks"]), ["[E1] S1 finished", "[E2] S2 asks"])
+        with patch.object(self.z, "require_lock"):
+            self.assertEqual(len(self.z.queue_represent()), 2)  # shown a 2nd time (a crash lost the 1st)
+            self.assertEqual(len(self.z.queue_represent()), 2)  # a 3rd
+            self.assertEqual(self.z.queue_represent(), [])  # capped: a forgotten ack can't loop the hook
+            self.assertEqual(len(self.z.queue_pending()), 2)  # but `start` still lists them
+            self.z.cmd_ack(["E1"])
+            self.assertEqual([e["id"] for e in self.z.queue_pending()], [2])
+            self.z.cmd_ack(["--all"])
+            self.assertEqual(self.z.queue_pending(), [])
+            with self.assertRaises(SystemExit):
+                self.z.cmd_ack(["E99"])
+
+    def test_watch_represents_unacked_events_before_anything_else(self):
+        self.session()
+        self.z.queue_add(["S1 T1 qa asked something"])
+        with patch.object(self.z, "require_lock"), patch.object(self.z, "claim_watcher", return_value=True), \
+                patch.object(self.z, "live_agents", side_effect=AssertionError("must not poll")):
+            self.assertTrue(self.z.cmd_watch(["--once"]))
+        self.assertIn("[E1] (again, un-acked", self.output.getvalue())
+        self.assertIn("asked something", self.output.getvalue())
+
+    def test_watch_events_are_queued_with_ids(self):
+        conn = self.session()
+        agent = {"agent_status": "idle", "state_change_seq": 10}
+        with patch.object(self.z, "require_lock"), patch.object(self.z, "holds_lock", return_value=True), \
+                patch.object(self.z, "claim_watcher", return_value=True), \
+                patch.object(self.z, "live_agents", return_value={"qa:p1": agent}), \
+                patch.object(self.z, "read_screen", return_value=self.DONE_SCREEN):
+            self.z.cmd_watch(["--once", "0.01"])
+        self.assertRegex(self.output.getvalue(), r"\[E1\] S1 T1 qa is idle")
+        self.assertEqual(len(self.z.queue_pending()), 1)
 
 
 if __name__ == "__main__":
