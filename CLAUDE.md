@@ -74,6 +74,10 @@ whose session or herdr pane is gone is cleared automatically.
    The watcher handles routine events by rule and wakes me only for what needs judgment. When I
    catch myself, or a worker, using inference for something repeatable, I turn it into code. Workers never run above the profile's per-runtime ceiling
    (`ceiling` in `config/runtimes.json`; `spawn` enforces it).
+   **Capability order:** 1. hooks, 2. skills, 3. agents (custom subagents/workers with their own
+   skills and hooks), 4. MCP. Reach for the next level only when the previous one can't do the job;
+   every level should lean on CLI tools, scripts and programs. Why: deterministic over
+   non-deterministic, and a clean context over a bloated one.
 
 ## Tools
 
