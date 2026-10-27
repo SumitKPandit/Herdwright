@@ -467,16 +467,24 @@ class ZedTests(unittest.TestCase):
         effort = self.z.effort_for_kind("claude", "investigation", None, "w")[0]
         self.assertEqual(self.z.apply_ceiling("claude", "m", effort, "w")[1], "medium")
 
-    def test_max_running_queues_extra_spawns_per_runtime(self):
+    def test_max_running_counts_every_open_session_of_the_runtime(self):
         conn = self.session()
-        self.config({"order": ["claude", "copilot"], "runtimes": {"claude": {"max_running": 1}}})
-        with self.assertRaises(SystemExit) as e:
+        self.config({"order": ["claude", "copilot"], "runtimes": {"claude": {"max_running": 3}}})
+        live = {"w1:p1": {"agent": "claude"}, "w2:p1": {"agent": "claude"},  # e.g. Zed itself and a worker
+                "w3:p1": {"agent": "copilot"}}
+        with patch.object(self.z, "live_agents", return_value=live):
+            self.assertEqual(self.z.running_count(conn, "claude"), 2)
             self.z.require_capacity(conn, "claude", 2)
-        self.assertEqual(e.exception.code, 75)
-        self.assertIn("queued: 1 claude workers running", self.output.getvalue())
-        self.z.require_capacity(conn, "copilot", 2)  # no cap configured
-        conn.execute("UPDATE sessions SET status='closed'")
-        self.z.require_capacity(conn, "claude", 2)
+            live["w4:p1"] = {"agent": "claude"}  # the user opens their own session
+            with self.assertRaises(SystemExit) as e:
+                self.z.require_capacity(conn, "claude", 2)
+            self.assertEqual(e.exception.code, 75)
+            self.assertIn("queued: 3 claude sessions are open", self.output.getvalue())
+            self.z.require_capacity(conn, "copilot", 2)  # no cap configured
+        with patch.object(self.z, "live_agents", return_value={}):  # herdr unavailable: the DB's own sessions
+            self.assertEqual(self.z.running_count(conn, "claude"), 1)
+            conn.execute("UPDATE sessions SET status='closed'")
+            self.assertEqual(self.z.running_count(conn, "claude"), 0)
 
     def test_coordinator_command_per_mode_within_the_ceiling(self):
         self.config({"order": ["claude"], "coordinator": {"routine": {"model": "cheap", "effort": "low"},

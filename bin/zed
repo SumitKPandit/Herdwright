@@ -517,18 +517,24 @@ def effort_for_kind(runtime, kind, effort, why):
 
 
 def running_count(conn, runtime):
+    """How many sessions of this runtime are open right now: every live agent of that CLI in herdr, i.e. Zed itself,
+    its workers and the user's own, because they all draw on the same plan. Falls back to the DB's own sessions
+    when herdr can't be listed."""
+    live = live_agents()
+    if live:
+        return sum(1 for a in live.values() if a.get("agent") == runtime)
     return conn.execute("SELECT COUNT(*) FROM sessions WHERE runtime=? AND external=0 AND status IN ('running','waiting_user')",
                         (runtime,)).fetchone()[0]
 
 
 def require_capacity(conn, runtime, tid):
-    """At most runtimes.<rt>.max_running workers per runtime (a plan's limits are shared by all of them);
-    beyond it the task stays queued (exit 75, like firstmate's project capacity)."""
+    """At most runtimes.<rt>.max_running sessions per runtime, counting all of them (see running_count): a plan's
+    limits are shared. Beyond it the task stays queued (exit 75, like firstmate's project capacity)."""
     cap = runtime_settings(runtime).get("max_running")
     n = running_count(conn, runtime)
     if cap is not None and n >= cap:
-        print(f"zed: queued: {n} {runtime} workers running (max_running {cap} in runtimes.json). T{tid} stays queued; "
-              f"spawn it again when one finishes (`bin/zed session list`).", file=sys.stderr)
+        print(f"zed: queued: {n} {runtime} sessions are open (Zed, workers and your own; max_running {cap} in runtimes.json). "
+              f"T{tid} stays queued; spawn it again when one finishes (`bin/zed session list`).", file=sys.stderr)
         sys.exit(75)
 
 
