@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""zed-qa — a test-case skeleton for a task, and a check that a QA report is complete. No model, read-only.
+
+Usage
+  zed-qa plan <T<id>|brief.md> [--dir PATH --base BRANCH] [--out DIR] [--json]
+      builds the QA report skeleton from the brief (profile/briefs/T<id>-*.md): each acceptance criterion and each
+      "Definition of done" item becomes a happy-path case, each "Known open points" item an edge case, plus the usual
+      edge prompts, and a regression case per changed source file when --dir and --base name the branch. The
+      tester fills in `Result:` and `Evidence:`. With --out DIR the skeleton is written to DIR/report.md (never over
+      an existing report). exit 0 ok, 2 no such task or brief
+  zed-qa report-check <dir|report.md> [--json]
+      refuses a report where: a case has no result (pass | fail | blocked | skipped), an evidence file is named but
+      missing (paths are relative to the report's folder), the environment (URL, Branch, Commit) is unrecorded, console
+      errors are unrecorded ('Console errors: none' is a record), there is no verdict or it contradicts the cases
+      (clean with a failed or blocked case; blockers with none). exit 0 ok, 1 problems listed, 2 no report found
+
+Report shape (what `plan` writes):
+  # QA report: T22
+  URL: http://localhost:3000        Branch: feature/x        Commit: abc1234          (one per line)
+  Console errors: none | what appeared
+  ## Cases
+  ### 1. Title
+  Result: pass | fail | blocked | skipped
+  Evidence: shots/01.png, trace.zip
+  Verdict: clean | blockers
+"""
+import argparse
+import re
+import sys
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import zedlib  # noqa: E402
+
+RESULTS = ("pass", "fail", "blocked", "skipped")
+ENV_KEYS = ("URL", "Branch", "Commit")
+PLACEHOLDER = re.compile(r"^(_{2,}|<.*>|todo|tbd|\?+|-)?$", re.I)
+BOILERPLATE = re.compile(r"\b(self-review|committed and PR raised|ZED:DONE|QA done)\b", re.I)
+EDGE_PROMPTS = ["Empty state: no data, no results, a brand-new account",
+                "Invalid or unexpected input: blank, very long, special characters, wrong type",
+                "Permissions: a user without access, a logged-out session",
+                "Interrupted flow: reload mid-way, back button, double submit"]
+
+
+def find_brief(ref):
+    if re.fullmatch(r"T\d+", ref):
+        found = sorted(p for p in zedlib.BRIEFS_DIR.glob(f"{ref}-*.md") if not p.name.endswith("-plan.md"))
+        return found[0] if found else None
+    p = Path(ref)
+    return p if p.is_file() else None
+
+
+def section(text, *names):
+    """Body of the first heading containing any of names (case-insensitive), up to the next heading of the same or higher level."""
+    for m in re.finditer(r"^(#{1,6})\s+(.*)$", text, re.M):
+        if any(n in m.group(2).lower() for n in names):
+            rest = text[m.end():]
+            end = re.search(rf"^#{{1,{len(m.group(1))}}}\s", rest, re.M)
+            return rest[:end.start()] if end else rest
+    return ""
+
+
+def bullets(body):
+    """Bullet or numbered items of a section; an indented line continues the item above."""
+    items = []
+    for line in body.splitlines():
+        m = re.match(r"^\s*(?:[-*]|\d+[.)])\s+(?:\[[ xX]\]\s*)?(.*\S)\s*$", line)
+        if m:
+            items.append(m.group(1))
+        elif items and line.strip() and line.startswith((" ", "\t")):
+            items[-1] += " " + line.strip()
+    return items
+
+
+def build_cases(brief_text, changed=()):
+    """[(group, title)]: happy path from acceptance criteria and the definition of done, edge cases from the open points
+    and the usual prompts, regression from the changed source files."""
+    happy = [i for i in bullets(section(brief_text, "acceptance")) + bullets(section(brief_text, "definition of done"))
+             if not BOILERPLATE.search(i)]
+    open_points = [i for i in bullets(section(brief_text, "open points")) if not re.match(r"(none|nothing)\b", i, re.I)]
+    cases = [("Happy path", t) for t in happy or ["The main flow the task describes works end to end"]]
+    cases += [("Edge cases", t) for t in open_points + EDGE_PROMPTS]
+    cases += [("Regression", f"Nearby behaviour of {f} still works") for f in changed]
+    if not changed:
+        cases.append(("Regression", "Pages and flows next to the changed area still work (name them)"))
+    return cases
+
+
+def skeleton(title, cases):
+    lines = [f"# QA report: {title}", "", "URL: ___", "Branch: ___", "Commit: ___", "Console errors: ___", "", "## Cases"]
+    group, n = None, 0
+    for g, t in cases:
+        n += 1
+        if g != group:
+            group = g
+            lines += ["", f"<!-- {g} -->"]
+        lines += [f"### {n}. {t}", "Result: ___", "Evidence: ___", "Notes: ", ""]
+    lines += ["## Verdict", "", "Verdict: ___", ""]
+    return "\n".join(lines)
+
+
+def changed_sources(path, base):
+    r = zedlib.git(path, "diff", "--name-only", f"{base}...HEAD", timeout=60)
+    if not r.ok:
+        raise RuntimeError(f"git diff failed: {r.stderr.strip()[:300]}")
+    review = SourceFileLoader("zed_review", str(Path(__file__).resolve().parent / "zed-review")).load_module()
+    return [f for f in r.stdout.split() if review.is_source(f)]
+
+
+def cmd_plan(a):
+    brief = find_brief(a.task)
+    if not brief:
+        print(f"zed-qa: no brief found for {a.task}", file=sys.stderr)
+        return 2
+    try:
+        changed = changed_sources(a.dir, a.base) if a.dir and a.base else []
+    except RuntimeError as e:
+        print(f"zed-qa: {e}", file=sys.stderr)
+        return 2
+    cases = build_cases(brief.read_text(), changed)
+    text = skeleton(a.task if re.fullmatch(r"T\d+", a.task) else brief.stem, cases)
+    if a.out:
+        target = Path(a.out) / "report.md"
+        if target.exists():
+            print(f"zed-qa: {target} exists; not overwriting a report", file=sys.stderr)
+            return 2
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+    zedlib.emit({"cases": [{"n": i, "group": g, "title": t} for i, (g, t) in enumerate(cases, 1)], "report": str(Path(a.out) / "report.md") if a.out else None},
+                a.json, lambda d: ([f"wrote {d['report']}"] if d["report"] else text.splitlines()))
+    return 0
+
+
+def value(text, key):
+    m = re.search(rf"^\s*(?:[-*]\s*)?(?:\*\*)?{key}(?:\*\*)?\s*:\s*(.*?)\s*$", text, re.I | re.M)
+    return m.group(1) if m else None
+
+
+def recorded(v):
+    return v is not None and not PLACEHOLDER.match(v.strip().strip("`*"))
+
+
+def check_report(text, folder):
+    """{'problems': [...], 'cases': n, 'verdict': ...}; no problems means the report is complete."""
+    problems = []
+    for key in ENV_KEYS:
+        if not recorded(value(text, key)):
+            problems.append(f"environment not recorded: {key}")
+    if not recorded(value(text, "Console errors")):
+        problems.append("console errors not recorded (write 'Console errors: none' if there were none)")
+    heads = list(re.finditer(r"^###\s+(\d+)\.\s*(.*)$", text, re.M))
+    results = []
+    for h, nxt in zip(heads, heads[1:] + [None]):
+        body = text[h.end():nxt.start() if nxt else len(text)]
+        body = re.split(r"^##\s", body, flags=re.M)[0]
+        where = f"case {h.group(1)} ({h.group(2).strip()[:40]})"
+        res = (value(body, "Result") or "").strip().strip("`*").lower()
+        results.append(res)
+        if res not in RESULTS:
+            problems.append(f"{where}: no result (pass | fail | blocked | skipped)" if not res or PLACEHOLDER.match(res)
+                            else f"{where}: result '{res}' is not one of {', '.join(RESULTS)}")
+        ev = value(body, "Evidence")
+        for name in [e.strip().strip("`") for e in re.split(r"[,;]", ev or "") if recorded(e) and e.strip().lower() not in ("none", "n/a")]:
+            p = Path(name).expanduser()
+            if not (p if p.is_absolute() else folder / p).is_file():
+                problems.append(f"{where}: evidence file '{name}' not found next to the report")
+    if not heads:
+        problems.append("no cases (### 1. title ... Result: ...)")
+    verdicts = [m.group(1).strip().strip("`*").lower() for m in re.finditer(r"^\s*(?:\*\*)?Verdict(?:\*\*)?\s*:\s*(.*?)\s*$", text, re.I | re.M)]
+    verdict = None
+    if not [v for v in verdicts if recorded(v)]:
+        problems.append("no verdict (write 'Verdict: clean' or 'Verdict: blockers')")
+    elif len(verdicts) > 1:
+        problems.append(f"{len(verdicts)} verdict lines; write exactly one")
+    elif verdicts[0] not in ("clean", "blockers"):
+        problems.append(f"verdict must be 'clean' or 'blockers' (got '{verdicts[0]}')")
+    else:
+        verdict = verdicts[0]
+        bad = any(r in ("fail", "blocked") for r in results)
+        if verdict == "clean" and bad:
+            problems.append("verdict is clean but a case failed or is blocked")
+        if verdict == "blockers" and not bad:
+            problems.append("verdict is blockers but no case failed or is blocked")
+    return {"problems": problems, "cases": len(heads), "verdict": verdict}
+
+
+def cmd_report_check(a):
+    p = Path(a.report).expanduser()
+    path = p / "report.md" if p.is_dir() else p
+    if not path.is_file():
+        print(f"zed-qa: no report found at {path}", file=sys.stderr)
+        return 2
+    result = check_report(path.read_text(), path.parent)
+    zedlib.emit(result, a.json, lambda d: [f"{path}: " + ("ok" if not d["problems"] else f"{len(d['problems'])} problem(s)")
+                                           + f" ({d['cases']} case(s), verdict {d['verdict'] or 'missing'})"]
+                + ["  - " + x for x in zedlib.cap_lines(d["problems"], 25)])
+    return 1 if result["problems"] else 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="zed-qa", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    plan = sub.add_parser("plan")
+    plan.add_argument("task")
+    plan.add_argument("--dir")
+    plan.add_argument("--base")
+    plan.add_argument("--out")
+    plan.add_argument("--json", action="store_true")
+    chk = sub.add_parser("report-check")
+    chk.add_argument("report")
+    chk.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+    return cmd_plan(a) if a.cmd == "plan" else cmd_report_check(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

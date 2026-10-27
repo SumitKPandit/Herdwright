@@ -105,6 +105,15 @@ commit and push anything that must survive.
 2. **Self-review** for clean, readable, maintainable code that follows existing patterns; no debug
    leftovers or dead code; tests where the repo has them. Run lint, type check and tests.
 
+Helpers that do the mechanical part without a model (each has `--help`; use them before doing it by hand):
+- `bin/zed-checks run <repo> [--dir <worktree>]` runs the repo's lint, type check and tests from its `checks`
+  block in `config/projects.json`; if the repo has none, say so to Zed and run its own commands.
+- `bin/zed-review prep <pr-url>` (or `--dir <worktree> --base <branch>`) lists debug leftovers, source files
+  without a test change, new dependencies, migrations and secret-looking lines in a diff: run it on your own diff
+  before raising a PR. `zed-review check-draft <file>` checks a review draft.
+- `bin/zed-qa plan <T-id>` gives the QA case skeleton for your task; `zed-qa report-check <dir>` checks a QA report.
+- `bin/zed-xref <symbol|path>` finds every use across all the repos, so a changed contract shows its other consumers.
+
 ## Git safety
 
 Commit only on your own branch. Never push to, commit to, or rebase base/release/deploy branches,
