@@ -13,6 +13,11 @@ import zedmem  # noqa: E402
 AUTHOR_HATS = ("build", "design")  # whoever wore these on a task or branch may not review or QA it
 WRITER_HATS = (None, "build")      # a session with no hat is a plain worker, which may edit source too
 OPEN = ("running", "waiting_user")
+def is_senior(fields):
+    """The one reading of an employee's `senior` field: true, or the text "true" (front matter may give either)."""
+    return fields.get("senior") is True or str(fields.get("senior")).strip().lower() == "true"
+
+
 LEAD_HATS = ("design",)            # seniors rank first for these, and for work marked ambiguous
 SAME_TASK_WEIGHT = 5               # a past assignment on this very task (a fixer who built it ranks high)
 SAME_HAT_REPO_WEIGHT = 1
@@ -104,8 +109,8 @@ def suggest(conn, tid, hat, repo, branch=None, tags=(), ambiguous=False):
         score, parts = familiarity(conn, name, tid, repo, hat, tags)
         last = conn.execute("SELECT MAX(created_at) FROM sessions WHERE employee=?", (name,)).fetchone()[0] or ""
         why = (f"busy with S{taken[name]}" if name in taken else "authored this work" if name in wrote else "")
-        rows.append({"name": name, "eligible": not why, "why": why, "senior": bool(fields.get("senior")),
-                     "lead": bool(fields.get("senior")) and (ambiguous or hat in LEAD_HATS),
+        rows.append({"name": name, "eligible": not why, "why": why, "senior": is_senior(fields),
+                     "lead": is_senior(fields) and (ambiguous or hat in LEAD_HATS),
                      "score": score, "parts": parts, "last": last})
     rows.sort(key=lambda r: (not r["eligible"], not r["lead"], -r["score"], r["last"], r["name"]))
     return rows

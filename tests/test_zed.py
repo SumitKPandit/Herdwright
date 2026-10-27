@@ -1130,6 +1130,36 @@ class ZedTests(unittest.TestCase):
         self.assertIn('rating of T1: not good: "PR description was thin" → Recorded in lessons', events[0]["text"])
         self.assertIn("already handled", self.output.getvalue())
 
+    def test_inbox_done_refuses_an_answer_whose_question_is_still_open(self):
+        conn = self.session()
+        qid = conn.execute("INSERT INTO questions(task_id, session_id, question, status, asked_at) "
+                           "VALUES (1, 1, 'Which?', 'open', 'now')").lastrowid
+        item = self.feedback(conn, "answer", question_id=qid, text="This one")
+        with patch.object(self.z, "db", return_value=conn), patch.object(self.z, "require_lock"):
+            with self.assertRaises(SystemExit):
+                self.z.cmd_inbox(["done", str(item)])
+            self.assertEqual(conn.execute("SELECT status FROM inbox").fetchone()[0], "new")
+            conn.execute("UPDATE questions SET status='answered' WHERE id=?", (qid,))
+            self.z.cmd_inbox(["done", str(item)])
+        self.assertEqual(conn.execute("SELECT status FROM inbox").fetchone()[0], "handled")
+
+    def test_watch_forgets_inbox_items_once_handled(self):
+        conn = self.z.db()
+        self.addCleanup(conn.close)
+        conn.execute("INSERT INTO tasks(title,created_at,updated_at) VALUES ('QA','now','now')")
+        item = self.feedback(conn, text="first")
+        self.watch_once()
+        inbox_path = self.z.WATCH_STATE_PATH.with_name("watch-inbox.json")
+        self.assertEqual(json.loads(inbox_path.read_text()), [item])
+        conn.execute("UPDATE inbox SET status='handled'")
+        conn.commit()
+        with patch.object(self.z, "require_lock"):
+            self.z.cmd_ack(["--all"])
+        with patch.object(self.z.time, "sleep", side_effect=InterruptedError):
+            with self.assertRaises(InterruptedError):
+                self.watch_once("0.01")
+        self.assertEqual(json.loads(inbox_path.read_text()), [])
+
     def watch_once(self, *args):
         with patch.object(self.z, "require_lock"), patch.object(self.z, "holds_lock", return_value=True), \
                 patch.object(self.z, "live_agents", return_value={}):

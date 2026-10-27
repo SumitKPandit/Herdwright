@@ -1245,6 +1245,10 @@ def cmd_inbox(args):
     if item["status"] == "handled":
         print(f"#{item['id']} was already handled")
         return
+    if item["kind"] == "answer" and item["question_id"]:
+        q = conn.execute("SELECT status FROM questions WHERE id=?", (item["question_id"],)).fetchone()
+        if q and q["status"] == "open":
+            die(f"Q{item['question_id']} is still open: pass the answer on with `q answer {item['question_id']} ...` first")
     response = " ".join(args[2:]) or None
     conn.execute("UPDATE inbox SET status='handled', response=?, handled_at=? WHERE id=?", (response, now(), item["id"]))
     if item["kind"] in ("comment", "rating"):  # answers are logged by `q answer`, new tasks by `task add`
@@ -2511,10 +2515,12 @@ def cmd_watch(args):
             events += delivery_events(alerts)
             events += core_sync_events(alerts)
             first = False
-            for item in conn.execute("SELECT * FROM inbox WHERE status='new' ORDER BY id"):
+            waiting = conn.execute("SELECT * FROM inbox WHERE status='new' ORDER BY id").fetchall()
+            for item in waiting:
                 if item["id"] not in announced:
                     events.append(f"INBOX {inbox_summary(item)} — handle it with the inbox skill (bin/zed inbox)")
                     announced.add(item["id"])
+            announced &= {item["id"] for item in waiting}  # handled items need no remembering
             conn.commit()
             conn.close()
         except Exception as e:  # keep the watch alive through transient failures
@@ -2907,7 +2913,7 @@ def dashboard_team(conn):
     for name in emp.names():
         fields = emp.load_employee(name)[0]
         s = working.get(name)
-        people.append({"name": name, "voice": fields.get("voice"), "senior": fields.get("senior") is True or fields.get("senior") == "true",
+        people.append({"name": name, "voice": fields.get("voice"), "senior": zedassign.is_senior(fields),
                        "assignment": {k: s[k] for k in ("id", "task_id", "hat", "repo")} if s else None})
     return {"employees": people, "waits": zedassign.board(conn)["waits"]}
 

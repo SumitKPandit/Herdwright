@@ -153,6 +153,12 @@ class HireTests(ProfileCase):
         fields, _ = emp.load_employee("newbie")
         self.assertEqual((fields["senior"], fields["strengths"]), (True, ["x", "y"]))
 
+    def test_is_senior_reads_true_and_the_text_true_only(self):
+        import zedassign
+        for value, expected in ((True, True), ("true", True), ("True", True), (False, False), ("false", False), (None, False)):
+            self.assertEqual(zedassign.is_senior({"senior": value}), expected, value)
+        self.assertFalse(zedassign.is_senior({}))
+
     def test_senior_comes_from_the_card_unless_overridden(self):
         run("hire", "atlas")
         run("hire", "forge", "--no-senior")
