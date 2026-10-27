@@ -1,0 +1,7 @@
+{
+  "scripts": ["zed-pr", "zed-review", "zed-checks", "zed-employee"],
+  "skills": ["review-maintainability", "answer-peer", "finish"],
+  "deny": {"edit": ["**"], "commands": ["gh pr review", "gh pr comment", "bb pr comment"]},
+  "subagents": "none",
+  "kind": "review"
+}

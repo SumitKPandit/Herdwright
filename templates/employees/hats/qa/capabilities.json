@@ -1,0 +1,7 @@
+{
+  "scripts": ["zed-qa", "zed-checks", "zed-pr", "zed-employee"],
+  "skills": ["qa-web", "bug-report", "answer-peer", "finish"],
+  "deny": {"edit": ["**"], "commands": ["gh pr review", "gh pr comment", "bb pr comment"]},
+  "subagents": "none",
+  "kind": "qa"
+}

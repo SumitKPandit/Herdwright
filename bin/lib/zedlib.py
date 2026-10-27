@@ -115,6 +115,50 @@ def live_agents():
         return {}
 
 
+EMPLOYEE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS employees (
+  name TEXT PRIMARY KEY,
+  senior INTEGER NOT NULL DEFAULT 0,
+  hired_at TEXT NOT NULL,
+  introduced_at TEXT
+);
+"""
+# an assignment is a session: who wore which hat, how it ended, and who asked for it
+EMPLOYEE_SESSION_COLUMNS = [("employee", "TEXT"), ("hat", "TEXT"), ("verdict", "TEXT"), ("origin", "TEXT"),
+                            ("direct", "INTEGER NOT NULL DEFAULT 0")]
+
+
+def ensure_employee_schema(conn):
+    """Create the employees table and add the sessions columns assignments need. Idempotent, no behaviour change."""
+    conn.executescript(EMPLOYEE_SCHEMA)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+    for col, decl in EMPLOYEE_SESSION_COLUMNS if cols else []:  # no sessions table yet: bin/zed creates it, then calls us again
+        if col not in cols:
+            conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
+
+
+SECRET_PATTERNS = [
+    ("private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("AWS access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")),
+    ("Slack token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}")),
+    ("Atlassian token", re.compile(r"\bATATT[A-Za-z0-9_=-]{10,}")),
+    ("API key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}")),
+    ("JWT", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")),
+    ("bearer token", re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{16,}", re.I)),
+    ("credential assignment", re.compile(r"\b(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)\b"
+                                         r"[\"']?\s*[:=]\s*[\"']?[^\s\"',;]{6,}", re.I)),
+]
+
+
+def find_secret(text):
+    """Name of the first secret-looking pattern in text, else None. Credentials are never stored or sent."""
+    for name, pattern in SECRET_PATTERNS:
+        if pattern.search(text):
+            return name
+    return None
+
+
 def emit(data, as_json, render):
     """Print data as JSON, or render(data) -> lines as capped text."""
     if as_json:

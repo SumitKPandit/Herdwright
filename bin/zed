@@ -170,6 +170,7 @@ def db():
                       ("scratch", "TEXT")]:
         if col not in cols:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
+    zedlib.ensure_employee_schema(conn)
     return conn
 
 

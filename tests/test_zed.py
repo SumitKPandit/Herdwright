@@ -88,6 +88,18 @@ class ZedTests(unittest.TestCase):
         self.addCleanup(conn.close)
         columns = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)")}
         self.assertTrue({"runtime", "model", "effort", "brief", "credits", "external"} <= columns)
+        self.assertTrue({"employee", "hat", "verdict", "origin", "direct"} <= columns)
+        self.assertEqual(conn.execute("SELECT count(*) FROM employees").fetchone()[0], 0)
+        self.z.db().close()  # migrating twice is harmless
+
+    def test_employee_columns_default_to_no_employee(self):
+        conn = self.z.db()
+        self.addCleanup(conn.close)
+        conn.execute("INSERT INTO tasks (title, created_at, updated_at) VALUES ('t', 'now', 'now')")
+        conn.execute("INSERT INTO sessions (task_id, repo, base, branch, worktree, agent, created_at, updated_at) "
+                     "VALUES (1, 'r', 'b', 'br', 'w', 'a', 'now', 'now')")
+        row = conn.execute("SELECT employee, hat, verdict, origin, direct FROM sessions").fetchone()
+        self.assertEqual(tuple(row), (None, None, None, None, 0))
 
     def test_fixed_model_and_default(self):
         self.config({"order": ["copilot"], "runtimes": {"copilot": {"model": "gpt-test", "effort": "high"}}})
