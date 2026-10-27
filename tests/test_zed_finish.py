@@ -1,5 +1,8 @@
 """`zed-employee finish` (design step 3.3): the write-back an assignment ends with."""
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import _load  # noqa: F401
@@ -43,6 +46,17 @@ class AssignDb(ProfileCase):
 
 
 class FinishTests(AssignDb):
+    def checkout(self, sid):
+        """Make session `sid`'s worktree a real checkout with one commit; returns its head sha."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        git = lambda *a: subprocess.run(["git", "-C", tmp.name, *a], check=True, capture_output=True, text=True).stdout.strip()
+        git("init", "-q")
+        git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init")
+        self.conn.execute("UPDATE sessions SET worktree=? WHERE id=?", (tmp.name, sid))
+        self.conn.commit()
+        return git("rev-parse", "HEAD")
+
     def finish(self, *argv):
         if "--lesson" in argv and not {"--idea", "--no-idea"} & set(argv):  # the code-first ask is tested in test_zed_gates
             argv += ("--no-idea", "nothing here can be code")
@@ -83,6 +97,7 @@ class FinishTests(AssignDb):
 
     def test_review_and_qa_need_a_verdict_and_blockers_need_a_draft(self):
         self.seed("quill", "review")
+        sha = self.checkout(1)
         code, _, err = self.finish("-e", "quill", "--none", "x")
         self.assertEqual((code, "needs --verdict clean|blockers" in err), (1, True))
         code, _, err = self.finish("-e", "quill", "--none", "x", "--verdict", "blockers")
@@ -93,13 +108,32 @@ class FinishTests(AssignDb):
         draft.write_text("- src/a.py:3 high: fix\nverdict: blockers\n")
         code, out, err = self.finish("-e", "quill", "--none", "x", "--verdict", "blockers", "--draft", str(draft))
         self.assertEqual((code, err), (0, ""))
-        self.assertEqual(self.conn.execute("SELECT verdict FROM sessions WHERE id=1").fetchone()[0], "blockers")
+        self.assertEqual(tuple(self.conn.execute("SELECT verdict, verdict_sha FROM sessions WHERE id=1").fetchone()), ("blockers", sha))
+        placed = self.profile / "briefs" / "T20-quill-S1-findings.md"  # copied to where the hat may write and fixers look
+        self.assertEqual(placed.read_text(), draft.read_text())
         self.assertEqual(self.conn.execute("SELECT text FROM events WHERE kind='findings'").fetchone()[0],
-                         f"S1 quill review blockers: {draft.resolve()}")
+                         f"S1 quill review blockers: {placed}")
         self.assertIn("verdict blockers, findings", out)
+
+    def test_a_draft_already_in_place_is_left_alone(self):
+        self.seed("quill", "review")
+        self.checkout(1)
+        placed = self.profile / "briefs" / "T20-quill-S1-findings.md"
+        placed.parent.mkdir()
+        placed.write_text("- a.py:1 high: x\n")
+        self.assertEqual(self.finish("-e", "quill", "--none", "x", "--verdict", "blockers", "--draft", str(placed))[0], 0)
+        self.assertEqual(placed.read_text(), "- a.py:1 high: x\n")
+
+    def test_a_verdict_is_refused_when_the_head_sha_cannot_be_read(self):
+        self.seed("quill", "qa")  # its worktree /wt is not a checkout
+        code, _, err = self.finish("-e", "quill", "--none", "x", "--verdict", "clean")
+        self.assertEqual(code, 1)
+        self.assertIn("cannot read the head commit", err)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0], 0)
 
     def test_a_clean_review_needs_no_draft_and_a_build_takes_no_verdict(self):
         self.seed("quill", "qa")
+        self.checkout(1)
         self.assertEqual(self.finish("-e", "quill", "--none", "x", "--verdict", "clean")[0], 0)
         self.seed("juno", "build")
         code, _, err = self.finish("-e", "juno", "--none", "x", "--verdict", "clean")

@@ -7,6 +7,7 @@ holds the instances. No model is involved.
 import contextlib
 import json
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -319,6 +320,16 @@ def head_sha(worktree):
     return r.stdout.strip() if r.returncode == 0 else None
 
 
+def place_draft(draft, tid, name, sid):
+    """Copy a findings draft to profile/briefs/T<task>-<name>-S<session>-findings.md (where a review/qa hat may write
+    it, and where whoever fixes looks) unless it is already there; returns the path the record should name."""
+    dest = zedlib.PROFILE_DIR / "briefs" / f"T{tid}-{name}-S{sid}-findings.md"
+    if Path(draft).resolve() != dest.resolve():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(draft, dest)
+    return str(dest)
+
+
 def open_assignment(conn, name, session=None):
     """The session `finish` is about: the one named (S42 or 42), else the employee's only open one."""
     if session:
@@ -367,6 +378,9 @@ def finish(name, *, verdict=None, lessons=(), none_reason=None, draft=None, idea
                 raise FinishRefused(f"findings draft {draft} does not exist")
         elif verdict == "blockers":
             raise FinishRefused("a verdict of blockers needs --draft <findings file>: whoever fixes starts from it")
+        sha = head_sha(s["worktree"]) if verdict else None
+        if verdict and not sha:
+            raise FinishRefused(f"cannot read the head commit of {s['worktree']}: a verdict is recorded with the sha it is about")
         lessons = [x for x in lessons if x.strip()]
         if bool(lessons) == bool(none_reason):
             raise FinishRefused("give at least one --lesson \"...\", or --none \"why nothing new\" (not both)")
@@ -393,8 +407,9 @@ def finish(name, *, verdict=None, lessons=(), none_reason=None, draft=None, idea
         written = [zedmem.remember(edir, "lesson", text, f"T{tid} S{sid}", hat=hat).id for text in lessons]
         work = zedmem.remember(edir, "work", body, f"T{tid} S{sid}" + (f" {s['pr_url']}" if s["pr_url"] else ""), repo=repo, hat=hat)
         if verdict:
-            conn.execute("UPDATE sessions SET verdict=?, verdict_sha=? WHERE id=?", (verdict, head_sha(s["worktree"]), sid))
+            conn.execute("UPDATE sessions SET verdict=?, verdict_sha=? WHERE id=?", (verdict, sha, sid))
         if draft:
+            draft = place_draft(draft, tid, name, sid)
             conn.execute("INSERT INTO events(task_id, ts, kind, text) VALUES (?,?,?,?)",
                          (tid, today, "findings", f"S{sid} {name} {hat} {verdict or 'notes'}: {draft}"))
         conn.execute("INSERT INTO events(task_id, ts, kind, text) VALUES (?,?,?,?)",
