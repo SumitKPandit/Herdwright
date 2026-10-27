@@ -124,6 +124,12 @@ class HookTests(unittest.TestCase):
     def test_an_invalid_commit_format_is_refused_at_install(self):
         prof = self.r / "profile"
         (prof / "config").mkdir(parents=True)
+        for bad in ("(", ["x"]):
+            (prof / "config" / "settings.json").write_text(json.dumps({"guard": {"commit_format": bad}}))
+            env = {**os.environ, "ZED_PROFILE_DIR": str(prof)}
+            out = subprocess.run([GUARD, "install", str(self.wt)], capture_output=True, text=True, env=env)
+            self.assertEqual(out.returncode, 2, bad)
+            self.assertNotIn("Traceback", out.stderr)
         (prof / "config" / "settings.json").write_text(json.dumps({"guard": {"commit_format": "("}}))
         env = {**os.environ, "ZED_PROFILE_DIR": str(prof)}
         out = subprocess.run([GUARD, "install", str(self.wt)], capture_output=True, text=True, env=env)

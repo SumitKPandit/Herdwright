@@ -49,7 +49,7 @@ def _item(text):
 def _scalar(value):
     value = value.strip()
     if value[:1] in ('"', "'"):
-        return json.loads(value) if value[0] == '"' else value[1:-1]
+        return json.JSONDecoder().raw_decode(value)[0] if value[0] == '"' else value[1:-1]
     if m := re.match(r"\[(.*)\]\s*(?:#.*)?$", value):
         return [_item(v) for v in LIST_ITEM.findall(m.group(1)) if v.strip()]
     value = re.sub(r"\s+#.*$", "", value)

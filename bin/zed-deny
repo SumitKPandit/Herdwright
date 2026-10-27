@@ -4,7 +4,7 @@
 Runs on both runtimes (Claude Code `--settings`, Copilot `--plugin-dir`; spawn writes the files). It acts only in a
 session that has ZED_EMPLOYEE and ZED_HAT in its environment; every other session passes untouched. It reads the hook
 JSON on stdin and, to deny, writes the reason to stderr and exits 2 (both runtimes block on that and show the reason
-to the model). A parse problem or an unknown hat allows the call: a guard bug must never stop the work.
+to the model). An unknown hat allows the call (no policy); any other internal error denies it (fails closed).
 
 It denies, per the hat: edits matching `deny.edit` (`**` = nothing in the worktree), shell commands starting with a
 `deny.commands` prefix, shell writes (redirects, rm/mv/cp/tee..., sed -i) to a denied path, git writes in the worktree
@@ -33,11 +33,15 @@ def main(argv=None):
     if not (os.environ.get("ZED_EMPLOYEE") and hat):
         return 0
     try:
+        manifest = emp.load_manifest(hat)
+    except emp.EmployeeError:
+        return 0  # an unknown hat has no policy to enforce
+    try:
         payload = json.load(sys.stdin)
         worktree = os.environ.get("ZED_WORKTREE") or payload.get("cwd") or os.getcwd()
-        reason = zeddeny.decide(payload, emp.load_manifest(hat), worktree, zedlib.PROFILE_DIR)
-    except Exception:  # fail open
-        return 0
+        reason = zeddeny.decide(payload, manifest, worktree, zedlib.PROFILE_DIR)
+    except Exception as e:  # fail closed: a call the hook cannot read is not allowed
+        reason = f"the call could not be checked ({type(e).__name__}: {e}), so it is denied"
     if a.explain:
         print(f"deny: {reason}" if reason else "allow")
         return 0

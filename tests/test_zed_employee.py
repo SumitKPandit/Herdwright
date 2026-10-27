@@ -116,6 +116,7 @@ class FrontmatterTests(unittest.TestCase):
 
     def test_comments_and_missing_block(self):
         self.assertEqual(emp.parse_frontmatter("---\nruntime: auto   # the profile order\n---\n")[0], {"runtime": "auto"})
+        self.assertEqual(emp.parse_frontmatter('---\nk: "x # y" # c\n---\n')[0], {"k": "x # y"})
         self.assertEqual(emp.parse_frontmatter("no block"), ({}, "no block"))
 
 

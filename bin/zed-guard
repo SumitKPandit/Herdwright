@@ -130,6 +130,8 @@ def cmd_install(a):
     if a.base:
         patterns.append(a.base)
     try:
+        if not isinstance(rules.get("commit_format") or "", str):
+            raise re.error("must be a string")
         re.compile(rules.get("commit_format") or "")
     except re.error as e:
         print(f"zed-guard: guard.commit_format in the profile settings is not a valid regex: {e}", file=sys.stderr)

@@ -50,7 +50,10 @@ def git_target(words, cwd):
     while i < len(words):
         w = words[i]
         if w == "-C" and i + 1 < len(words):
-            target = words[i + 1] if os.path.isabs(os.path.expanduser(words[i + 1])) else str(Path(target) / words[i + 1])
+            if os.path.isabs(os.path.expanduser(words[i + 1])):
+                target = words[i + 1]
+            else:
+                target = None if target is None else str(Path(target) / words[i + 1])
             i += 2
         elif w in ("-c", "--git-dir", "--work-tree") and i + 1 < len(words):
             i += 2

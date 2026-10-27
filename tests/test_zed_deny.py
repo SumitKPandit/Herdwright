@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+from unittest import mock
 from unittest.mock import patch
 
 import _load
@@ -74,6 +75,27 @@ class DecideTests(unittest.TestCase):
             self.assertIn("denied" if "--" in command or "pushd" in command else "cannot be checked", self.bash("build", command), command)
         self.assertIsNone(self.bash("build", f"cd $D && touch {self.wt}/src/x"))  # absolute targets stay checkable
 
+    def test_git_writes_after_an_unknown_cd_are_denied_for_a_read_only_hat(self):
+        for hat in ("review", "qa"):
+            for command in ("cd $D && git commit -m x", "cd $D && git push", "cd - && git commit -m x",
+                            'cd "$(git rev-parse --show-toplevel)" && git add x', "cd $D; git add -A"):
+                self.assertIn("cannot be checked", self.bash(hat, command), (hat, command))
+            self.assertIsNone(self.bash(hat, "cd $D && git log"), hat)
+            self.assertIsNone(self.bash(hat, f"cd $D && git -C {self.evidence} commit -m x"), hat)
+        self.assertIsNone(self.bash("build", "cd $D && git commit -m x"))
+
+    def test_more_cd_spellings_move_the_cwd(self):
+        emp_dir = self.profile / "employees"
+        for command in (f"cd -P {emp_dir} && touch quill/x", f"builtin cd {emp_dir} && touch quill/x",
+                        f"command cd {emp_dir} && touch quill/x", f"cd -L -- {emp_dir} && touch quill/x"):
+            self.assertIn("denied", self.bash("build", command), command)
+        for command in ("popd && touch x", f"CDPATH={emp_dir} cd quill && touch x"):
+            self.assertIn("cannot be checked", self.bash("build", command), command)
+
+    def test_an_internal_error_denies(self):
+        with mock.patch.object(zeddeny, "shell_problem", side_effect=TypeError("boom")):
+            self.assertIn("could not be checked", self.bash("review", "git status"))
+
     def test_targets_the_shell_would_expand_cannot_be_checked(self):
         for command in ("touch $D/x", "echo hi > `pwd`/x", "touch ~root/x"):
             self.assertIn("cannot be checked", self.bash("build", command), command)
@@ -134,11 +156,11 @@ class HookScriptTests(unittest.TestCase):
             os.environ.pop("ZED_HAT", None)
             self.assertEqual(self.run_hook(plain, {})[0], 0)
 
-    def test_fail_open_on_garbage_and_unknown_hat(self):
+    def test_unknown_hat_allows_but_garbage_input_denies(self):
         env = {"ZED_EMPLOYEE": "quill", "ZED_HAT": "juggle"}
         self.assertEqual(self.run_hook({"tool_name": "Bash", "tool_input": {"command": "gh pr comment 1"}}, env)[0], 0)
-        with patch.dict(os.environ, {"ZED_EMPLOYEE": "quill", "ZED_HAT": "review"}), patch.object(sys, "stdin", io.StringIO("{oops")):
-            self.assertEqual(deny.main([]), 0)
+        with patch.dict(os.environ, {"ZED_EMPLOYEE": "quill", "ZED_HAT": "review"}), patch.object(sys, "stdin", io.StringIO("{oops")), redirect_stderr(io.StringIO()):
+            self.assertEqual(deny.main([]), 2)
 
     def test_explain_prints_the_decision(self):
         env = {"ZED_EMPLOYEE": "quill", "ZED_HAT": "review", "ZED_WORKTREE": "/nonexistent-wt"}

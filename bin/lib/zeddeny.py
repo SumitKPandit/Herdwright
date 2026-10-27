@@ -75,18 +75,23 @@ def shell_problem(cmd, manifest, worktree, profile, cwd):
         return None  # unbalanced quotes: fail open, like the other hooks
     read_only = "**" in deny["edit"]  # a hat that may not edit at all may not commit either
     for words, _ in cmds:
+        words_before = [w for w in words if re.fullmatch(r"CDPATH=.*", w)] if words else []
         while words and re.fullmatch(r"\w+=.*", words[0]):
             words = words[1:]
         if not words:
             continue
-        if Path(words[0]).name in ("cd", "pushd"):
+        if re.fullmatch(r"CDPATH=.*", words_before[0] if words_before else ""):
+            cwd = None  # `CDPATH=x cd y` may land anywhere
+        while words and Path(words[0]).name in ("builtin", "command"):
+            words = words[1:]
+        if words and Path(words[0]).name in ("cd", "pushd", "popd"):
             # follow `cd <dir> && ...` so later relative targets resolve where the shell will; a target the shell
-            # expands (`cd $X`, `cd -`) leaves the cwd unknown: later relative targets cannot be checked
-            args = [w for w in words[1:] if w != "--"]
+            # expands (`cd $X`, `cd -`, `popd`) leaves the cwd unknown: later relative targets cannot be checked
+            args = [w for w in words[1:] if w != "--" and not re.fullmatch(r"-[LPe@]+", w)]
             if args and cwd is not None and not unresolved(args[0]) and args[0] != "-":
                 d = Path(os.path.expanduser(args[0]))
                 cwd = os.path.realpath(d if d.is_absolute() else Path(cwd) / d)
-            elif args:
+            elif args or Path(words[0]).name == "popd":
                 cwd = None
             continue
         if prefix := command_denied(words, deny["commands"]):
@@ -102,6 +107,8 @@ def shell_problem(cmd, manifest, worktree, profile, cwd):
                 return f"writing {t} is denied to this hat ({pattern})"
         if name == "git" and read_only:
             sub, repo = zedshell.git_target(words, cwd)
+            if sub in zedshell.GIT_WRITE and (repo is None or unresolved(repo)):
+                return f"`git {sub}` cannot be checked (the directory is unknown): use `git -C <absolute path>`"
             if sub in zedshell.GIT_WRITE and denied_path(repo, ["**"], worktree, profile, cwd):
                 return f"`git {sub}` in the worktree is denied: this hat does not change the repo"
     return None
@@ -117,7 +124,15 @@ def edit_paths(tool_input):
 
 
 def decide(payload, manifest, worktree, profile):
-    """Reason to deny this tool call for an employee wearing the hat `manifest` describes, or None to allow it."""
+    """Reason to deny this tool call for an employee wearing the hat `manifest` describes, or None to allow it.
+    An internal error denies: a guard that cannot decide must not wave the call through."""
+    try:
+        return _decide(payload, manifest, worktree, profile)
+    except Exception as e:
+        return f"the call could not be checked ({type(e).__name__}: {e}), so it is denied"
+
+
+def _decide(payload, manifest, worktree, profile):
     tool = str(payload.get("tool_name", "")).lower()
     inp = payload.get("tool_input") or {}
     cwd = payload.get("cwd") or os.getcwd()
