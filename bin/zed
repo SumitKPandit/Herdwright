@@ -2111,6 +2111,39 @@ def cmd_hook(args):
         sys.exit(1)
 
 
+CONTEXT_FILES = ["CLAUDE.md", "playbook.md", "failure-modes.md", "profile/profile.md", "profile/lessons.md"]
+CONTEXT_BUDGET_WORDS = 9000
+
+
+def context_words():
+    """(words per always-loaded file, budget). The budget is `context_budget_words` in the profile's
+    config/settings.json (default 9000); the files are what every Zed session reads at start."""
+    files = {"CLAUDE.md": ZED_HOME / "CLAUDE.md", "playbook.md": ZED_HOME / "playbook.md",
+             "failure-modes.md": ZED_HOME / "failure-modes.md", "profile.md": PROFILE_DIR / "profile.md",
+             "lessons.md": PROFILE_DIR / "lessons.md"}
+    budget = read_json(PROFILE_DIR / "config" / "settings.json", {}).get("context_budget_words", CONTEXT_BUDGET_WORDS)
+    return {n: len(f.read_text().split()) for n, f in files.items() if f.exists()}, budget
+
+
+def context_line():
+    words, budget = context_words()
+    total = sum(words.values())
+    detail = ", ".join(f"{n} {w}" for n, w in sorted(words.items(), key=lambda kv: -kv[1]))
+    if total > budget:
+        return (f"context: OVER BUDGET, {total} words of {budget} always loaded ({detail}). Prune, or move content into a "
+                "skill that loads when needed (`learn` skill); don't grow these files")
+    return f"context: {total} of {budget} words always loaded ({detail})"
+
+
+def cmd_doctor(args):
+    """doctor [--quiet] — checks Zed's own health; for now the always-loaded context budget. Exits 1 when over."""
+    words, budget = context_words()
+    over = sum(words.values()) > budget
+    if over or "--quiet" not in args:
+        print(context_line(), file=sys.stderr if over else sys.stdout)
+    sys.exit(1 if over else 0)
+
+
 def cmd_paths(args):
     """Print where Zed's files are, for skills and scripts."""
     print(json.dumps({"home": str(ZED_HOME), "profile": str(PROFILE_DIR),
@@ -2187,6 +2220,7 @@ def cmd_start(args):
     watcher = watcher_alive()
     running = conn.execute("SELECT COUNT(*) FROM sessions WHERE status IN ('running','waiting_user')").fetchone()[0]
     out.append(f"watcher: {'alive, pid ' + str(watcher) if watcher else 'NOT RUNNING' + (' — arm it: bin/zed watch --once (background)' if running else '')}")
+    out.append(context_line())
     if quota_settings().get("threshold_tokens"):
         out.append(quota_warning() or "quota: under the configured threshold (`bin/zed quota` for detail)")
     out += notes + render_brief(conn)
@@ -2224,6 +2258,8 @@ def cmd_help(args):
                                      turn-end guard; act only in the session holding the lock
   ack <E-id>... | ack --all          retire handled watcher events; un-acked ones are shown again by `watch`
                                      (up to 3 times) and always by `start`
+  doctor [--quiet]                   check the always-loaded context budget (context_budget_words in
+                                     config/settings.json, default 9000); exits 1 when over
   quota                              estimate plan usage from session transcripts (rolling window, all Claude
                                      sessions); spawn warns past runtimes.json quota.threshold_tokens
   coordinator [routine|judgment] [--print]
@@ -2245,7 +2281,7 @@ Session states: """ + ", ".join(SESSION_STATES))
 
 COMMANDS = {"task": cmd_task, "log": cmd_log, "q": cmd_q, "spawn": cmd_spawn, "session": cmd_session,
             "close": cmd_close, "adopt": cmd_adopt, "handoff": cmd_handoff, "watch": cmd_watch, "status": cmd_status,
-            "brief": cmd_brief, "coordinator": cmd_coordinator, "quota": cmd_quota, "ack": cmd_ack, "hook": cmd_hook, "paths": cmd_paths, "start": cmd_start, "lock": cmd_lock, "runtime": cmd_runtime, "models": cmd_models, "help": cmd_help}
+            "brief": cmd_brief, "coordinator": cmd_coordinator, "quota": cmd_quota, "doctor": cmd_doctor, "ack": cmd_ack, "hook": cmd_hook, "paths": cmd_paths, "start": cmd_start, "lock": cmd_lock, "runtime": cmd_runtime, "models": cmd_models, "help": cmd_help}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:

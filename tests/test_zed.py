@@ -704,6 +704,25 @@ class ZedTests(unittest.TestCase):
         self.assertRegex(self.output.getvalue(), r"\[E1\] S1 T1 qa is idle")
         self.assertEqual(len(self.z.queue_pending()), 1)
 
+    def test_context_budget_check(self):
+        self.z.ZED_HOME = self.root / "home"
+        self.z.ZED_HOME.mkdir()
+        (self.z.ZED_HOME / "CLAUDE.md").write_text("word " * 60)
+        (self.root / "lessons.md").write_text("word " * 30)
+        words, budget = self.z.context_words()
+        self.assertEqual((words["CLAUDE.md"], words["lessons.md"], budget), (60, 30, 9000))
+        self.assertIn("94 of 9000 words", self.z.context_line())
+        (self.root / "config").mkdir(exist_ok=True)
+        (self.root / "config" / "settings.json").write_text('{"context_budget_words": 90}')
+        self.assertIn("OVER BUDGET", self.z.context_line())
+        with self.assertRaises(SystemExit) as e:
+            self.z.cmd_doctor(["--quiet"])
+        self.assertEqual(e.exception.code, 1)
+        (self.root / "config" / "settings.json").write_text('{"context_budget_words": 94}')
+        with self.assertRaises(SystemExit) as e:
+            self.z.cmd_doctor(["--quiet"])
+        self.assertEqual(e.exception.code, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -35,7 +35,12 @@ Ask: *would this be true and useful for a Zed serving someone else?*
 3. **Separate told from inferred.** Mark inferences `(inferred, unconfirmed)`; never brief a worker
    with an inference as if it were a decision.
 4. **Lessons** carry the rule, **Why**, and **How to apply**.
-5. **Prune.** If a file passes ~200 lines or mixes topics, split it and update
+5. **Mind the context budget.** `CLAUDE.md`, `profile.md`, `lessons.md`, `playbook.md` and
+   `failure-modes.md` are read at every session start, so together they have a word budget
+   (`bin/zed doctor`; `bin/zed start` shows it; the pre-commit hook fails when it is passed). When a
+   lesson would push past it, prune or merge older entries, or move the detail into a skill or a
+   `knowledge/` file that is loaded only when needed, leaving a one-line pointer behind.
+6. **Prune.** If a file passes ~200 lines or mixes topics, split it and update
    `profile/knowledge/README.md`.
 
 ## 3. Commit
