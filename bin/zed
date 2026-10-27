@@ -1509,6 +1509,7 @@ BLOCK_END = re.compile(r"^(```|[─━╭╰❯⏵✻✢✽]|.*\bAIC used\b|.*\b
 BLOCK_MAX_LINES = 80           # a marker with more text than this after it is old output, not a final report
 DONE_FIELDS = ("Summary", "Branch", "PR", "QA", "Follow-ups", "Learnings")
 NO_QA = re.compile(r"^\W*(none|n/?a|not (run|done|tested)|skipped|no qa|-)?\W*$", re.I)
+WORKING_SCAN = 10              # seconds between looks at a working worker's screen for a new ZED block
 LAPSE_GRACE = 30               # seconds a worker must stay idle without a ZED block before it is nudged
 LAPSE_NUDGE = "Continue, or end with ZED:QUESTION / ZED:DONE / ZED:BLOCKED."
 
@@ -1622,6 +1623,28 @@ def settle_turn(conn, s, screen, alerts, line, seq):
     if not young:
         seen["lapse"] = {"seq": seq, "since": time.time()}
     return None
+
+
+def scan_working(conn, s, alerts):
+    """A worker can print a ZED block and keep working (e.g. it waits on a background workflow), so the turn
+    never ends and no idle/done event fires. Every WORKING_SCAN seconds look at the screen of working workers;
+    a block that differs from the last one seen and is unchanged since the previous scan (so not half-printed)
+    is recorded and returned as an event."""
+    seen = alerts.setdefault(s["id"], {})
+    if time.time() - seen.get("scan_at", 0) < WORKING_SCAN:
+        return None
+    seen["scan_at"] = time.time()
+    block = parse_block(read_screen(s["agent"], "recent-unwrapped", 150))
+    if not block or block["fingerprint"] == seen.get("block"):
+        seen.pop("pending", None)
+        return None
+    if seen.get("pending") != block["fingerprint"]:
+        seen["pending"] = block["fingerprint"]
+        return None
+    seen["block"], seen["nudges"] = block["fingerprint"], 0
+    seen.pop("pending")
+    seen.pop("lapse", None)
+    return f"S{s['id']} T{s['task_id']} {s['agent']} · new ZED:{block['kind']} while still working\n{record_block(conn, s, block)}"
 
 
 def lapse_tick(s, state, seq, alerts):
@@ -1744,6 +1767,8 @@ def cmd_watch(args):
                     if line:
                         events.append(line)
                     prev[key] = snapshot
+                if state == "working" and (line := scan_working(conn, s, alerts)):
+                    events.append(line)
                 lapse = lapse_tick(s, state, snapshot["sequence"], alerts)
                 if lapse:
                     kind, text = lapse

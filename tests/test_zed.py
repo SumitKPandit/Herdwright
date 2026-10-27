@@ -590,6 +590,42 @@ class ZedTests(unittest.TestCase):
             "except BlockingIOError: sys.exit(7)"), str(self.z.WATCHER_LOCK_PATH)])
         self.assertEqual(other.returncode, 7)  # another process can't claim it
 
+    def test_block_printed_while_still_working_is_reported_once(self):
+        """S19 printed a ZED:QUESTION and stayed 'working' (waiting on a background workflow)."""
+        conn = self.session()
+        s = conn.execute("SELECT * FROM sessions").fetchone()
+        alerts = {}
+        question = "ZED:QUESTION\n1. Which greeting?"
+        with patch.object(self.z, "WORKING_SCAN", 0), patch.object(self.z, "read_screen") as screen:
+            screen.return_value = "ZED:QUESTION\n1. Which gr"  # half printed
+            self.assertIsNone(self.z.scan_working(conn, s, alerts))
+            screen.return_value = question
+            self.assertIsNone(self.z.scan_working(conn, s, alerts))  # changed since last look: wait for it to settle
+            line = self.z.scan_working(conn, s, alerts)
+            self.assertIn("new ZED:QUESTION while still working", line)
+            self.assertIn("Q1: Which greeting?", line)
+            self.assertIsNone(self.z.scan_working(conn, s, alerts))  # same block: not reported again
+            self.assertIsNone(self.z.scan_working(conn, s, alerts))
+            screen.return_value = "just working output"
+            self.assertIsNone(self.z.scan_working(conn, s, alerts))
+        with patch.object(self.z, "read_screen", return_value="ZED:QUESTION\n1. Another?"):
+            self.assertIsNone(self.z.scan_working(conn, s, alerts))  # throttled by WORKING_SCAN
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0], 1)
+
+    def test_watch_reports_a_block_from_a_working_worker(self):
+        conn = self.session()
+        conn.execute("UPDATE sessions SET created_at=?", (self.z.now(),))  # recent: no STALL event
+        conn.commit()
+        agent = {"agent_status": "working", "state_change_seq": 3}
+        with patch.object(self.z, "require_lock"), patch.object(self.z, "holds_lock", return_value=True), \
+                patch.object(self.z, "claim_watcher", return_value=True), patch.object(self.z, "WORKING_SCAN", 0), \
+                patch.object(self.z, "live_agents", return_value={"qa:p1": agent}), \
+                patch.object(self.z, "read_screen", return_value="ZED:BLOCKED\nNeed a login"), \
+                patch.object(self.z.time, "sleep"):
+            self.z.cmd_watch(["--once", "0.01"])
+        self.assertIn("new ZED:BLOCKED while still working", self.output.getvalue())
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
