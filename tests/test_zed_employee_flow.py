@@ -70,7 +70,7 @@ class PilotFlow(AssignCase):
         # 4. the fix is a build whose first prompt names the findings; Juno ranks first (they built it)
         self.assertEqual(run("suggest", "T20", "--hat", "build")[1].splitlines()[1].split()[1], "juno")
         fix = self.assignment("juno", "build")
-        self.assertIn(str(draft.resolve()), self.mock_prompt_worker.call_args.args[1])
+        self.assertIn(str(self.profile / "briefs" / "T20-quill-S2-findings.md"), self.mock_prompt_worker.call_args.args[1])
         self.end(fix, "--lesson", "Start a fix from the findings draft, one plan step per finding.")
 
         # 5. the author set only grows: Quill (never an author) re-reviews and QAs
