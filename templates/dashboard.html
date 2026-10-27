@@ -112,6 +112,7 @@ a { color: var(--link); }
 .sent { margin: .35rem 0; font-size: .875rem; overflow-wrap: anywhere; }
 
 .fb { display: grid; gap: .5rem; margin-top: .75rem; }
+.fb.flush { margin-top: 0; }
 .fb label { display: grid; gap: .25rem; font-size: .875rem; }
 .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: .5rem; }
 .row { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem .75rem; }
@@ -160,11 +161,12 @@ button:disabled { cursor: progress; opacity: .65; }
         <h2 id="team-h">Team</h2>
         <p class="dim" id="team-empty">No employees hired yet.</p>
         <ul class="items" id="team-list"></ul>
+        <h3 id="waits-h" hidden>Waiting for someone</h3>
         <ul class="items" id="team-waits"></ul>
       </section>
       <section class="panel" id="new-task" aria-labelledby="n-h">
         <h2 id="n-h">New task</h2>
-        <form class="fb" data-kind="task" style="margin-top:0">
+        <form class="fb flush" data-kind="task">
           <label><span>What should Zed get done?</span><input type="text" name="title" required maxlength="200"></label>
           <label><span>Details <span class="hint">(optional)</span></span><textarea name="text" rows="3"></textarea></label>
           <div class="two">
@@ -405,6 +407,7 @@ function renderTeam(team) {
   $('#team-empty').hidden = team.employees.length > 0;
   setHtml($('#team-list'), html`${team.employees.map(e => html`<li><strong>${e.name}</strong>${e.senior ? ' (senior)' : ''}
     ${e.assignment ? html`<span class="dim">on T${e.assignment.task_id} · ${e.assignment.hat} · ${e.assignment.repo}</span>` : badge('ok', 'free')}</li>`)}`);
+  $('#waits-h').hidden = team.waits.length === 0;
   setHtml($('#team-waits'), html`${team.waits.map(w => html`<li><span class="chip">T${w.task}</span> ${WAIT[w.kind] || w.kind}
     ${w.may.length ? html`<span class="dim">· could be: ${w.may.join(', ')}</span>` : ''}</li>`)}`);
 }
