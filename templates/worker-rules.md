@@ -55,6 +55,11 @@ waste stops everyone.
   scope rather than pasting large context; start sub-agents only for independent, parallel work.
 - **Keep work resumable.** Record progress in files as you go, so a pause or handoff never repeats
   work.
+- **Fan out sparingly.** Use a workflow or sub-agents only for many independent units of work, at most
+  4 at once, and never for mechanical steps (a script does those). Each one resends context.
+- **Start fresh for an unrelated task.** If you are asked to switch to unrelated work, finish or record
+  where you are and tell Zed (`ZED:QUESTION`); Zed restarts you fresh instead of carrying a long
+  context along.
 - **Report progress in output, not activity.** If a step is taking far longer than it should, stop
   and tell Zed why instead of grinding on.
 
