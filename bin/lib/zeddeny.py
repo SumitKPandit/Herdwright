@@ -79,11 +79,15 @@ def shell_problem(cmd, manifest, worktree, profile, cwd):
             words = words[1:]
         if not words:
             continue
-        if Path(words[0]).name == "cd":
-            # follow `cd <dir> && ...` so later relative targets resolve where the shell will; `cd` with no usable
-            # argument (`cd`, `cd -`, `cd $X`) leaves the guess unchanged
-            if len(words) > 1 and not unresolved(words[1]) and words[1] != "-":
-                cwd = os.path.realpath(Path(os.path.expanduser(words[1])) if Path(os.path.expanduser(words[1])).is_absolute() else Path(cwd) / words[1])
+        if Path(words[0]).name in ("cd", "pushd"):
+            # follow `cd <dir> && ...` so later relative targets resolve where the shell will; a target the shell
+            # expands (`cd $X`, `cd -`) leaves the cwd unknown: later relative targets cannot be checked
+            args = [w for w in words[1:] if w != "--"]
+            if args and cwd is not None and not unresolved(args[0]) and args[0] != "-":
+                d = Path(os.path.expanduser(args[0]))
+                cwd = os.path.realpath(d if d.is_absolute() else Path(cwd) / d)
+            elif args:
+                cwd = None
             continue
         if prefix := command_denied(words, deny["commands"]):
             return f"`{prefix}` is denied to this hat: anything outward goes to Zed as a draft"
@@ -92,8 +96,8 @@ def shell_problem(cmd, manifest, worktree, profile, cwd):
         if name in zedshell.FILE_WRITERS or (name in ("sed", "perl") and any(re.fullmatch(r"-\w*i\w*", w) for w in words[1:])):
             targets += [w for w in words[1:] if not w.startswith("-")]
         for t in targets:
-            if unresolved(t):
-                return f"writing {t} cannot be checked (the shell expands it): use a literal absolute path"
+            if unresolved(t) or (cwd is None and not (Path(os.path.expanduser(t)).is_absolute())):
+                return f"writing {t} cannot be checked (the shell expands it or the directory is unknown): use a literal absolute path"
             if pattern := denied_path(t, patterns, worktree, profile, cwd):
                 return f"writing {t} is denied to this hat ({pattern})"
         if name == "git" and read_only:

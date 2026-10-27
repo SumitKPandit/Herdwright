@@ -67,6 +67,13 @@ class DecideTests(unittest.TestCase):
         self.assertIn("denied", self.bash("review", f"cd {self.evidence} && cd {self.wt}/src && touch x"))
         self.assertIsNone(self.bash("build", "cd src && touch x"))
 
+    def test_a_cd_the_shell_expands_leaves_relative_targets_unchecked(self):
+        emp_dir = self.profile / "employees"
+        for command in (f"cd $D && touch x", f"D={emp_dir}/quill; cd $D && touch x", f'cd "$E" && touch x',
+                        f"cd -- {emp_dir} && touch quill/x", f"pushd {emp_dir} && touch quill/x", "cd - && touch x"):
+            self.assertIn("denied" if "--" in command or "pushd" in command else "cannot be checked", self.bash("build", command), command)
+        self.assertIsNone(self.bash("build", f"cd $D && touch {self.wt}/src/x"))  # absolute targets stay checkable
+
     def test_targets_the_shell_would_expand_cannot_be_checked(self):
         for command in ("touch $D/x", "echo hi > `pwd`/x", "touch ~root/x"):
             self.assertIn("cannot be checked", self.bash("build", command), command)

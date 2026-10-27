@@ -121,6 +121,15 @@ class HookTests(unittest.TestCase):
             r = self.commit(f"TKT#8: on {branch}", f"{branch}.txt")
             self.assertIn(f"protected branch '{branch}'", r.stderr)
 
+    def test_an_invalid_commit_format_is_refused_at_install(self):
+        prof = self.r / "profile"
+        (prof / "config").mkdir(parents=True)
+        (prof / "config" / "settings.json").write_text(json.dumps({"guard": {"commit_format": "("}}))
+        env = {**os.environ, "ZED_PROFILE_DIR": str(prof)}
+        out = subprocess.run([GUARD, "install", str(self.wt)], capture_output=True, text=True, env=env)
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("not a valid regex", out.stderr)
+
     def test_empty_commit_message_file_is_a_readable_refusal(self):
         self.install("--jira", "ABC-9")
         empty = self.r / "msg"

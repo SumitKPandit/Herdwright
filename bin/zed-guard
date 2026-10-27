@@ -59,7 +59,7 @@ def commit_message_problem(first_line, jira=None, enforce=True, pattern=None, ex
     if prefix and not first_line.startswith(prefix):
         return f"commit message must start with '{prefix}' (rule: `JIRA-ID | Description`), got: {first_line!r}"
     if not prefix and not re.match(pattern or GENERIC_COMMIT, first_line):
-        return f"commit message must read 'JIRA-ID | Description' (e.g. {example or 'ABC-123 | Add the thing'}), got: {first_line!r}"
+        return f"commit message must match the commit format (e.g. {example or 'ABC-123 | Add the thing'}), got: {first_line!r}"
     return None
 
 
@@ -129,6 +129,11 @@ def cmd_install(a):
         patterns += list((zedlib.projects().get(a.repo) or {}).get("branches") or {})
     if a.base:
         patterns.append(a.base)
+    try:
+        re.compile(rules.get("commit_format") or "")
+    except re.error as e:
+        print(f"zed-guard: guard.commit_format in the profile settings is not a valid regex: {e}", file=sys.stderr)
+        return 2
     prev = effective_hooks_path(wt)
     d = hook_dir(wt)
     if str(d) == prev:

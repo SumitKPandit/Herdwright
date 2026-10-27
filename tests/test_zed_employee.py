@@ -110,7 +110,7 @@ class FrontmatterTests(unittest.TestCase):
         self.assertEqual(body, "# X")
 
     def test_list_items_with_commas_and_brackets_roundtrip(self):
-        fields = {"strengths": ["fast, careful", "uses [x]", 'says "no"', "plain", "# tag"], "none": []}
+        fields = {"strengths": ["fast, careful", "uses [x]", 'says "no"', "plain", "# tag", "a # b", "a #b"], "none": []}
         parsed, _ = emp.parse_frontmatter(emp.render_frontmatter(fields) + "# X\n")
         self.assertEqual(parsed, fields)
 

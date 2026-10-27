@@ -1,6 +1,6 @@
 """Employee memory: a strict markdown format that scripts can parse, verify, sort and cap without a model.
 
-Design: docs/design/employees.md (branch design/zed-employees), section 5. An employee's memory lives in
+Design: docs/design/employees.md, section 5. An employee's memory lives in
 profile/employees/<name>/memory/:
 
     craft/<hat>.md, craft/general.md   lessons (how to wear a hat, or work, better)

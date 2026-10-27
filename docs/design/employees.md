@@ -1,14 +1,10 @@
-# Design: a team of named, persistent employees (T18, revision 3)
+# Design: a team of named, persistent employees
 
-Status: proposal for the user's review. Nothing here is built.
-Revision 3 makes every employee a generalist: any of the six can do any kind of work (section 2). Revision 2
-(`9ce5874`) is in git history.
-Citations (`bin/zed:N`, `CLAUDE.md:N`, ...) are to core on the profile branch (`profile/sumit`), unchanged since
-`2020c17` (checked: no diff in `bin/`, `templates/`, `CLAUDE.md`, `playbook.md`, `.claude/`). They are newer than the
-`main` this branch was cut from (`main` lacks directive 9 and most `bin/zed-*` helpers). Citations of the form
-`profile/config/...` are to the user's profile. Firstmate facts come from `docs/research/firstmate-learnings.md`
-(branch `research/firstmate-learnings`) and a shallow read of github.com/kunchenguid/firstmate, read as data and
-not run.
+Status: design record; the pilot is described in section 11.
+Every employee is a generalist: any of them can do any kind of work (section 2).
+Citations (`bin/zed:N`, `CLAUDE.md:N`, ...) are to core at the time of writing and may drift; citations of the form
+`profile/config/...` are to the user's profile.
+
 
 ## 0. What changed from revision 2
 
@@ -28,7 +24,7 @@ neutrality, the capability order, no budgets, nobody retires.
 
 ## 1. What this is
 
-The user's idea (verbatim in `bin/zed task show T18`): Zed as team lead of **named employees** with
+The user's idea (as the user first put it): Zed as team lead of **named employees** with
 persistent identity and memory; they differ from today's ephemeral workers; they may start ephemeral
 subagents; Zed talks to them; they collaborate 1:1 or in groups; Zed keeps them productive and efficient.
 
@@ -120,7 +116,7 @@ a dependency can go to different employees at once. Zed turns each unit into a b
 ### How work moves (a typical story)
 
 ```
-Zed writes the brief; `zed-employee suggest T20 --hat build` ranks the free employees; Zed assigns
+Zed writes the brief; `zed-employee suggest <task> --hat build` ranks the free employees; Zed assigns
   [large/ambiguous]  design  (a senior first)  -> plan with build units -> Zed assigns each unit
   build   anyone free                          -> branch + draft PR; the author is now free
   review  anyone free except the author(s)     ┐ may run together, read-only
@@ -349,19 +345,19 @@ model. Five kinds:
 | kind | holds | needs | goes stale |
 |---|---|---|---|
 | `fact` | how a repo or system works | `src` (file path + `anchor` string, or URL) | when the anchor is gone, or after `ttl` (default 60 d) |
-| `preference` | what the user or team wants | `src` naming a decision (`decision T7 E12`, PR URL) | after `ttl` (default 180 d) |
+| `preference` | what the user or team wants | `src` naming a decision (a decision, PR URL) | after `ttl` (default 180 d) |
 | `lesson` | how to wear a hat better, or work better generally; stored in `craft/<hat>.md` or `craft/general.md` | `src` (the assignment that taught it) | never; pruned by low `uses` |
 | `work` | what the employee did: task, **hat**, branch, PR, outcome, what was tricky | written by `zed-employee finish` **from the DB and plan, no model**; the employee may add one line | `ttl` 180 d, then archived |
 | `heard` | something learned from a peer or from Zed that the employee did not verify | `src: msg #<id>` | `ttl` 30 d unless confirmed (`refresh` upgrades it to a `fact` with an anchor) |
 
-Example, `profile/employees/quill/memory/repos/unified-mention.md` (a `work` entry names its hat, so `suggest` can count familiarity per repo and per hat):
+Example, `profile/employees/quill/memory/repos/example-app.md` (a `work` entry names its hat, so `suggest` can count familiarity per repo and per hat):
 
 ```markdown
 - [m-0007] fact | 2026-10-20 | tags: auth,views | src: app/auth/guard.py anchor: "def require_role" | verified: 2026-10-27 | ttl: 60d | uses: 4
   Role checks live in `guard.py`, not in views. A view that skips `require_role` is a finding.
-- [m-0011] preference | 2026-10-22 | tags: prs | src: decision T17 E41 | verified: 2026-10-22 | ttl: 180d | uses: 2
+- [m-0011] preference | 2026-10-22 | tags: prs | src: decision, PR URL | verified: 2026-10-22 | ttl: 180d | uses: 2
   The user wants approval only when there are no blockers, otherwise a short list of blockers.
-- [m-0014] work | 2026-10-26 | tags: auth | hat: review | src: T17 S31 PR#512 | ttl: 180d | uses: 0
+- [m-0014] work | 2026-10-26 | tags: auth | hat: review | src: PR#512 | ttl: 180d | uses: 0
   Reviewed PR#512 (role guard refactor): two findings, both about error paths; author fixed in one round.
 ```
 
@@ -420,14 +416,14 @@ of a repo's assignments over 30 days, so familiarity cannot quietly turn into sp
 ### The assignment
 
 ```
-Zed: bin/zed spawn T20 ... employee=quill hat=review tags=auth,views origin=zed   (alias: bin/zed assign quill T20 ...)
+Zed: bin/zed spawn <task> ... employee=quill hat=review tags=auth,views origin=zed   (alias: bin/zed assign quill <task> ...)
   1. checks: employee exists; no other open session for them (else queued); capacity (`require_capacity`,
      bin/zed:530); hat is known; hard rule (review/qa refused for an author of the task/branch);
      one writer: a `build` is refused while any other session is open on the worktree, and any session is
      refused while a `build` is open on it
   2. bin/zed-employee verify --repo <repo>      # cheap local git; marks entries ok / stale / expired
-  3. bin/zed-employee pack quill --repo <repo> --hat review --tags auth,views --session S42
-       -> profile/.cache/employees/quill/S42-pack.md   (budget: memory_words ≈ 2-3k tokens)
+  3. bin/zed-employee pack quill --repo <repo> --hat review --tags auth,views --session <session>
+       -> profile/.cache/employees/quill/<session>-pack.md   (budget: memory_words ≈ 2-3k tokens)
   4. spawn as today (bin/zed:1259), plus: agent name quill-t20; sessions.employee='quill', sessions.hat='review';
      ZED_EMPLOYEE and ZED_HAT env; hat charter and employee rules appended to the worker rules; the hat's `deny`
      rendered for the chosen runtime (R2); first prompt names the charter, voice, pack, inbox, the findings of
@@ -461,7 +457,7 @@ someone who is not an author, **including the previous fixer**: the author set g
 
 An employee that goes wrong is repaired, not removed. The loop, all deterministic until the last step:
 
-1. **Signal**: a flag (section 8) or the user's complaint. 2. `zed-employee postmortem S42` prints the evidence
+1. **Signal**: a flag (section 8) or the user's complaint. 2. `zed-employee postmortem <session>` prints the evidence
 bundle: the pack ids that session used and their text, the hat, the entries cited in any send-back, the plan
 timeline, the messages sent, the `finish` output. 3. Zed (the model) decides the repair from that bundle, which is
 one of: `drop`/amend a memory entry with a reason; add a `lesson` from the failure (to the hat's `craft` file); tighten
@@ -600,7 +596,7 @@ New, all script-side:
 Model judgement remains for: confirming who takes a new assignment (`zed-employee suggest` ranks the free employees; Zed confirms), reading a flagged pack or thread, and choosing a repair.
 
 **Not measured, a hypothesis for the pilot:** that the pack (about 2-3k tokens read once, plus 0-5 memory
-writes) costs less than the re-derivation it saves. The pilot (section 11) compares against T17's recorded
+writes) costs less than the re-derivation it saves. The pilot (section 11) compares against a recorded
 sessions in `db/spend.jsonl`.
 
 ## 9. Onboarding and introductions
@@ -651,7 +647,7 @@ later step depends on them.
 | 1 | **Capability scripts** | M-L | an ordinary worker can use each script; tests green |
 | 2 | **Record + memory** | L | memory format validated; pack deterministic in tests |
 | 3 | **Assignment with hats** | M-L | a Juno build, a Quill review and a Juno-or-Quill qa run end to end on both runtimes (or queue with the stated fallback) |
-| 4 | **Pilot, phase A** (about a week, at least 4 assignments per employee across all three hats, no messaging) | M | measured against the T17 baseline |
+| 4 | **Pilot, phase A** (about a week, at least 4 assignments per employee across all three hats, no messaging) | M | measured against the recorded baseline |
 | 5 | **Messaging and direct chat**: tables, `msg`, limits, doorbell, step-boundary inbox, `talk`, `start` mail line | L | Phase B exchange works; no thread hits `needs_zed` |
 | 6 | **Oversight**: `report`, flags, digest line, `postmortem`, `ideas.md`, failure-modes rows | M | flags fire on seeded bad data in tests |
 | 7 | **Rest of the team and the `design` hat**: Scout, Atlas, Forge, Pip hired; `design` template and `zed-plan split` skill; onboarding skill, `CLAUDE.md`, `profile.template/` | M | each employee has passed one real assignment under two hats; one design assignment produced a plan Zed split into briefs |
@@ -719,12 +715,12 @@ is decision 12 in section 12 (Q2 there), not a new question.
 - **Build (either):** takes ordinary stories and bugs on a repo with good tests. Success is checkable from data:
   send-backs per task fewer than comparable T-sessions in `spend.jsonl`; tokens per plan step at or below baseline;
   memory `uses` over 40% of packed entries after 5 assignments.
-- **Review (either, on the other's PRs and, separately, unapproved PRs reusing T17's work):** drafts only; never
+- **Review (either, on the other's PRs and, separately, unapproved PRs reusing earlier work):** drafts only; never
   posts (deny rule). Success: findings per review that the author accepted; `zed-review check-draft` passes first
-  time; tokens per plan step at or below T17's.
+  time; tokens per plan step at or below the baseline.
 - **QA (either, on the other's branches):** `zed-qa report-check` passes first time; defects found that the author's
   own pass missed (count, compared with tasks QA'd by the author alone).
-- **Phase A (solo, about a week):** no messaging. Measure the above against T17 and recent worker baselines in
+- **Phase A (solo, about a week):** no messaging. Measure the above against the baseline and recent worker baselines in
   `db/spend.jsonl`.
 - **Phase B (collaborative):** turn on `msg`. Planned exchanges: the `review` assignment asks the author what a change was meant
   to do (`ask`, needs a sentence); `findings` go to the thread and Zed starts the fix assignment from them (no Zed
