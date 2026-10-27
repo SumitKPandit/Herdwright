@@ -285,6 +285,9 @@ class RenderedPolicyTests(AssignCase):
             self.assertIn(f"--deny-tool=shell({prefix})", copilot)
         hooks = json.loads((kit["copilot_plugin"] / "hooks" / "hooks.json").read_text())
         self.assertEqual(hooks["hooks"]["PreToolUse"][0]["bash"], str(HOME / "bin" / "zed-deny"))
+        self.assertEqual(hooks["hooks"]["Stop"][0]["bash"], f"{HOME / 'bin' / 'zed-employee'} stop-guard")
+        settings = json.loads(kit["claude_settings"].read_text())
+        self.assertEqual(settings["hooks"]["Stop"][0]["hooks"][0]["command"], f"{HOME / 'bin' / 'zed-employee'} stop-guard")
         self.assertEqual(json.loads((kit["copilot_plugin"] / "plugin.json").read_text())["name"], "zed-deny")
         self.assertIn("ZED_HAT=review", env)
 

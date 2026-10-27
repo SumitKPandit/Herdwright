@@ -177,9 +177,14 @@ def hook_command(zed_home):
     return str(Path(zed_home) / "bin" / "zed-deny")
 
 
+def stop_command(zed_home):
+    return f"{Path(zed_home) / 'bin' / 'zed-employee'} stop-guard"
+
+
 def claude_settings(zed_home):
     """Contents of the per-session `claude --settings` file (additive to the project's own settings)."""
-    return {"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": hook_command(zed_home), "timeout": 10}]}]}}
+    return {"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": hook_command(zed_home), "timeout": 10}]}],
+                      "Stop": [{"hooks": [{"type": "command", "command": stop_command(zed_home), "timeout": 10}]}]}}
 
 
 def copilot_plugin(directory, zed_home, name="zed-deny"):
@@ -187,7 +192,8 @@ def copilot_plugin(directory, zed_home, name="zed-deny"):
     directory = Path(directory)
     (directory / "hooks").mkdir(parents=True, exist_ok=True)
     (directory / "plugin.json").write_text(json.dumps({"name": name, "version": "1.0.0", "description": "Zed hat deny policy"}, indent=2) + "\n")
-    hooks = {"version": 1, "hooks": {"PreToolUse": [{"type": "command", "bash": hook_command(zed_home), "timeoutSec": 10}]}}
+    hooks = {"version": 1, "hooks": {"PreToolUse": [{"type": "command", "bash": hook_command(zed_home), "timeoutSec": 10}],
+                                     "Stop": [{"type": "command", "bash": stop_command(zed_home), "timeoutSec": 10}]}}
     (directory / "hooks" / "hooks.json").write_text(json.dumps(hooks, indent=2) + "\n")
     return directory
 

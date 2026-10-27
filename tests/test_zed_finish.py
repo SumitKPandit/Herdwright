@@ -1,5 +1,9 @@
 """`zed-employee finish` (design step 3.3): the write-back an assignment ends with."""
+import io
+import json
+import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -43,6 +47,39 @@ class AssignDb(ProfileCase):
              created or f"2026-10-2{self.n % 10} 09:00", "x"))
         self.conn.commit()
         return self.n
+
+
+class StopGuardTests(AssignDb):
+    def stop(self, payload=None, env=None):
+        env = {"ZED_EMPLOYEE": "juno", "ZED_SESSION": "S1"} if env is None else env
+        with patch.dict(os.environ, env), patch.object(sys, "stdin", io.StringIO(json.dumps(payload or {}))):
+            return run("stop-guard")
+
+    def report_done(self):
+        log = self.profile / ".cache" / "status" / "S1.log"
+        log.parent.mkdir(parents=True)
+        log.write_text("needs-decision: x\ndone: built; pr=none; qa=ran it\n")
+
+    def test_a_turn_that_reported_done_without_finish_is_blocked_and_after_finish_it_is_not(self):
+        self.seed("juno", "build")
+        self.assertEqual(self.stop(), (0, "", ""))  # nothing reported yet
+        self.report_done()
+        code, out, _ = self.stop()
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["decision"], "block")
+        self.assertIn("zed-employee finish", json.loads(out)["reason"])
+        self.assertEqual(run("finish", "-e", "juno", "--none", "nothing new")[0], 0)
+        self.assertEqual(self.stop(), (0, "", ""))
+
+    def test_a_second_stop_in_a_row_and_a_session_without_an_employee_pass(self):
+        self.seed("juno", "build")
+        self.report_done()
+        self.assertEqual(self.stop({"stop_hook_active": True})[1], "")
+        self.assertEqual(self.stop(env={"ZED_SESSION": "S1"})[1], "")
+
+    def test_a_broken_input_fails_open(self):
+        with patch.dict(os.environ, {"ZED_EMPLOYEE": "juno", "ZED_SESSION": "S1"}), patch.object(sys, "stdin", io.StringIO("not json")):
+            self.assertEqual(run("stop-guard"), (0, "", ""))
 
 
 class FinishTests(AssignDb):

@@ -320,6 +320,23 @@ def head_sha(worktree):
     return r.stdout.strip() if r.returncode == 0 else None
 
 
+def stop_problem(session=None, name=None):
+    """Why a worker's turn may not end yet: it has reported `done:` in its status file but has not run `finish`
+    (the status file is the one report both runtimes' workers write before ZED:DONE). None when it may stop.
+    Fails open when the session or its files cannot be read: a hook must never wedge a turn."""
+    sid = str(session or "").lstrip("S")
+    if not (name and sid.isdigit()):
+        return None
+    log = zedlib.PROFILE_DIR / ".cache" / "status" / f"S{sid}.log"
+    if not log.is_file() or not re.search(r"^done:", log.read_text(errors="replace"), re.M):
+        return None
+    with database() as conn:
+        if conn.execute("SELECT 1 FROM events WHERE kind='finish' AND text LIKE ?", (f"S{sid} %",)).fetchone():
+            return None
+    return (f"S{sid} reported done but `zed-employee finish` has not run: run it (it writes back what you learned and "
+            "the verdict's head sha), then print your ZED:DONE block")
+
+
 def place_draft(draft, tid, name, sid):
     """Copy a findings draft to profile/briefs/T<task>-<name>-S<session>-findings.md (where a review/qa hat may write
     it, and where whoever fixes looks) unless it is already there; returns the path the record should name."""

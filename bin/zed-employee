@@ -35,9 +35,14 @@ Usage
   zed-employee board [--json]
       who is free, and what waits (new tasks, builds lacking a review or qa verdict, fixes) with who may take each
 
+  zed-employee stop-guard
+      the worker's Stop hook (spawn renders it for both runtimes): blocks the end of a turn that reported `done:` in
+      its status file without having run `finish`; reads the hook JSON on stdin; prints {"decision":"block",...}
+
 Exit codes: 0 ok · 1 refused (the reason is printed) · 2 usage or unknown employee/hat
 """
 import argparse
+import json
 import os
 import re
 import sys
@@ -145,6 +150,21 @@ def cmd_finish(args):
     print("\n".join(emp.finish(employee_name(args), verdict=args.verdict, lessons=args.lesson, none_reason=args.none,
                                draft=args.draft, ideas=args.idea, note=args.note,
                                session=args.session or os.environ.get("ZED_SESSION"))))
+
+
+def cmd_stop_guard(args):
+    """Block the end of a turn that reported done without `finish`. A second Stop in a row (stop_hook_active) is let
+    through, so a worker that cannot finish is never stuck: the done path still flags it to Zed."""
+    try:
+        payload = json.load(sys.stdin)
+        if payload.get("stop_hook_active") or not os.environ.get("ZED_EMPLOYEE"):
+            return 0
+        reason = emp.stop_problem(os.environ.get("ZED_SESSION"), os.environ["ZED_EMPLOYEE"])
+    except Exception:  # noqa: BLE001 - fail open
+        return 0
+    if reason:
+        print(json.dumps({"decision": "block", "reason": reason}))
+    return 0
 
 
 def task_id(text):
@@ -263,6 +283,7 @@ def build_parser():
     s = add("board", cmd_board)
     s.add_argument("--json", action="store_true")
     s.add_argument("--brief", action="store_true", help="exit 1 when something waits (what `bin/zed start` shows)")
+    add("stop-guard", cmd_stop_guard)
     s = add("finish", cmd_finish)
     emp_arg(s)
     s.add_argument("--verdict", choices=emp.VERDICTS)
