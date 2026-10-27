@@ -16,5 +16,24 @@
       "Bash(gh pr list:*)",
       "Bash(gh pr view:*)"
     ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/bin/zed hook stop-guard",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/bin/zed hook arm",
+            "asyncRewake": true,
+            "timeout": 28800
+          }
+        ]
+      }
+    ]
   }
 }

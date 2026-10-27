@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -419,7 +420,8 @@ class ZedTests(unittest.TestCase):
         self.assertIn("watcher: NOT RUNNING", self.output.getvalue())
 
     def test_second_watcher_is_refused(self):
-        with patch.object(self.z, "require_lock"), patch.object(self.z, "watcher_alive", return_value=999):
+        with patch.object(self.z, "require_lock"), patch.object(self.z, "claim_watcher", return_value=False), \
+                patch.object(self.z, "watcher_alive", return_value=999):
             with self.assertRaises(SystemExit) as e:
                 self.z.cmd_watch(["--once"])
         self.assertEqual(e.exception.code, 4)
@@ -532,6 +534,61 @@ class ZedTests(unittest.TestCase):
         conn.execute("UPDATE sessions SET external=1")
         self.z.record_spend(conn, conn.execute("SELECT * FROM sessions").fetchone())
         self.assertEqual(len(self.z.spend_rows()), 1)  # external sessions aren't ours to account
+
+    def hook(self, mode, data=None, lock=True, tracked=True, watcher=None, watch=None):
+        """Run `zed hook <mode>`; returns the exit code (0 when it simply returns)."""
+        with patch.object(self.z, "hook_input", return_value=data or {}), \
+                patch.object(self.z, "holds_lock", return_value=lock), \
+                patch.object(self.z, "has_tracked_work", return_value=tracked), \
+                patch.object(self.z, "watcher_alive", return_value=watcher), \
+                patch.object(self.z, "cmd_watch", side_effect=watch or (lambda args: False)) as cmd_watch, \
+                patch.object(self.z, "GUARD_WAIT", 0), patch.object(self.z, "ARM_MIN_SECONDS", 0):
+            try:
+                self.z.cmd_hook([mode])
+            except SystemExit as e:
+                return e.code, cmd_watch
+            return 0, cmd_watch
+
+    def test_stop_guard_blocks_a_blind_turn_end_once(self):
+        self.assertEqual(self.hook("stop-guard")[0], 2)
+        self.assertIn("no watcher is running", self.output.getvalue())
+        self.assertEqual(self.hook("stop-guard", data={"stop_hook_active": True})[0], 0)  # never loops
+        self.assertEqual(self.hook("stop-guard", watcher=123)[0], 0)
+        self.z.ARM_STAMP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.z.ARM_STAMP_PATH.touch()  # arm just ran (and woke Zed with an event): nothing to block
+        self.assertEqual(self.hook("stop-guard")[0], 0)
+        os.utime(self.z.ARM_STAMP_PATH, (1, 1))  # an old stamp doesn't count
+        self.assertEqual(self.hook("stop-guard")[0], 2)
+        self.assertEqual(self.hook("stop-guard", lock=False)[0], 0)  # read-only sessions are untouched
+        self.assertEqual(self.hook("stop-guard", tracked=False)[0], 0)
+
+    def test_arm_hook_wakes_only_on_events_and_only_when_it_may(self):
+        code, cmd_watch = self.hook("arm", watch=lambda args: True)
+        self.assertEqual(code, 2)
+        self.assertEqual(cmd_watch.call_args.args[0], ["--once", "--exit-when-idle"])
+        self.assertEqual(self.hook("arm", watch=lambda args: False)[0], 0)  # went idle: no wake
+        self.assertEqual(self.hook("arm", watch=lambda args: sys.exit(3))[0], 2)  # lock lost: tell Zed
+        self.assertEqual(self.hook("arm", watch=lambda args: sys.exit(4))[0], 0)  # lost the race to another watcher
+        for kw in ({"lock": False}, {"tracked": False}, {"watcher": 123}):
+            code, cmd_watch = self.hook("arm", **kw)
+            self.assertEqual(code, 0)
+            cmd_watch.assert_not_called()
+
+    def test_broken_hook_never_blocks(self):
+        code, _ = self.hook("arm", watch=lambda args: 1 / 0)
+        self.assertEqual(code, 1)
+
+    def test_one_watcher_at_a_time(self):
+        self.assertIsNone(self.z.watcher_alive())
+        self.assertTrue(self.z.claim_watcher())
+        self.addCleanup(self.z._watcher_lock.close)
+        self.assertEqual(self.z.watcher_alive(), os.getpid())
+        self.assertTrue(self.z.claim_watcher())  # idempotent in the watcher itself
+        other = subprocess.run([sys.executable, "-c", (
+            "import fcntl,sys; f=open(sys.argv[1],'a')\n"
+            "try: fcntl.flock(f, fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
+            "except BlockingIOError: sys.exit(7)"), str(self.z.WATCHER_LOCK_PATH)])
+        self.assertEqual(other.returncode, 7)  # another process can't claim it
 
 
 if __name__ == "__main__":

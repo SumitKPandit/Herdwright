@@ -22,6 +22,7 @@ mutating commands and `watch` refuse. See `zed lock`.
 Run `zed help` for commands.
 """
 import atexit
+import contextlib
 import fcntl
 import json
 import math
@@ -51,6 +52,8 @@ RUNTIME_STATE_PATH = PROFILE_DIR / ".cache" / "runtime-state.json"
 WATCH_STATE_PATH = PROFILE_DIR / ".cache" / "watch-state.json"
 SPEND_LEDGER_PATH = PROFILE_DIR / "db" / "spend.jsonl"
 WATCHER_PID_PATH = PROFILE_DIR / ".cache" / "watch.pid"
+WATCHER_LOCK_PATH = PROFILE_DIR / ".cache" / "watch.lock"
+ARM_STAMP_PATH = PROFILE_DIR / ".cache" / "hook-arm.stamp"  # touched by the Stop hook's arm step on every firing
 COPILOT_INSTRUCTIONS_DIR = PROFILE_DIR / ".cache" / "copilot-instructions"
 
 # What Zed needs to know about each agent CLI it can run on. Everything user-specific (which ones
@@ -1643,13 +1646,37 @@ def lapse_tick(s, state, seq, alerts):
                     "(read its screen; it may be waiting on something or lost)")
 
 
+_watcher_lock = None  # held open for the life of this watcher; the kernel drops it when the process dies
+
+
 def watcher_alive():
-    """pid of a live `zed watch` for this profile, or None (a stale pid file or a reused pid doesn't count)."""
-    pid = read_json(WATCHER_PID_PATH, {}).get("pid")
-    if not pid or pid == os.getpid():
-        return None
-    r = run(["ps", "-o", "command=", "-p", str(pid)], check=False)
-    return pid if r.returncode == 0 and re.search(r"\bzed\b.*\bwatch\b", r.stdout) else None
+    """pid of a live watcher for this profile (`watch` or the Stop hook's `hook arm`), or None. Decided by an
+    flock the watcher holds, so a stale pid file or a reused pid can't fool it."""
+    WATCHER_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(WATCHER_LOCK_PATH, "a") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return read_json(WATCHER_PID_PATH, {}).get("pid") or -1
+    return None
+
+
+def claim_watcher():
+    """Become the one watcher; False if another one holds the claim."""
+    global _watcher_lock
+    if _watcher_lock and not _watcher_lock.closed:
+        return True  # this process already is the watcher
+    WATCHER_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    f = open(WATCHER_LOCK_PATH, "a")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.close()
+        return False
+    _watcher_lock = f
+    WATCHER_PID_PATH.write_text(json.dumps({"pid": os.getpid(), "started": now()}))
+    atexit.register(lambda: WATCHER_PID_PATH.unlink(missing_ok=True))
+    return True
 
 
 def cmd_watch(args):
@@ -1658,17 +1685,15 @@ def cmd_watch(args):
     exits after the first event(s), which wakes Zed, and remembers what it has reported so a re-armed
     watch only reports new changes. Exits (3) when this session loses the Zed lock."""
     once = "--once" in args
-    rest = [a for a in args if a != "--once"]
+    until_idle = "--exit-when-idle" in args  # the Stop hook's watcher gives up when no work is tracked any more
+    idle_ticks, tracked = 0, True
+    rest = [a for a in args if not a.startswith("--")]
     interval = float(rest[0]) if rest else 3.0
     db().close()
     require_lock()
-    other = watcher_alive()
-    if other:
-        print(f"WATCH_ALREADY_RUNNING pid {other}: one watcher is enough; it will wake Zed.", flush=True)
+    if not claim_watcher():
+        print(f"WATCH_ALREADY_RUNNING pid {watcher_alive()}: one watcher is enough; it will wake Zed.", flush=True)
         sys.exit(4)
-    WATCHER_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
-    WATCHER_PID_PATH.write_text(json.dumps({"pid": os.getpid(), "started": now()}))
-    atexit.register(lambda: WATCHER_PID_PATH.unlink(missing_ok=True))
     saved = read_json(WATCH_STATE_PATH, None)
     prev = {int(k): v for k, v in saved.items()} if saved is not None else {}
     first = saved is None
@@ -1684,6 +1709,7 @@ def cmd_watch(args):
         try:
             conn = db()
             sessions = conn.execute("SELECT * FROM sessions WHERE status IN ('running','waiting_user')").fetchall()
+            tracked = bool(sessions)
             live = live_agents()
             for s in sessions:
                 a = live.get(s["pane_id"])
@@ -1736,7 +1762,10 @@ def cmd_watch(args):
         WATCH_STATE_PATH.write_text(json.dumps(prev))
         alerts_path.write_text(json.dumps(alerts))
         if once and events:
-            return
+            return True
+        idle_ticks = 0 if tracked else idle_ticks + 1
+        if until_idle and idle_ticks >= 5:
+            return False
         time.sleep(interval)
 
 
@@ -1830,6 +1859,79 @@ def health_events(conn, s, a, state, alerts):
                     log_event(conn, s["task_id"], "auto", f"S{s['id']} usage {fmt_usage(u)}; {done} plan steps; {wrote} output files changed")
                 seen["usage_step"], seen["usage_plan_done"], seen["usage_at"] = step, done, time.time()
     return out
+
+
+ARM_MIN_SECONDS = 15  # an arm that wakes Zed sooner than this is lost: Claude is still finishing the Stop phase
+GUARD_WAIT = 6  # seconds the turn-end guard waits for the Stop hook's watcher to come up
+
+
+def hook_input():
+    """The JSON Claude Code sends a hook on stdin ({} when there is none)."""
+    try:
+        return json.loads(sys.stdin.read() or "{}") if not sys.stdin.isatty() else {}
+    except ValueError:
+        return {}
+
+
+def arm_ran_since(ts):
+    try:
+        return ARM_STAMP_PATH.stat().st_mtime >= ts
+    except FileNotFoundError:
+        return False
+
+
+def has_tracked_work():
+    conn = db()
+    try:
+        return conn.execute("SELECT COUNT(*) FROM sessions WHERE status IN ('running','waiting_user')").fetchone()[0] > 0
+    finally:
+        conn.close()
+
+
+def cmd_hook(args):
+    """hook arm | hook stop-guard — Claude Code `Stop` hooks (see .claude/settings.json). Both act only in the
+    session that holds the profile lock and only while sessions are tracked, so read-only sessions are untouched.
+      arm         (asyncRewake) runs the watcher inside the hook: re-arming takes no model turn. It exits 2, which
+                  wakes Zed with the events on stderr, only when there are events (or the lock is lost). One watcher
+                  at a time; it gives up quietly when no work is tracked any more.
+      stop-guard  blocks ending a turn with tracked work and no live watcher, once per stop (stop_hook_active)."""
+    mode = args[0] if args else ""
+    if mode not in ("arm", "stop-guard"):
+        die("hook arm | hook stop-guard")
+    data = hook_input()
+    try:
+        if not holds_lock() or not has_tracked_work() or (mode == "stop-guard" and data.get("stop_hook_active")):
+            return
+        if mode == "stop-guard":
+            started = time.time()
+            while not (watcher_alive() or arm_ran_since(started - 2)):  # arm may already have woken Zed with an event
+                if time.time() >= started + GUARD_WAIT:
+                    break
+                time.sleep(0.3)
+            else:
+                return
+            print("zed: sessions are tracked but no watcher is running, so you'd miss a worker finishing or asking. "
+                  "Arm one: run `bin/zed watch --once` in the background (Bash run_in_background), then end your turn.",
+                  file=sys.stderr)
+            sys.exit(2)
+        ARM_STAMP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ARM_STAMP_PATH.touch()
+        if watcher_alive():
+            return
+        armed_at = time.time()
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                woke = cmd_watch(["--once", "--exit-when-idle"])
+        except SystemExit as e:  # 3: lock lost (the message is already on stderr); 4: another watcher won the race
+            woke = e.code == 3
+        if woke:
+            time.sleep(max(0, ARM_MIN_SECONDS - (time.time() - armed_at)))
+            sys.exit(2)
+    except SystemExit:
+        raise
+    except Exception as e:  # a broken hook must never wedge a turn: report it without blocking
+        print(f"zed hook {mode}: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_paths(args):
@@ -1938,6 +2040,8 @@ def cmd_help(args):
                                      (writes a handoff note, closes the old session, spawns the new one)
   runtime status | runtime limited <rt> [until=<when>] [note...] | runtime ok <rt>
                                      which runtimes are usable; mark one limited / available again
+  hook arm | hook stop-guard         Claude Stop hooks (.claude/settings.json): tokenless watcher re-arm and a
+                                     turn-end guard; act only in the session holding the lock
   quota                              estimate plan usage from session transcripts (rolling window, all Claude
                                      sessions); spawn warns past runtimes.json quota.threshold_tokens
   coordinator [routine|judgment] [--print]
@@ -1959,7 +2063,7 @@ Session states: """ + ", ".join(SESSION_STATES))
 
 COMMANDS = {"task": cmd_task, "log": cmd_log, "q": cmd_q, "spawn": cmd_spawn, "session": cmd_session,
             "close": cmd_close, "adopt": cmd_adopt, "handoff": cmd_handoff, "watch": cmd_watch, "status": cmd_status,
-            "brief": cmd_brief, "coordinator": cmd_coordinator, "quota": cmd_quota, "paths": cmd_paths, "start": cmd_start, "lock": cmd_lock, "runtime": cmd_runtime, "models": cmd_models, "help": cmd_help}
+            "brief": cmd_brief, "coordinator": cmd_coordinator, "quota": cmd_quota, "hook": cmd_hook, "paths": cmd_paths, "start": cmd_start, "lock": cmd_lock, "runtime": cmd_runtime, "models": cmd_models, "help": cmd_help}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
