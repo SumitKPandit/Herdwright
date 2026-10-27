@@ -6,6 +6,11 @@
       "role": "what this repo is",
       "host": "github",
       "dev_base": "main",
+      "checks": {
+        "lint": "what lints this repo, e.g. npm run lint",
+        "types": "what type-checks it, e.g. npx tsc --noEmit",
+        "test": "what runs its tests, e.g. npm test"
+      },
       "branches": {
         "main": "staging; base for new dev"
       }

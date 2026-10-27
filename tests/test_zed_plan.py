@@ -55,5 +55,84 @@ class PlanTests(unittest.TestCase):
             self.assertEqual(subprocess.run([str(_load.HOME / "bin" / "zed-plan"), "lint", d + "/nope"], capture_output=True).returncode, 2)
 
 
+DESIGN = """# Design: widget export
+
+## Context
+Some prose.
+
+## Build units
+
+### Unit A: Export endpoint
+- Scope: add GET /export returning CSV
+  for the current filters
+- Files: api/export.py, api/urls.py
+- Done when: curl returns the CSV; tests green
+- Estimate: ~2 h
+- Depends on: none
+
+### Unit B: Export button
+- Scope: button in the toolbar calling the endpoint
+- Files: web/Toolbar.tsx
+- Done when: button downloads the file in a browser
+- Estimate: ~90 min
+- Depends on: A
+
+### Unit C: Docs
+- Scope: document the endpoint
+- Files: api/urls.py, docs/export.md
+- Done when: docs page merged
+- Estimate: ~30 min
+- Depends on: none
+
+## Risks
+- not a unit
+"""
+
+
+class SplitTests(unittest.TestCase):
+    def test_units_parse_with_dependencies_and_continuations(self):
+        units = plan.parse_units(DESIGN)
+        self.assertEqual([u["id"] for u in units], ["A", "B", "C"])
+        self.assertEqual(units[0]["scope"], "add GET /export returning CSV for the current filters")
+        self.assertEqual((units[0]["files"], units[0]["est_min"], units[0]["deps"]), (["api/export.py", "api/urls.py"], 120, []))
+        self.assertEqual((units[1]["deps"], units[1]["est_min"]), (["A"], 90))
+        self.assertNotIn("not a unit", str(units[2]["_fields"]))
+
+    def test_waves_and_parallel_file_warning(self):
+        problems, warnings, waves = plan.check_units(plan.parse_units(DESIGN))
+        self.assertEqual(problems, [])
+        self.assertEqual(waves, {"A": 0, "B": 1, "C": 0})
+        self.assertEqual(warnings, ["units A and C can run at the same time but both touch api/urls.py"])
+
+    def test_problems(self):
+        bad = DESIGN.replace("- Depends on: A", "- Depends on: Z").replace("- Done when: docs page merged\n", "")
+        problems = "\n".join(plan.check_units(plan.parse_units(bad))[0])
+        self.assertIn("unit B: depends on unknown unit 'Z'", problems)
+        self.assertIn("unit C: no 'Done when'", problems)
+        self.assertIn("duplicate id", "\n".join(plan.check_units(plan.parse_units(DESIGN + "\n### Unit A: again\n"))[0]))
+        cyc = DESIGN.replace("Estimate: ~2 h\n- Depends on: none", "Estimate: ~2 h\n- Depends on: B")
+        self.assertIn("dependency cycle: A -> B -> A", plan.check_units(plan.parse_units(cyc))[0][0])
+        self.assertIn("no units found", plan.check_units([])[0][0])
+        self.assertIn("estimate needs", "\n".join(plan.check_units(plan.parse_units(DESIGN.replace("~90 min", "soon")))[0]))
+
+    def test_cli_split_writes_skeletons_only_when_clean(self):
+        with tempfile.TemporaryDirectory() as d:
+            f, out = Path(d) / "design.md", Path(d) / "briefs"
+            f.write_text(DESIGN)
+            r = subprocess.run([str(_load.HOME / "bin" / "zed-plan"), "split", str(f), "--out", str(out)], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("wave 1  B: Export button (~90 min)  after A", r.stdout)
+            self.assertEqual(sorted(p.name for p in out.iterdir()), ["A-export-endpoint.md", "B-export-button.md", "C-docs.md"])
+            text = (out / "B-export-button.md").read_text()
+            self.assertIn("Depends on: unit A", text)
+            self.assertIn("button downloads the file in a browser", text)
+            f.write_text(DESIGN.replace("- Depends on: A", "- Depends on: Z"))
+            out2 = Path(d) / "none"
+            r = subprocess.run([str(_load.HOME / "bin" / "zed-plan"), "split", str(f), "--out", str(out2)], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 1)
+            self.assertFalse(out2.exists())
+            self.assertEqual(subprocess.run([str(_load.HOME / "bin" / "zed-plan"), "split", d + "/nope"], capture_output=True).returncode, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
