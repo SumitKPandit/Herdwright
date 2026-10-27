@@ -498,7 +498,10 @@ class CoreSyncCheckTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             git = lambda *a: subprocess.run(["git", "-C", tmp, *a], check=True, capture_output=True, text=True)
             git("init", "-q", "-b", "main")
-            r = subprocess.run(["python3", str(HOME / "bin" / "zed-core-sync"), "--check"], capture_output=True, text=True, cwd=tmp)
+            (Path(tmp) / "bin").mkdir()
+            script = Path(tmp) / "bin" / "zed-core-sync"  # a copy: the script checks the repo it lives in
+            script.write_text((HOME / "bin" / "zed-core-sync").read_text())
+            r = subprocess.run(["python3", str(script), "--check"], capture_output=True, text=True, cwd=tmp)
             self.assertEqual(r.returncode, 2)
             self.assertIn("profile branch", r.stderr)
 

@@ -29,6 +29,7 @@ class ZedTests(unittest.TestCase):
         with patch.dict(os.environ, {"ZED_PROFILE_DIR": str(self.root)}):
             exec(compile((HOME / "bin/zed").read_text(), self.z.__file__, "exec"), self.z.__dict__)
         (self.root / "profile.md").write_text("# Throwaway test profile\n")
+        self.enterContext(patch.object(self.z, "core_sync_events", return_value=[]))  # would read the live repo
         self.output = io.StringIO()
         self.enterContext(contextlib.redirect_stdout(self.output))
         self.enterContext(contextlib.redirect_stderr(self.output))
