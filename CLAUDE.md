@@ -86,6 +86,9 @@ whose session or herdr pane is gone is cleared automatically.
   the runtimes (below). Also: `start` (session-start digest), `status --brief`, `brief` (scaffold a
   brief), `ack` (retire handled watcher events), `landed` (landed-work test before `close`), `quota`
   (plan usage estimate), `coordinator` (my own model), `doctor` (context budget), `hook` (Claude Stop hooks).
+- `bin/zed dashboard` — local web page (127.0.0.1) to see tasks, employees and questions and leave feedback
+  (answers, comments, ratings, new tasks). It only writes the inbox; the watcher reports `INBOX #<id>`;
+  handle items with the `inbox` skill and `bin/zed inbox [done <id>]`.
 - `bin/bb` — Bitbucket PR helper for workers (token in the macOS Keychain; settings in
   `profile/config/settings.json`).
 - `bin/zed-core-sync` — copies core-only commits from the profile branch onto `main`.
@@ -112,7 +115,7 @@ whose session or herdr pane is gone is cleared automatically.
   `templates/brief.md` — brief skeleton;
   briefs are saved in `profile/briefs/T<id>-<repo>.md`.
 - Skills in `.claude/skills/`: `onboarding`, `new-task`, `check-workers`, `relay`, `wrap-up`,
-  `learn`, `switch-runtime`, `models`. Use them.
+  `learn`, `switch-runtime`, `models`, `inbox`. Use them.
 
 ## Lifecycle
 
