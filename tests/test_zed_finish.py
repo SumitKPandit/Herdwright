@@ -1,13 +1,11 @@
 """`zed-employee finish` (design step 3.3): the write-back an assignment ends with."""
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 import _load  # noqa: F401
 
 import zedassign
 import zedemployee as emp
-import zedlib
 import zedmem
 from test_zed_employee import ProfileCase, run
 
@@ -23,6 +21,7 @@ class AssignDb(ProfileCase):
     def setUp(self):
         super().setUp()
         self.conn = emp.connect()
+        self.addCleanup(self.conn.close)
         self.conn.executescript(SESSIONS)
         emp.zedlib.ensure_employee_schema(self.conn)
         for name in ("juno", "quill", "pip"):

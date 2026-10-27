@@ -1185,7 +1185,8 @@ def employee_kit(name, hat, repo, tags, sid, agent, worktree):
     kit["claude_settings"].write_text(json.dumps(zeddeny.claude_settings(ZED_HOME), indent=2) + "\n")
     zeddeny.copilot_plugin(kit["copilot_plugin"], ZED_HOME)
     kit["deny_tools"] = zeddeny.copilot_deny_tools(emp.load_manifest(hat))
-    env = [f"ZED_EMPLOYEE={name}", f"ZED_HAT={hat}", f"ZED_SESSION=S{sid}", f"ZED_WORKTREE={worktree}"]
+    env = [f"ZED_EMPLOYEE={name}", f"ZED_HAT={hat}", f"ZED_SESSION=S{sid}", f"ZED_WORKTREE={worktree}",
+           f"ZED_PROFILE_DIR={PROFILE_DIR}"]  # so zed-employee and zed-deny find this profile, wherever it is
     return kit, env
 
 

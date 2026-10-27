@@ -5,7 +5,6 @@ import contextlib
 import io
 import json
 import os
-import sqlite3
 import subprocess
 import tempfile
 import types
@@ -54,6 +53,7 @@ class AssignCase(unittest.TestCase):
         self.enterContext(contextlib.redirect_stdout(self.output))
         self.enterContext(contextlib.redirect_stderr(self.output))
         self.conn = self.z.db()
+        self.addCleanup(self.conn.close)
         for name in ("juno", "quill", "pip"):
             emp.hire(name)
         ts = "2026-10-27 09:00"
@@ -124,7 +124,8 @@ class SpawnWithEmployeeTests(AssignCase):
         self.assertEqual(rules, (out / "juno-t20-build-instructions" / "zed-worker.instructions.md").read_text())
         workspace = next(c for c in self.herdr_calls if c[:3] == ["herdr", "workspace", "create"])
         env = [workspace[i + 1] for i, a in enumerate(workspace) if a == "--env"]
-        self.assertEqual(env, ["ZED_EMPLOYEE=juno", "ZED_HAT=build", f"ZED_SESSION=S{sid}", f"ZED_WORKTREE={self.worktree}"])
+        self.assertEqual(env, ["ZED_EMPLOYEE=juno", "ZED_HAT=build", f"ZED_SESSION=S{sid}", f"ZED_WORKTREE={self.worktree}",
+                               f"ZED_PROFILE_DIR={self.profile}"])
         start = next(c for c in self.herdr_calls if c[:3] == ["herdr", "agent", "start"])
         self.assertIn(str(out / "juno-t20-build-rules.md"), start)
         self.assertEqual(start[start.index("--settings") + 1], str(out / "juno-t20-build-settings.json"))

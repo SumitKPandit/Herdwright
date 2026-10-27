@@ -152,13 +152,14 @@ def task_id(text):
 
 
 def cmd_suggest(args):
-    conn, tid = emp.connect(), task_id(args.task)
-    last = conn.execute("SELECT repo, branch FROM sessions WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
-    repo = args.repo or (last["repo"] if last else None)
-    if not repo:
-        raise emp.EmployeeError(f"T{tid} has no session yet: say which repo with --repo")
-    branch = args.branch or (last["branch"] if last else None)
-    rows = zedassign.suggest(conn, tid, args.hat, repo, branch, csv(args.tags), args.ambiguous)
+    tid = task_id(args.task)
+    with emp.database() as conn:
+        last = conn.execute("SELECT repo, branch FROM sessions WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+        repo = args.repo or (last["repo"] if last else None)
+        if not repo:
+            raise emp.EmployeeError(f"T{tid} has no session yet: say which repo with --repo")
+        branch = args.branch or (last["branch"] if last else None)
+        rows = zedassign.suggest(conn, tid, args.hat, repo, branch, csv(args.tags), args.ambiguous)
 
     def render(rows):
         out = [f"suggest T{tid} --hat {args.hat} (repo {repo}" + (f", branch {branch}" if branch else "") + ")"]
@@ -172,7 +173,8 @@ def cmd_suggest(args):
 
 
 def cmd_board(args):
-    data = zedassign.board(emp.connect())
+    with emp.database() as conn:
+        data = zedassign.board(conn)
 
     def render(data):
         out = ["free: " + (", ".join(data["free"]) or "nobody"), "waiting:"]
