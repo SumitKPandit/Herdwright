@@ -25,6 +25,7 @@ def strip_heredocs(cmd):
 def tokens(cmd):
     lex = shlex.shlex(strip_heredocs(cmd).replace("\n", " ; "), posix=True, punctuation_chars=True)
     lex.whitespace_split = False
+    lex.wordchars += "${}"  # keep `$E` / `${E}` one word, so `git -C $E commit` reads as a git commit in an unknown repo
     return list(lex)
 
 

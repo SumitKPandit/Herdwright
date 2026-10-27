@@ -82,8 +82,8 @@ def shell_problem(cmd, manifest, worktree, profile, cwd):
             continue
         if re.fullmatch(r"CDPATH=.*", words_before[0] if words_before else ""):
             cwd = None  # `CDPATH=x cd y` may land anywhere
-        while words and Path(words[0]).name in ("builtin", "command"):
-            words = words[1:]
+        while words and (Path(words[0]).name in ("builtin", "command") or words[0] in ("{", "then", "do", "else")):
+            words = words[1:]  # a compound command's opener leaves the next word the command
         if words and Path(words[0]).name in ("cd", "pushd", "popd"):
             # follow `cd <dir> && ...` so later relative targets resolve where the shell will; a target the shell
             # expands (`cd $X`, `cd -`, `popd`) leaves the cwd unknown: later relative targets cannot be checked
@@ -91,8 +91,8 @@ def shell_problem(cmd, manifest, worktree, profile, cwd):
             if args and cwd is not None and not unresolved(args[0]) and args[0] != "-":
                 d = Path(os.path.expanduser(args[0]))
                 cwd = os.path.realpath(d if d.is_absolute() else Path(cwd) / d)
-            elif args or Path(words[0]).name == "popd":
-                cwd = None
+            elif args or Path(words[0]).name in ("popd", "cd"):
+                cwd = None  # a bare `cd` goes home
             continue
         if prefix := command_denied(words, deny["commands"]):
             return f"`{prefix}` is denied to this hat: anything outward goes to Zed as a draft"

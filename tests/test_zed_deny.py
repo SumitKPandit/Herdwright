@@ -84,6 +84,20 @@ class DecideTests(unittest.TestCase):
             self.assertIsNone(self.bash(hat, f"cd $D && git -C {self.evidence} commit -m x"), hat)
         self.assertIsNone(self.bash("build", "cd $D && git commit -m x"))
 
+    def test_a_variable_repo_after_dash_c_cannot_be_checked_for_a_read_only_hat(self):
+        for hat in ("review", "qa"):
+            for command in ("git -C $E commit -m x", "git -C ${E} commit -m x", "cd $D && git -C $E commit -m x"):
+                self.assertIn("cannot be checked", self.bash(hat, command), (hat, command))
+            self.assertIsNone(self.bash(hat, "git -C $E log"), hat)
+            self.assertIn("denied", self.bash(hat, f"git -C {self.wt} commit -m x"), hat)
+        self.assertIsNone(self.bash("build", "git -C $E commit -m x"))
+
+    def test_a_compound_opener_or_bare_cd_does_not_hide_the_cd(self):
+        emp_dir = self.profile / "employees"
+        for command in (f"{{ cd {emp_dir}; touch quill/x; }}", f"if true; then cd {emp_dir}; touch quill/x; fi"):
+            self.assertIn("denied", self.bash("build", command), command)
+        self.assertIn("cannot be checked", self.bash("build", "cd && touch x"))
+
     def test_more_cd_spellings_move_the_cwd(self):
         emp_dir = self.profile / "employees"
         for command in (f"cd -P {emp_dir} && touch quill/x", f"builtin cd {emp_dir} && touch quill/x",
