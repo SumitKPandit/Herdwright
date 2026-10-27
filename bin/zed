@@ -37,6 +37,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import zedlib  # noqa: E402
+
 ZED_HOME = Path(__file__).resolve().parent.parent
 PROFILE_DIR = Path(os.environ.get("ZED_PROFILE_DIR") or ZED_HOME / "profile").expanduser().resolve()
 DB_PATH = PROFILE_DIR / "db" / "zed.db"
@@ -120,6 +123,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   brief TEXT,
   credits REAL,  -- Copilot AI credits used, as last read from the session's footer
   pr_state TEXT,  -- open | merged | closed, as last polled by the watcher
+  scratch TEXT,  -- per-session scratch folder in an in-place (non-git) project; removed on close
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -162,7 +166,8 @@ def db():
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(sessions)")]
     # migrate DBs created before these columns existed
     for col, decl in [("external", "INTEGER NOT NULL DEFAULT 0"), ("runtime", "TEXT NOT NULL DEFAULT 'claude'"),
-                      ("model", "TEXT"), ("effort", "TEXT"), ("brief", "TEXT"), ("credits", "REAL"), ("pr_state", "TEXT")]:
+                      ("model", "TEXT"), ("effort", "TEXT"), ("brief", "TEXT"), ("credits", "REAL"), ("pr_state", "TEXT"),
+                      ("scratch", "TEXT")]:
         if col not in cols:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
     return conn
@@ -1337,6 +1342,11 @@ def cmd_spawn(args, worktree=None):
         if guard.returncode and "already pointing" not in guard.stderr:  # a reused worktree keeps its guard
             die(f"could not install the git guard in {worktree}; no worker started:\n{guard.stderr.strip() or guard.stdout.strip()}")
 
+    scratch = None
+    if p.get("worktrees") is False:  # in-place project: the worker's scratch goes in its own folder, removed on close
+        scratch = worktree / f"T{tid}-{agent}"
+        scratch.mkdir(exist_ok=True)
+
     # 2. herdr workspace + agent CLI
     require_lock()
     env, cli_args = runtime_launch(runtime, agent, model, effort)
@@ -1358,9 +1368,9 @@ def cmd_spawn(args, worktree=None):
     ts = now()
     cur = conn.execute(
         "INSERT INTO sessions(task_id,repo,base,branch,worktree,agent,workspace_id,pane_id,status,runtime,model,effort,"
-        "brief,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "brief,scratch,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (tid, kv["repo"], kv["base"], kv["branch"], str(worktree), agent, ws_id, pane_id, "running",
-         runtime, model, effort, str(brief), ts, ts))
+         runtime, model, effort, str(brief), str(scratch) if scratch else None, ts, ts))
     sid = cur.lastrowid
     conn.execute("UPDATE tasks SET status='active' WHERE id=? AND status IN ('intake','parked')", (tid,))
     log_event(conn, tid, "spawn", f"S{sid} {agent} on {kv['repo']} {kv['branch']} ← {kv['base']} ({worktree}); "
@@ -1382,6 +1392,9 @@ def cmd_spawn(args, worktree=None):
             f"Read your worker rules at {GENERATED_WORKER_RULES} and your brief at {brief}, then "
             f"{PROFILE_DIR}/knowledge/repos/{kv['repo']}.md if it exists. "
             f"Your status file is {STATUS_DIR}/S{sid}.log (see 'Report status' in your rules). ")
+    if scratch:
+        text += (f"Your scratch folder is {scratch}: keep every clone, download and temporary file there and nowhere "
+                 f"else in the project; Zed deletes it when your session closes. ")
     if kv.get("handoff"):
         text += (f"You are taking over from an earlier session that stopped (see the handoff note at "
                  f"{Path(kv['handoff']).resolve()}): read it, check the worktree's git state, and continue "
@@ -1500,10 +1513,29 @@ def cmd_landed(args):
     print(f"S{s['id']} is landed: pushed, nothing uncommitted, PR merged/closed or none, plan complete, no open questions")
 
 
+def remove_scratch(path):
+    """Delete a scratch folder unless it holds unique work. Returns a report line."""
+    reasons = zedlib.scratch_unique_work(path)
+    if reasons:
+        return f"kept scratch {path}: " + "; ".join(reasons)
+    shutil.rmtree(path)
+    return f"removed scratch {path}"
+
+
+def own_scratch(s):
+    """The session's scratch folder if it is one Zed may delete: T<id>-<name> directly inside its project folder."""
+    scratch = Path(s["scratch"]) if s["scratch"] else None
+    if scratch and scratch.is_dir() and zedlib.SCRATCH_NAME.fullmatch(scratch.name) \
+            and scratch.parent == Path(s["worktree"]):
+        return scratch
+
+
+
 def cmd_close(args):
-    """close <S|agent> [keep-worktree] — stop the worker, close its herdr workspace, remove the worktree."""
+    """close <S|agent> [keep-worktree] [keep-scratch] [force] — stop the worker, close its herdr workspace, then remove
+    its scratch folder and its worktree unless they hold unique work (the landed-work test; see scratch_unique_work)."""
     if not args:
-        die("close <S|agent> [keep-worktree] [force]")
+        die("close <S|agent> [keep-worktree] [keep-scratch] [force]")
     conn = db()
     require_lock()
     ref = args[0][1:] if args[0].startswith("S") and args[0][1:].isdigit() else args[0]
@@ -1527,19 +1559,29 @@ def cmd_close(args):
             die(f"S{s['id']} is not landed, so its worktree stays:\n{report}\n"
                 "Resolve these, or pass 'keep-worktree' (close the session only) / 'force'.")
         print(f"note: S{s['id']} is not landed yet (worktree kept):\n{report}")
+    remove_wt = "keep-worktree" not in args and wt.exists()
     record_credits(conn, s)
     record_spend(conn, s)
     if s["workspace_id"]:
         close_workspace(s["workspace_id"])
-    if "keep-worktree" not in args and wt.exists():
+    report = []
+    if remove_wt:
         repo_path = expand(project(s["repo"])["path"])
         run(["git", "-C", str(repo_path), "worktree", "remove", *(["--force"] if "force" in args else []), str(wt)])
+        report.append(f"removed worktree {wt}")
+    elif not in_place:
+        report.append(f"kept worktree {wt}")
+    scratch = own_scratch(s)
+    if scratch and "keep-scratch" not in args:
+        report.append(remove_scratch(scratch))
     conn.execute("UPDATE sessions SET status='closed', updated_at=? WHERE id=?", (now(), s["id"]))
-    log_event(conn, s["task_id"], "close", f"S{s['id']} {s['agent']} closed" + (" (worktree kept)" if "keep-worktree" in args else ""))
+    log_event(conn, s["task_id"], "close", f"S{s['id']} {s['agent']} closed" + "".join(f"; {r}" for r in report))
     touch_task(conn, s["task_id"])
     conn.commit()
     write_status(conn)
     print(f"closed S{s['id']}")
+    for r in report:
+        print(f"  {r}")
 
 
 def cmd_adopt(args):
@@ -2464,8 +2506,10 @@ def cmd_help(args):
                                      kind (default: the task's worktype) picks the effort by model_policy.effort_by_kind;
                                      beyond runtimes.<rt>.max_running the task is queued (exit 75)
   session list | session set <S|agent> key=value... (status pr_url claude_session_id pane_id workspace_id base brief)
-  close <S|agent> [keep-worktree] [force]   (external sessions are only untracked; the landed-work test below
-                                     must pass before the worktree is removed)
+  close <S|agent> [keep-worktree] [keep-scratch] [force]
+                                     (external sessions are only untracked; the landed-work test below
+                                     must pass before the worktree is removed; the session's scratch
+                                     folder is removed too unless it holds unique work)
   landed <S|agent>                   landed-work test: pushed, nothing uncommitted, PR merged/closed, plan
                                      complete, no open questions; prints exactly what blocks closing
   adopt <pane-id> <T> [repo=]        track a session Zed didn't start (user's own)

@@ -69,6 +69,32 @@ def expand(path):
     return Path(os.path.expanduser(str(path)))
 
 
+SCRATCH_NAME = re.compile(r"T\d+-[a-z][a-z0-9_-]*")
+
+
+def scratch_dirs(project_path):
+    """Scratch folders (T<id>-<name>) directly inside an in-place (non-git) project folder."""
+    p = Path(project_path)
+    return sorted(d for d in p.iterdir() if d.is_dir() and SCRATCH_NAME.fullmatch(d.name)) if p.is_dir() else []
+
+
+def scratch_unique_work(scratch):
+    """Reasons a scratch folder holds work that exists nowhere else: nested git repos with tracked changes or
+    commits no remote has. Everything else in it is scratch by definition."""
+    reasons = []
+    for root, dirs, _ in os.walk(scratch):
+        dirs[:] = [d for d in dirs if d != "node_modules"]
+        if not os.path.lexists(os.path.join(root, ".git")):
+            continue
+        dirs[:] = []  # a repo: don't look inside it
+        rel = os.path.relpath(root, scratch)
+        if git(root, "status", "--porcelain", "--untracked-files=no").stdout.strip():
+            reasons.append(f"{rel}: uncommitted changes")
+        elif git(root, "log", "--oneline", "--branches", "--not", "--remotes").stdout.strip():
+            reasons.append(f"{rel}: commits not on any remote")
+    return reasons
+
+
 def db_readonly():
     """Read-only connection to the task DB; None when there is no DB yet."""
     if not DB_PATH.exists():

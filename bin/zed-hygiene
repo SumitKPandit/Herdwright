@@ -3,8 +3,9 @@
 
 Ported from firstmate's fm-fleet-sync / fm-herdr-session-cleanup / fm-bootstrap (detect + refresh half).
 Report-only by default. `--apply` does only the safe mechanical part: `git fetch --prune`, `git worktree prune`,
-and a fast-forward of a clone's checked-out dev base when the clone is clean and strictly behind. It never deletes
-a branch or worktree that holds work, and never touches a herdr pane.
+a fast-forward of a clone's checked-out dev base when the clone is clean and strictly behind, and removal of orphan
+scratch folders that hold no unique work. It never deletes a branch or worktree that holds work, and never
+touches a herdr pane.
 
 Usage
   zed-hygiene report [--fetch] [--apply] [--json]
@@ -13,11 +14,15 @@ Usage
         prunable-worktree  git lists a worktree whose folder is gone
         merged-branch      local branch already merged into origin/<dev_base> (safe to delete, by the user or Zed)
         gone-branch        local branch whose upstream was deleted on the remote
+        scratch-leftover   a T<id>-<agent> scratch folder in a non-git project that no live session owns
+                           (--apply deletes it unless a nested git repo in it has unique work)
         behind             clone's checked-out dev base is N commits behind origin
       and herdr panes still open for sessions the DB has closed. --fetch refreshes origin first (network, read-only).
       exit 0 nothing to do, 1 findings
 """
 import argparse
+import shutil
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -96,6 +101,27 @@ def project_findings(name, p, root, owned, fetch, apply):
     return findings, actions
 
 
+def scratch_findings(conn, apply):
+    """Scratch folders (T<id>-<agent>) in non-git projects that no live session owns; --apply removes the ones with no unique work."""
+    try:
+        live = {Path(r["scratch"]) for r in conn.execute("SELECT scratch FROM sessions WHERE status!='closed' AND scratch IS NOT NULL")} if conn else set()
+    except sqlite3.OperationalError:  # DB from before the scratch column existed
+        live = set()
+    findings, actions = [], []
+    for name, p in zedlib.projects().items():
+        if p.get("worktrees") is not False or not p.get("path"):
+            continue
+        for d in zedlib.scratch_dirs(zedlib.expand(p["path"])):
+            if d in live:
+                continue
+            unique = zedlib.scratch_unique_work(d)
+            findings.append(f"{name}: scratch-leftover {d}" + (f" (kept: {'; '.join(unique)})" if unique else ""))
+            if apply and not unique:
+                shutil.rmtree(d)
+                actions.append(f"{name}: removed scratch {d}")
+    return findings, actions
+
+
 def pane_findings(conn, live):
     if conn is None:
         return []
@@ -121,6 +147,9 @@ def main(argv=None):
             f, act = project_findings(name, p, root, owned, a.fetch, a.apply)
             findings += f
             actions += act
+    f, act = scratch_findings(conn, a.apply)
+    findings += f
+    actions += act
     findings += pane_findings(conn, zedlib.live_agents())
     data = {"findings": findings, "actions": actions}
     zedlib.emit(data, a.json, lambda d: zedlib.cap_lines(d["actions"] + d["findings"], 50, 260) or ["clean: nothing to do"])

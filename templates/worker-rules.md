@@ -86,6 +86,14 @@ Every turn you take resends your whole context, so a wait must cost as few turns
 - Never `sleep` and then check by hand, and never start something in the background and poll it
   with repeated tool calls.
 
+## Scratch files
+
+In a git repo everything lives in your worktree. If your brief or prompt names a **scratch folder**
+(you're working in a plain folder that isn't a git repo, e.g. PR review clones), put every clone,
+download and temporary file there and nowhere else. Zed deletes it when your session closes, but only
+if it holds nothing unique (a clone with uncommitted changes or commits no remote has is kept), so
+commit and push anything that must survive.
+
 ## Before every PR
 0. Once the PR is open, `bin/zed-pr ready-check <pr-url>` must pass before you mark it ready
    (CI green, no conflicts, title format, base branch, reviewers requested).

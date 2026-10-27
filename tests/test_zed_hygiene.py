@@ -5,6 +5,7 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import _load
@@ -106,6 +107,50 @@ class RepoTests(unittest.TestCase):
                              env={**os.environ, "ZED_PROFILE_DIR": str(prof)})
         self.assertEqual(out.returncode, 1, out.stderr)
         self.assertIn("behind main by", out.stdout)
+
+
+class ScratchTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.folder = Path(self.tmp.name).resolve() / "docs"
+        self.folder.mkdir()
+        self.projects = {"docs": {"path": str(self.folder), "worktrees": False}, "r": {"path": "/nowhere"}}
+        patcher = unittest.mock.patch.object(zedlib, "projects", return_value=self.projects)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def conn(self, live_scratch):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(SCHEMA)
+        conn.execute("INSERT INTO sessions (task_id,repo,base,branch,worktree,agent,scratch,status,created_at,updated_at) "
+                     "VALUES (1,'docs','-','-',?,'live',?,'running','x','x')", (str(self.folder), str(live_scratch)))
+        return conn
+
+    def test_orphan_scratch_is_reported_and_only_removed_when_it_holds_no_unique_work(self):
+        live, orphan, unique, other = (self.folder / n for n in ("T1-live", "T9-old", "T8-pr", "notes"))
+        for d in (live, orphan, unique, other):
+            d.mkdir()
+        (orphan / "clone").mkdir()
+        git(unique, "init", "-q", "-b", "main", "repo")
+        git(unique / "repo", "commit", "-q", "--allow-empty", "-m", "mine")
+        conn = self.conn(live)
+        findings, actions = hy.scratch_findings(conn, apply=False)
+        self.assertEqual(len(findings), 2)
+        self.assertEqual(actions, [])
+        self.assertTrue(orphan.exists())
+        findings, actions = hy.scratch_findings(conn, apply=True)
+        self.assertEqual(actions, [f"docs: removed scratch {orphan}"])
+        self.assertFalse(orphan.exists())
+        self.assertTrue(live.exists() and unique.exists() and other.exists())
+        self.assertIn("kept: repo: commits not on any remote", "\n".join(findings))
+
+    def test_a_db_without_the_scratch_column_is_tolerated(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE sessions (status TEXT)")
+        conn.row_factory = sqlite3.Row
+        self.assertEqual(hy.scratch_findings(conn, apply=False), ([], []))
 
 
 if __name__ == "__main__":

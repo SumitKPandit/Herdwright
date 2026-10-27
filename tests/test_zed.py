@@ -897,6 +897,100 @@ class ZedTests(unittest.TestCase):
             alerts = {1: {"refresh": 180_000}}
             self.assertIn("restart FAILED", self.z.settle_turn(conn, s, "x", alerts, "L", 5))
 
+    # ---- cleanup at close
+
+    def git(self, path, *args):
+        return subprocess.run(["git", "-C", str(path), "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                              check=True, capture_output=True, text=True).stdout
+
+    def repo_with_worktree(self):
+        repo = self.root / "repo"
+        repo.mkdir()
+        self.git(repo, "init", "-b", "main")
+        (repo / "a.txt").write_text("a")
+        self.git(repo, "add", "."), self.git(repo, "commit", "-m", "init")
+        remote = self.root / "origin.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+        self.git(repo, "remote", "add", "origin", str(remote)), self.git(repo, "push", "-q", "origin", "main")
+        wt = self.root / "wt"
+        self.git(repo, "worktree", "add", "-b", "feature/x", str(wt))
+        return repo, wt
+
+    def closing(self, conn, repo, *args, in_place=False):
+        proj = {"path": str(repo), **({"worktrees": False} if in_place else {})}
+        with patch.object(self.z, "db", return_value=conn), patch.object(self.z, "require_lock"), \
+                patch.object(self.z, "project", return_value=proj), patch.object(self.z, "close_workspace"), \
+                patch.object(self.z, "record_credits"):
+            self.z.cmd_close(["S1", *args])
+
+    def worktree_session(self, repo, wt, scratch=None):
+        conn = self.session()
+        conn.execute("UPDATE sessions SET repo='r', worktree=?, scratch=? WHERE id=1", (str(wt), scratch))
+        conn.commit()
+        return conn
+
+    def status(self, conn):
+        return conn.execute("SELECT status FROM sessions WHERE id=1").fetchone()[0]
+
+    def test_close_removes_a_landed_worktree_even_without_an_upstream(self):
+        repo, wt = self.repo_with_worktree()  # branch is in origin/main, no upstream of its own
+        conn = self.worktree_session(repo, wt)
+        self.closing(conn, repo)
+        self.assertFalse(wt.exists())
+        self.assertEqual(self.status(conn), "closed")
+        self.assertIn("removed worktree", self.output.getvalue())
+
+    def test_close_keeps_a_worktree_with_unpushed_commits(self):
+        repo, wt = self.repo_with_worktree()
+        (wt / "b.txt").write_text("b")
+        self.git(wt, "add", "."), self.git(wt, "commit", "-m", "work")
+        conn = self.worktree_session(repo, wt)
+        with self.assertRaises(SystemExit):
+            self.closing(conn, repo)
+        self.assertIn("1 commit(s) not pushed", self.output.getvalue())
+        self.assertTrue(wt.exists())
+        self.assertEqual(self.status(conn), "running")
+        self.closing(conn, repo, "keep-worktree")
+        self.assertTrue(wt.exists())
+        self.assertEqual(self.status(conn), "closed")
+
+    def scratch_session(self, name="T1-qa"):
+        folder = self.root / "folder"
+        scratch = folder / name
+        scratch.mkdir(parents=True)
+        conn = self.session()
+        conn.execute("UPDATE sessions SET repo='docs', worktree=?, scratch=? WHERE id=1", (str(folder), str(scratch)))
+        conn.commit()
+        return folder, scratch, conn
+
+    def test_close_removes_scratch_but_not_the_project_folder(self):
+        folder, scratch, conn = self.scratch_session()
+        (scratch / "clone").mkdir()
+        (scratch / "clone" / "big.bin").write_text("x")
+        (folder / "keep.md").write_text("docs")
+        self.closing(conn, folder, in_place=True)
+        self.assertFalse(scratch.exists())
+        self.assertTrue((folder / "keep.md").exists())
+        self.assertEqual(self.status(conn), "closed")
+
+    def test_close_keeps_scratch_clone_with_unpushed_commits(self):
+        folder, scratch, conn = self.scratch_session()
+        clone = scratch / "pr-1"
+        self.git(scratch, "init", "-b", "main", str(clone))
+        (clone / "f").write_text("f")
+        self.git(clone, "add", "."), self.git(clone, "commit", "-m", "mine")
+        self.closing(conn, folder, in_place=True)
+        self.assertTrue(clone.exists())
+        self.assertIn("pr-1: commits not on any remote", self.output.getvalue())
+        self.assertEqual(self.status(conn), "closed")
+
+    def test_scratch_outside_its_project_or_oddly_named_is_never_deleted(self):
+        folder, scratch, conn = self.scratch_session(name="notes")
+        self.closing(conn, folder, in_place=True)
+        self.assertTrue(scratch.exists())
+        conn.execute("UPDATE sessions SET scratch=? WHERE id=1", (str(self.root),))
+        self.assertIsNone(self.z.own_scratch(conn.execute("SELECT * FROM sessions").fetchone()))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -179,7 +179,10 @@ and paused workers can be handed over with the user's OK (`switch-runtime` skill
 - Get core updates from others with `git merge main` (after `git fetch` and updating `main`).
 - Worktrees live under the `worktree_root` in `profile/config/projects.json`. A project with
   `"worktrees": false` (e.g. a plain docs folder) runs its workers in place; give parallel workers
-  disjoint files to write. Never delete one with
-  uncommitted/unpushed work without the user's OK (`bin/zed close` refuses by default).
+  disjoint files to write; each gets a scratch folder `<project>/T<id>-<agent>` that `spawn` records.
+  Cleanup is automatic: `bin/zed close` removes the worktree once it has landed (the `bin/zed landed` test) and
+  the session's scratch folder unless a nested git repo in it holds unique work; it prints what it kept.
+  `bin/zed-hygiene report` lists leftovers and `--apply` removes scratch with no unique work. Never delete a
+  worktree that hasn't landed without the user's OK (never pass `force` unasked).
 - Never touch herdr panes/workspaces Zed didn't create.
 - New machine: see README.md.

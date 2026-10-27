@@ -12,14 +12,18 @@ user, or fix it (e.g. a worker finishes the plan), rather than forcing. Also che
 for the worker to act (e.g. PR review fixes requested → keep it, or respawn later).
 
 First harvest the worker's `Learnings:` (from its ZED:DONE) into `profile/knowledge/repos/<repo>.md`
-following the `learn` skill. Then `bin/zed close <S>` (runs the same test and refuses to remove a worktree that isn't landed; `keep-worktree`
-closes just the session; never pass `force` without the user's OK). Tell the user it was closed and where to resume from (PR/branch).
+following the `learn` skill. Then `bin/zed close <S>`: it runs the same landed-work test and refuses to remove a worktree that
+isn't landed (`keep-worktree` closes just the session; never pass `force` without the user's OK). Cleanup is automatic:
+close removes the landed worktree and, for in-place (non-git) projects, the session's scratch folder `<project>/T<id>-<agent>`,
+and prints what it removed or kept. Scratch is kept when a nested git repo in it has tracked changes or commits no remote
+has (`keep-scratch` keeps it regardless). Tell the user it was closed, what was kept and why, and where to resume from (PR/branch).
 
 Mark the task: `pr_open` while PRs await review/merge; `done` only when the user says it's done
 or the PR is merged (`bin/zed-pr state <url>`: verdict `merged`). Commit the profile.
 
 Housekeeping at wrap-up: `bin/zed-hygiene report --fetch` lists orphan/prunable worktrees, merged or
-gone branches and stale clones; tell the user what it finds. `--apply` fast-forwards clones and prunes, so
+gone branches, stale clones and leftover scratch folders; tell the user what it finds. `--apply` fast-forwards clones, prunes
+and deletes scratch leftovers with no unique work, so
 run it only with the user's OK, each time. Back up the record with `bin/zed-export export profile/db/backup.json`
 (commit it with the profile).
 
