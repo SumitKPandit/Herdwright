@@ -267,7 +267,7 @@ class ZedTests(unittest.TestCase):
                 patch.object(self.z, "run", return_value=subprocess.CompletedProcess([], 0, "feature/qa\n", "")) as run, \
                 patch.object(self.z, "record_credits"), patch.object(self.z, "cmd_spawn", return_value=2) as spawn:
             (self.root / "briefs").mkdir()
-            self.assertEqual(self.z.cmd_handoff(["S1", "runtime=auto"]), 2)
+            self.assertEqual(self.z.cmd_handoff(["S1", "runtime=auto", "copilot_reason=claude is limited in this test"]), 2)
             self.assertEqual(spawn.call_args.kwargs["worktree"], self.root)
             self.assertTrue(any(c.args[0] == ["herdr", "workspace", "close", "qa-ws"] for c in run.call_args_list))
             note = (self.root / "briefs/T1-scratch-handoff-S1.md").read_text()

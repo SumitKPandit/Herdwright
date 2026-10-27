@@ -306,14 +306,14 @@ class MergeHookEndToEndTests(GateCase):
 
 
 class HandoffEmployeeTests(GateCase):
-    def hand_off(self, *extra):
+    def hand_off(self, *extra, restart=True):
         sid = self.row("build", None, status="running")
         self.conn.execute("UPDATE sessions SET employee=NULL, hat=NULL, workspace_id='w', runtime='claude' WHERE id=?", (sid,))
         self.conn.commit()
         (self.profile / "briefs").mkdir(exist_ok=True)
         with patch.object(self.z, "close_workspace"), patch.object(self.z, "record_credits"), \
                 patch.object(self.z, "record_spend"), patch.object(self.z, "cmd_spawn", return_value=9) as spawn:
-            self.z.cmd_handoff([f"S{sid}", "restart", f"brief={self.brief}", *extra])
+            self.z.cmd_handoff([f"S{sid}", *(["restart"] if restart else []), f"brief={self.brief}", *extra])
         return spawn.call_args.args[0]
 
     def test_a_session_without_an_employee_goes_to_a_free_one(self):
@@ -330,21 +330,26 @@ class HandoffEmployeeTests(GateCase):
             args = self.hand_off()
         self.assertIn("ephemeral=no employee is free", args)
 
-    def test_handoff_to_copilot_gives_no_reason_of_its_own(self):
-        claude = {"installed": True, "enabled": True, "limited": None}
-        with patch.object(self.z, "choose_runtime", return_value="copilot"):
-            args = self.hand_off()
+    CLAUDE_USABLE = {"installed": True, "enabled": True, "limited": None}
+
+    def test_handoff_to_copilot_while_claude_is_usable_is_refused_before_closing_anything(self):
+        with patch.object(self.z, "choose_runtime", return_value="copilot"), \
+                patch.object(self.z, "runtime_report", return_value=self.CLAUDE_USABLE), self.assertRaises(SystemExit):
+            self.hand_off(restart=False)
+        self.assertIn("claude is usable", self.output.getvalue())
+        self.assertEqual(self.conn.execute("SELECT status FROM sessions").fetchone()[0], "running")
+
+    def test_handoff_to_copilot_when_claude_is_limited_gives_no_reason_of_its_own(self):
+        with patch.object(self.z, "choose_runtime", return_value="copilot"), \
+                patch.object(self.z, "runtime_report", return_value={**self.CLAUDE_USABLE, "limited": {"note": "cap"}}):
+            args = self.hand_off(restart=False)
         self.assertFalse(any(a.startswith("copilot_reason=") for a in args))
-        kv = self.z.parse_kv(args[1:])
-        self.assertIn("claude is usable", zedgates.copilot_before_claude("copilot", claude, kv))
-        self.assertIsNone(zedgates.copilot_before_claude("copilot", {**claude, "limited": {"note": "cap"}}, kv))
 
     def test_handoff_passes_the_callers_copilot_reason(self):
-        with patch.object(self.z, "choose_runtime", return_value="copilot"):
-            args = self.hand_off("copilot_reason=user asked for it")
+        with patch.object(self.z, "choose_runtime", return_value="copilot"), \
+                patch.object(self.z, "runtime_report", return_value=self.CLAUDE_USABLE):
+            args = self.hand_off("copilot_reason=user asked for it", restart=False)
         self.assertIn("copilot_reason=user asked for it", args)
-        self.assertIsNone(zedgates.copilot_before_claude(
-            "copilot", {"installed": True, "enabled": True, "limited": None}, self.z.parse_kv(args[1:])))
 
     def test_nothing_eligible_refuses_before_closing_anything(self):
         with patch.object(zedassign, "suggest", return_value=[]), self.assertRaises(SystemExit):

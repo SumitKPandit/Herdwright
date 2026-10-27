@@ -1988,6 +1988,8 @@ def cmd_handoff(args):
     target = s["runtime"] if restart else choose_runtime(kv.get("runtime", "auto"), exclude=(s["runtime"],))
     if target == s["runtime"] and not restart:
         die("handoff needs a different runtime (or `restart` for a fresh session on the same one)")
+    if reason := zedgates.copilot_before_claude(target, runtime_report("claude"), kv):
+        die(f"refused: {reason}")  # before anything is closed: spawn would refuse it after the old session is gone
     wt = s["worktree"]
     if not s["workspace_id"]:
         die("handoff needs the old worker's managed workspace so it can be stopped safely")
