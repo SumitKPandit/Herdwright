@@ -192,6 +192,15 @@ class ZedTests(unittest.TestCase):
                         self.assertIsNone(self.z.set_copilot_permissions("qa"))
                     self.assertIn(self.z.PERMISSION_MODE_MENU[mode], run.call_args.args[0])
 
+    def test_permission_selection_accepts_a_loading_footer_once_the_menu_closed(self):
+        menu = "Manual Approval\nAssisted Permissions\nAllow All"
+        self.config({"order": ["copilot"], "runtimes": {"copilot": {"permission_mode": "assisted"}}})
+        with patch.object(self.z, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):
+            with patch.object(self.z, "read_screen", side_effect=[menu, "prompt\n ◉ Loading: 1 plugin — still waiting on extensions; ide"]):
+                self.assertIsNone(self.z.set_copilot_permissions("qa"))
+            with patch.object(self.z, "read_screen", side_effect=[menu] + [menu + "\nLoading:"] * 30):
+                self.assertIn("could not switch", self.z.set_copilot_permissions("qa"))
+
     def test_permission_failure_does_not_look_successful(self):
         with patch.object(self.z, "run", return_value=subprocess.CompletedProcess([], 1, "", "blocked")):
             self.assertIn("could not open", self.z.set_copilot_permissions("qa"))

@@ -1214,7 +1214,8 @@ def set_copilot_permissions(agent):
         screen = read_screen(agent)
         # The menu itself contains every label; only accept the selected mode in the footer.
         footer = "\n".join(screen.strip().splitlines()[-4:])
-        if labels[mode] in footer and not all(label in screen for label in labels.values()):
+        # While Copilot still waits on an extension its footer shows the "Loading:" line instead of the mode.
+        if (labels[mode] in footer or "Loading:" in footer) and not all(label in screen for label in labels.values()):
             return None
         time.sleep(0.2)
     return f"could not switch to {labels[mode]}; footer: {footer!r}"

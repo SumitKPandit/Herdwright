@@ -23,6 +23,8 @@ Verdicts: `yes` works as needed, `partial` works with the stated limit, `no` una
   session shows `blocked` until answered.
 - Copilot may merge several commands into one tool call; give explicit "one call each" instructions in probes.
 - `--model auto` is accepted; an unavailable model name aborts with `Model "..." from --model flag is not available.`
+- `--model auto` works only with `-p`. In an interactive session it never finishes loading (footer `Loading: ... waiting on
+  extensions; ide`) and the first prompt stays queued; leave the model unset or name one (T23 end-to-end run).
 
 ## Hat deny policy as built (T23, verified 2026-10-27, Copilot CLI 1.0.103)
 
