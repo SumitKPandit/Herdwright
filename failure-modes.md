@@ -32,6 +32,7 @@ row here and, where possible, a check in `bin/zed`.
 
 | Failure | What the user experiences | Guard |
 |---|---|---|
+| Activity mistaken for delivery (files, plan ticks, verified-but-unpublished work) | "A full night and nothing new on Confluence" | Enforced: per-task delivery probe (`profile/config/delivery-probes.json`), and the watcher alerts `NO DELIVERY` after 60 min. Practice: publish each unit as soon as it's ready; never batch delivery to the end |
 | "Done" without proof (unpublished, no PR, no QA) | Trust lost | Practice: done only with evidence (URL read back, PR + QA notes); otherwise send it back |
 | Placeholder or missing content published | Embarrassment in front of Product | Practice: scripted completeness check before every publish |
 | Progress described as activity, not output | Can't judge whether things are on track | Practice: report delivered/total, spend vs budget, revised ETA with basis |

@@ -1845,7 +1845,7 @@ def cmd_watch(args):
     prev = {int(k): v for k, v in saved.items()} if saved is not None else {}
     first = saved is None
     alerts_path = WATCH_STATE_PATH.with_name("watch-alerts.json")
-    alerts = {int(k): v for k, v in read_json(alerts_path, {}).items()}  # health alerts already reported, kept across runs
+    alerts = {int(k) if k.isdigit() else k: v for k, v in read_json(alerts_path, {}).items()}  # health alerts already reported, kept across runs
     while True:
         if not holds_lock():
             h = read_lock()
@@ -1896,15 +1896,7 @@ def cmd_watch(args):
                     if line:
                         events.append(line)
                     prev[key] = snapshot
-                if state == "working" and (line := scan_working(conn, s, alerts)):
-                    events.append(line)
-                lapse = lapse_tick(s, state, snapshot["sequence"], alerts)
-                if lapse:
-                    kind, text = lapse
-                    if kind == "nudge":
-                        log_event(conn, s["task_id"], "auto", text)
-                    else:
-                        events.append(text)
+            events += delivery_events(alerts)
             first = False
             conn.commit()
             conn.close()
@@ -1931,6 +1923,37 @@ def prompt_summary(screen):
     lines = [l.strip(" │┃") .strip() for l in (screen or "").splitlines()[-30:]]
     keep = [l for l in lines if l and PROMPT_LINE.search(l) and "Tip:" not in l]
     return " | ".join(keep)[:600]
+
+
+DELIVERY_PROBES_PATH = PROFILE_DIR / "config" / "delivery-probes.json"
+DELIVERY_STALL_MINUTES = 60
+
+
+def delivery_events(alerts):
+    """Outcome checks: per task, a command printing one number, what has actually been delivered
+    (e.g. pages live on Confluence, PRs merged). Run every 15 min; wake Zed if a task with a running
+    session delivers nothing new for DELIVERY_STALL_MINUTES. Activity (files, plan ticks) is not delivery."""
+    out, now_t = [], time.time()
+    state = alerts.setdefault("delivery", {})
+    for tid, probe in read_json(DELIVERY_PROBES_PATH, {}).items():
+        st = state.setdefault(tid, {})
+        if now_t - st.get("checked", 0) < 900:
+            continue
+        st["checked"] = now_t
+        r = run(["bash", "-c", probe["command"]], check=False)
+        try:
+            value = int(r.stdout.strip().split()[-1])
+        except (ValueError, IndexError):
+            out.append(f"T{tid} delivery probe failed: {(r.stderr or r.stdout).strip()[:200]}")
+            continue
+        if value != st.get("value"):
+            st["value"], st["since"] = value, now_t
+            continue
+        idle = int((now_t - st.get("since", now_t)) // 60)
+        if idle >= DELIVERY_STALL_MINUTES and st.get("reported") != st.get("since"):
+            st["reported"] = st["since"]
+            out.append(f"T{tid} · NO DELIVERY: {probe.get('what', 'delivered count')} still {value} for {idle} min")
+    return out
 
 
 TOOLING_DIRS = {".git", "tools", "bin", "node_modules", ".venv", "venv", "__pycache__", ".ext"}
