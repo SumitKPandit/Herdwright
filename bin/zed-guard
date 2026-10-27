@@ -39,6 +39,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import zedgates  # noqa: E402
 import zedlib  # noqa: E402
 
 DEFAULT_PROTECTED = ["main", "master", "releases/*"]
@@ -143,6 +144,10 @@ def cmd_install(a):
     prev = effective_hooks_path(wt)
     d = hook_dir(wt)
     if str(d) == prev:
+        cfg = read_config(wt)
+        if cfg and cfg.get("gate") != a.gate:  # the hooks stay; only the gate setting changes
+            cfg["gate"] = a.gate
+            (d / "config.json").write_text(json.dumps(cfg))
         print("zed-guard: already pointing at its own hooks; run `remove` first", file=sys.stderr)
         return 2
     d.mkdir(parents=True, exist_ok=True)
@@ -179,15 +184,6 @@ def read_config(wt):
     return zedlib.read_json(hook_dir(wt) / "config.json", {}) or {}
 
 
-def gate_reason(wt):
-    """A `gate(sha)` for push_problems: `bin/zed gate check` (clean review and qa by non-authors at that sha)."""
-    def gate(sha):
-        r = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "zed"), "gate", "check", sha, str(wt)],
-                           capture_output=True, text=True)
-        return None if r.returncode == 0 else (r.stderr.strip() or r.stdout.strip() or "the merge gate did not pass")
-    return gate
-
-
 def cmd_hook(a):
     wt = Path.cwd()
     cfg = read_config(wt)
@@ -207,7 +203,7 @@ def cmd_hook(a):
             return 1
     elif a.name == "pre-push":
         anc = lambda old, new: worktree_git(wt, "merge-base", "--is-ancestor", old, new).returncode == 0
-        problems = push_problems(sys.stdin.read().splitlines(), cfg["protected"], anc, gate_reason(wt) if cfg.get("gate") else None)
+        problems = push_problems(sys.stdin.read().splitlines(), cfg["protected"], anc, (lambda sha: zedgates.gate_reason(wt, sha)) if cfg.get("gate") else None)
         for p in problems:
             print(f"zed-guard: {p}", file=sys.stderr)
         return 1 if problems else 0

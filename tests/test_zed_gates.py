@@ -20,6 +20,12 @@ HOME = Path(__file__).resolve().parents[1]
 
 
 class PureGateTests(unittest.TestCase):
+    def test_the_gate_check_a_hook_runs_never_sees_the_override(self):
+        with patch.dict(os.environ, {"ZED_GATE_OVERRIDE": "worker says so"}), patch.object(zedgates.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 1, "", "no review")
+            self.assertEqual(zedgates.gate_reason(HOME), "no review")
+        self.assertNotIn("ZED_GATE_OVERRIDE", run.call_args.kwargs["env"])
+
     def test_spawn_without_employee(self):
         self.assertIn("juno", zedgates.spawn_without_employee(["juno"], {}))
         self.assertIsNone(zedgates.spawn_without_employee(["juno"], {"employee": "juno"}))

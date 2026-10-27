@@ -3,6 +3,8 @@
 Each returns the reason it refuses, or None / an empty list when the action is allowed, so `bin/zed` stays thin and
 every gate is unit-tested for both outcomes.
 """
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -28,6 +30,14 @@ def merge_problems(conn, sha):
             problems.append(f"{hat} of {sha[:10]} is not clean by a non-author (S{last['id']}: {last['employee'] or 'no employee'}, "
                             f"verdict {last['verdict'] or 'none'})")
     return problems
+
+
+def gate_reason(worktree, sha="HEAD"):
+    """Why `sha` of `worktree` may not leave it yet (`bin/zed gate check`: clean review and qa by non-authors), or None."""
+    zed = Path(__file__).resolve().parent.parent / "zed"
+    env = {k: v for k, v in os.environ.items() if k != "ZED_GATE_OVERRIDE"}  # only the user's own `gate check` may override
+    r = subprocess.run([sys.executable, str(zed), "gate", "check", sha, str(worktree)], capture_output=True, text=True, env=env)
+    return None if r.returncode == 0 else (r.stderr.strip() or r.stdout.strip() or "the merge gate did not pass")
 
 
 def spawn_without_employee(free, kv):

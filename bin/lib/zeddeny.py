@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import zedgates  # noqa: E402
 import zedshell  # noqa: E402
 
 EDIT_TOOLS = {"edit", "write", "notebookedit", "multiedit", "create", "str_replace", "str_replace_editor", "apply_patch"}
@@ -37,7 +38,7 @@ def glob_regex(pattern):
     return re.compile(out + r"\Z")
 
 
-def matches(p, pattern, worktree, profile):
+def path_matches(p, pattern, worktree, profile):
     """Whether the resolved path `p` matches `pattern`: one beginning `profile/` is relative to the profile folder, any
     other to the worktree. `{session}` in a pattern is this session's id (ZED_SESSION)."""
     pattern = pattern.replace("{session}", os.environ.get("ZED_SESSION", "-"))
@@ -53,18 +54,22 @@ def denied_path(path, patterns, worktree, profile, cwd, exceptions=()):
     p = Path(os.path.expanduser(str(path)))
     p = Path(os.path.realpath(p if p.is_absolute() else Path(cwd) / p))
     for pattern in patterns:
-        if matches(p, pattern, worktree, profile) and not (
-                pattern != EMPLOYEE_DATA and any(matches(p, e, worktree, profile) for e in exceptions)):
+        if path_matches(p, pattern, worktree, profile) and not (
+                pattern != EMPLOYEE_DATA and any(path_matches(p, e, worktree, profile) for e in exceptions)):
             return pattern
     return None
 
 
 def holds_profile(repo, profile, cwd):
-    """True when `repo` is the checkout the profile lives in (or a folder above it): `git -C <that> commit` would
+    """True when `repo` is the checkout the profile lives in (any folder of it, or a folder above it): `git -C <that> commit` would
     commit profile files, which a hat that may not edit them must not do."""
     p = Path(os.path.expanduser(str(repo)))
     p = Path(os.path.realpath(p if p.is_absolute() else Path(cwd) / p))
-    return p == Path(os.path.realpath(profile)) or p in Path(os.path.realpath(profile)).parents
+    profile = Path(os.path.realpath(profile))
+    if p == profile or p in profile.parents:
+        return True
+    top = lambda d: subprocess.run(["git", "-C", str(d), "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip()
+    return p.is_dir() and top(p) != "" and os.path.realpath(top(p)) == os.path.realpath(top(profile))
 
 
 UNRESOLVED = re.compile(r"[$`]|^~[^/]")
@@ -82,13 +87,6 @@ def command_denied(words, prefixes):
         if len(words) >= len(want) and Path(words[0]).name == want[0] and words[1:len(want)] == want[1:]:
             return prefix
     return None
-
-
-def gate_reason(worktree):
-    """Why the worktree's HEAD may not leave it yet (`bin/zed gate check`: clean review and qa by non-authors), or None."""
-    zed = Path(__file__).resolve().parent.parent / "zed"
-    r = subprocess.run([sys.executable, str(zed), "gate", "check", "HEAD", str(worktree)], capture_output=True, text=True)
-    return None if r.returncode == 0 else (r.stderr.strip() or r.stdout.strip() or "the merge gate did not pass")
 
 
 def shell_problem(cmd, manifest, worktree, profile, cwd):
@@ -122,7 +120,7 @@ def shell_problem(cmd, manifest, worktree, profile, cwd):
         if prefix := command_denied(words, deny["commands"]):
             return f"`{prefix}` is denied to this hat: anything outward goes to Zed as a draft"
         if prefix := command_denied(words, deny.get("gated", [])):
-            if reason := gate_reason(worktree):
+            if reason := zedgates.gate_reason(worktree):
                 return f"`{prefix}` waits for a clean review and qa of this branch: {reason}"
         targets = [words[i + 1] for i, w in enumerate(words[:-1]) if w in zedshell.REDIRECTS and not words[i + 1].startswith("&")]
         name = Path(words[0]).name

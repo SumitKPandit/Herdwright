@@ -2,6 +2,7 @@ import io
 import json
 import os
 import sys
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr
@@ -107,25 +108,34 @@ class DecideTests(unittest.TestCase):
             self.assertIsNone(self.bash(hat, f"git -C {self.evidence} commit -m x"), hat)
         self.assertIsNone(self.bash("build", f"git -C {home} commit -m x"))
 
+    def test_a_folder_of_the_checkout_holding_the_profile_counts_as_holding_it(self):
+        home = self.profile.parent
+        (home / "bin").mkdir()
+        subprocess.run(["git", "-C", str(home), "init", "-q"], check=True)
+        for hat in ("review", "qa"):
+            self.assertIn("denied", self.bash(hat, f"git -C {home / 'bin'} commit -am x"), hat)
+            self.assertIn("denied", self.bash(hat, f"cd {home / 'bin'} && git commit -am x"), hat)
+            self.assertIsNone(self.bash(hat, f"git -C {home / 'bin'} log"), hat)
+
     def test_raising_a_pr_waits_for_the_merge_gate(self):
         commands = ("gh pr create --draft --title x", "/opt/bin/bb pr create --draft", "git push && gh pr create")
-        with mock.patch.object(zeddeny, "gate_reason", return_value="no review verdict recorded") as gate:
+        with mock.patch.object(zeddeny.zedgates, "gate_reason", return_value="no review verdict recorded") as gate:
             for command in commands:
                 self.assertIn("waits for a clean review and qa", self.bash("build", command), command)
             gate.assert_called_with(self.wt)
             self.assertIsNone(self.bash("build", "gh pr view 3"))
             self.assertIsNone(self.bash("build", "echo gh pr create"))
-        with mock.patch.object(zeddeny, "gate_reason", return_value=None):
+        with mock.patch.object(zeddeny.zedgates, "gate_reason", return_value=None):
             for command in commands:
                 self.assertIsNone(self.bash("build", command), command)
 
     def test_the_gate_reason_comes_from_zed_gate_check(self):
-        with mock.patch.object(zeddeny.subprocess, "run") as run:
+        with mock.patch.object(zeddeny.zedgates.subprocess, "run") as run:
             run.return_value = mock.Mock(returncode=1, stdout="", stderr="merge gate: no qa verdict")
-            self.assertEqual(zeddeny.gate_reason(self.wt), "merge gate: no qa verdict")
+            self.assertEqual(zeddeny.zedgates.gate_reason(self.wt), "merge gate: no qa verdict")
             self.assertEqual(run.call_args.args[0][2:5], ["gate", "check", "HEAD"])
             run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
-            self.assertIsNone(zeddeny.gate_reason(self.wt))
+            self.assertIsNone(zeddeny.zedgates.gate_reason(self.wt))
 
     def test_a_variable_repo_after_dash_c_cannot_be_checked_for_a_read_only_hat(self):
         for hat in ("review", "qa"):

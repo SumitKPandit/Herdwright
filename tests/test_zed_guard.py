@@ -176,17 +176,33 @@ class HookTests(unittest.TestCase):
         gone = git(self.wt, "push", "origin", ":task/ment-9-x", check=False)
         self.assertIn("deleting remote branch", gone.stderr)
 
-    def test_a_gated_worktree_refuses_a_push_without_review_and_qa_and_an_ungated_one_pushes(self):
+    def test_installing_again_with_the_gate_turns_it_on_in_a_guarded_worktree(self):
+        self.install("--jira", "MENT-9")
+        cfg = Path(git(self.wt, "config", "--get", "core.hooksPath").stdout.strip()) / "config.json"
+        self.assertFalse(json.loads(cfg.read_text())["gate"])
+        again = subprocess.run([GUARD, "install", str(self.wt), "--gate"], capture_output=True, text=True,
+                               env={**os.environ, "ZED_PROFILE_DIR": str(self.r / "no-profile")})
+        self.assertEqual(again.returncode, 2)
+        self.assertIn("already pointing", again.stderr)
+        self.assertTrue(json.loads(cfg.read_text())["gate"])
+
+    def test_a_gated_worktree_refuses_a_push_without_review_and_qa(self):
         profile = self.r / "gate-profile"
         (profile / "db").mkdir(parents=True)
         (profile / "profile.md").write_text("# test profile\n")
         self.install("--jira", "MENT-9", "--gate", profile=str(profile))
         self.assertEqual(self.commit("MENT-9 | one").returncode, 0)
-        env = {**os.environ, "ZED_PROFILE_DIR": str(profile)}
+        env = {**os.environ, "ZED_PROFILE_DIR": str(profile), "ZED_GATE_OVERRIDE": "worker says so"}  # only the user may override
         refused = subprocess.run(["git", "push", "origin", "HEAD:refs/heads/task/ment-9-x"], cwd=self.wt, capture_output=True, text=True, env=env)
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("push of 'task/ment-9-x' refused", refused.stderr)
         self.assertIn("no review verdict recorded", refused.stderr)
+
+    def test_an_ungated_worktree_pushes_without_asking_the_gate(self):
+        self.install("--jira", "MENT-9")
+        self.assertEqual(self.commit("MENT-9 | one").returncode, 0)
+        ok = git(self.wt, "push", "-q", "origin", "HEAD:refs/heads/task/ment-9-x", check=False)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
 
     def test_remove_restores_repo_hooks(self):
         self.install("--jira", "MENT-9")
