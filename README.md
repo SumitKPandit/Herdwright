@@ -1,7 +1,7 @@
 # Zed
 
-Zed is a personal engineering assistant that runs on [Claude Code](https://claude.com/claude-code),
-[GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/copilot-cli), or both.
+Zed is a personal engineering assistant that runs on [Pi](https://github.com/badlogic/pi-mono),
+[Claude Code](https://claude.com/claude-code), [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/copilot-cli), or a mix.
 You talk only to Zed. It takes your requests, writes a brief for each, and hands the work to
 worker sessions running in [herdr](https://herdr.dev), one git worktree per session. It relays
 their questions to you and your answers back, tracks every task, question and decision in a
@@ -19,12 +19,12 @@ What every Zed does, whoever uses it:
 
 ## Get started
 
-1. Install the prerequisites: Claude Code (`claude`) and/or GitHub Copilot CLI (`copilot`), herdr,
+1. Install the prerequisites: Pi (`pi`), Claude Code (`claude`), and/or GitHub Copilot CLI (`copilot`), herdr,
    git, `gh` (logged in), python3.
    `bin/bb`, the Bitbucket helper, needs macOS (it keeps its token in the Keychain).
 2. Clone Zed: `git clone <this repo> ~/zed && cd ~/zed && bin/zed-setup`
    (checks the prerequisites and installs the git guard hooks).
-3. Start herdr, open a pane in the Zed folder and run `claude` or `copilot` (Copilot: keep it in
+3. Start herdr, open a pane in the Zed folder and run `pi`, `claude` or `copilot` (Copilot: keep it in
    interactive mode, never autopilot).
 4. Say hi. On first run Zed **onboards you**: it asks who you are, how you work, which repos and
    tools you use, connects and verifies your accounts (GitHub, Bitbucket, Jira, Slack, …), and
@@ -37,7 +37,7 @@ about you lives in **`profile/`**, which exists only on your profile branch.
 
 | Path | What |
 |---|---|
-| `CLAUDE.md` | Zed's operating manual (loaded automatically by both Claude Code and Copilot CLI) |
+| `CLAUDE.md` | Zed's operating manual (loaded automatically by Pi, Claude Code, and Copilot CLI) |
 | `playbook.md` | Lessons about tools and workflow that help every Zed |
 | `.claude/skills/` | Zed's workflows: onboarding, new-task, check-workers, relay, wrap-up, learn, switch-runtime, models (both CLIs load them) |
 | `templates/` | Core worker rules (system prompt or custom instructions) and the brief skeleton |

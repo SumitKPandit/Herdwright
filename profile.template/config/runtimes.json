@@ -1,9 +1,14 @@
 {
   "order": [
+    "pi",
     "claude",
     "copilot"
   ],
   "runtimes": {
+    "pi": {
+      "enabled": true,
+      "max_running": 3
+    },
     "claude": {
       "enabled": true,
       "max_running": 3,

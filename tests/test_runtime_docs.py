@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 DOCS = Path(__file__).resolve().parents[1] / "docs" / "runtimes"
-RUNTIMES = ("claude", "copilot")
+RUNTIMES = ("claude", "copilot", "pi")
 CELLS = ("deny", "identity", "stop hook", "skills", "subagent cap", "prompt to a *working* session",
          "doorbell")
 VERDICTS = {"yes", "partial", "no"}

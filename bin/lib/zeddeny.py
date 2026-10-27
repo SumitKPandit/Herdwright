@@ -209,3 +209,44 @@ def copilot_plugin(directory, zed_home, name="zed-deny"):
 
 def copilot_deny_tools(manifest):
     return [f"shell({prefix})" for prefix in manifest["deny"]["commands"]]
+
+
+def pi_extension(path, zed_home):
+    """A per-session Pi extension that intercepts tool calls and invokes zed-deny on tool_call,
+    and runs zed-employee stop-guard on turn_end."""
+    hook = hook_command(zed_home)
+    stop = stop_command(zed_home)
+    content = f"""import {{ spawnSync }} from "node:child_process";
+import type {{ ExtensionAPI }} from "@earendil-works/pi-coding-agent";
+
+export default function (pi: ExtensionAPI) {{
+  pi.on("tool_call", async (event, ctx) => {{
+    const payload = JSON.stringify({{
+      tool_name: event.toolName,
+      tool_input: event.input,
+      cwd: process.cwd()
+    }});
+    const res = spawnSync({json.dumps(hook)}, [], {{
+      input: payload,
+      encoding: "utf-8",
+      env: process.env
+    }});
+    if (res.status === 2) {{
+      return {{ block: true, reason: (res.stderr || res.stdout || "Blocked by Zed policy").trim() }};
+    }}
+    return undefined;
+  }});
+
+  pi.on("turn_end", async () => {{
+    spawnSync({json.dumps(stop)}, {{
+      shell: true,
+      encoding: "utf-8",
+      env: process.env
+    }});
+  }});
+}}
+"""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(content)
+    return Path(path)
+

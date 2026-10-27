@@ -48,7 +48,7 @@ class ZedTests(unittest.TestCase):
             self.assertFalse(self.z.runtime_report("copilot")["enabled"])
 
     def test_single_runtime_profiles(self):
-        for runtime in ("claude", "copilot"):
+        for runtime in ("claude", "copilot", "pi"):
             with self.subTest(runtime=runtime):
                 self.config({"order": [runtime]})
                 with patch.object(self.z.shutil, "which", return_value="/cli"):
@@ -77,6 +77,30 @@ class ZedTests(unittest.TestCase):
             with patch.object(self.z, "ancestor_pids", return_value=[300, 100, 200]):
                 self.assertEqual(self.z.me()["runtime"], "claude")
                 self.assertEqual(self.z.me()["agent_session"], "claude-session")
+
+    def test_pi_runtime_identity(self):
+        env = {"PI_SESSION_ID": "pi-sess-123", "HERDR_PANE_ID": "qa:p1"}
+        with patch.dict(os.environ, env, clear=True):
+            with patch.object(self.z, "ancestor_pids", return_value=[300, 200]):
+                with patch.object(self.z, "run") as mock_run:
+                    mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="pi\n")
+                    identity = self.z.me()
+                    self.assertEqual(identity["runtime"], "pi")
+                    self.assertEqual(identity["agent_session"], "pi-sess-123")
+                    self.assertEqual(identity["pid"], 300)
+
+    def test_pi_runtime_launch(self):
+        self.config({"order": ["pi"], "runtimes": {"pi": {"exclude_tools": ["mcp__dangerous"]}}})
+        env, args = self.z.runtime_launch("pi", "qa-agent", "gemini-3.8-flash", "medium")
+        self.assertEqual(env, [])
+        self.assertIn("--approve", args)
+        self.assertIn("-n", args)
+        self.assertEqual(args[args.index("-n") + 1], "qa-agent")
+        self.assertIn("--model", args)
+        self.assertEqual(args[args.index("--model") + 1], "gemini-3.8-flash")
+        self.assertIn("--thinking", args)
+        self.assertEqual(args[args.index("--thinking") + 1], "medium")
+        self.assertIn("--exclude-tools=mcp__dangerous", args)
 
     def test_legacy_lock_identity(self):
         self.assertTrue(self.z.same_holder({"claude_session": "old"}, {"agent_session": "old"}))

@@ -9,7 +9,7 @@ Concepts
   task     a unit of work the user asked for (usually one Jira ticket)
   session  one worker (Claude Code or GitHub Copilot CLI) running in herdr, in its own git
            worktree, on one repo
-  runtime  the agent CLI a session runs on: `claude` or `copilot` (see RUNTIMES). Which ones the
+  runtime  the agent CLI a session runs on: `pi`, `claude` or `copilot` (see RUNTIMES). Which ones the
            user has, their order of preference and the model policy live in
            <profile>/config/runtimes.json
   question something a worker (or Zed) needs the user to decide
@@ -79,6 +79,15 @@ DASHBOARD_STATE_PATH = PROFILE_DIR / ".cache" / "dashboard.json"
 # What Zed needs to know about each agent CLI it can run on. Everything user-specific (which ones
 # they have, preference order, model policy, permission mode) is in <profile>/config/runtimes.json.
 RUNTIMES = {
+    "pi": {
+        "cli": "pi",
+        "session_env": "PI_SESSION_ID",
+        "pid_env": "PI_PID",
+        "efforts": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+        "trust_prompt": "Trust project-local files",
+        "trust_keys": ["enter"],
+        "limit_patterns": [r"rate.limited", r"rate limit", r"quota exceeded", r"429\b", r"resource exhausted"],
+    },
     "claude": {
         "cli": "claude",
         "session_env": "CLAUDE_CODE_SESSION_ID",  # set in the shell of every Claude Code session
@@ -200,7 +209,7 @@ def now():
 
 def require_profile():
     if not (PROFILE_DIR / "profile.md").exists():
-        die(f"no profile at {PROFILE_DIR}. Start `claude` or `copilot` in {ZED_HOME} to run onboarding, "
+        die(f"no profile at {PROFILE_DIR}. Start `pi`, `claude` or `copilot` in {ZED_HOME} to run onboarding, "
             "or set ZED_PROFILE_DIR.")
 
 
@@ -249,6 +258,14 @@ def me():
     Env vars are inherited, so when both runtimes' vars are set, the nearest ancestor process wins."""
     found = {name: int(os.environ[rt["pid_env"]]) for name, rt in RUNTIMES.items()
              if os.environ.get(rt["pid_env"], "").isdigit()}
+    if "pi" not in found and (os.environ.get("PI_SESSION_ID") or os.environ.get("PI_CODING_AGENT")):
+        pi_pid = None
+        for p in ancestor_pids():
+            comm = run(["ps", "-o", "comm=", "-p", str(p)], check=False).stdout.strip()
+            if comm.endswith("pi") or comm.endswith("node"):
+                pi_pid = p
+                break
+        found["pi"] = pi_pid or os.getppid()
     runtime = None
     if len(found) > 1:
         order = ancestor_pids()
@@ -464,14 +481,16 @@ def available_models(runtime):
         text = run(["copilot", "help", "config"], check=False).stdout
         section = text.split("`model`", 1)[1].split("\n\n", 1)[0] if "`model`" in text else ""
         return {norm_model(m): m for m in re.findall(r'-\s+"([^"]+)"', section)}
-    if runtime == "claude":  # Claude Code has no listing; it accepts any Claude model's full name
+    if runtime in ("claude", "pi"):  # Claude Code and Pi accept any model ID configured or given
         return None
     return {}
 
 
 def runtime_model_id(runtime, model, available):
-    if available is None:  # claude: Anthropic model ids use dashes (claude-opus-5-5)
-        return model.replace(".", "-") if norm_model(model).startswith("claude") else None
+    if available is None:  # claude / pi
+        if runtime == "claude":
+            return model.replace(".", "-") if norm_model(model).startswith("claude") else None
+        return model  # pi accepts any model id
     return available.get(norm_model(model))
 
 
@@ -592,15 +611,21 @@ def require_capacity(conn, runtime, tid):
 
 
 def coordinator_command(mode):
-    """The `claude` command line that starts Zed's own session in `mode` ('routine' or 'judgment'), from the
-    profile's runtimes.json `coordinator.<mode>` ({"model", "effort"}), never above the claude ceiling."""
+    """The command line that starts Zed's own session in `mode` ('routine' or 'judgment'), from the
+    profile's runtimes.json `coordinator.<mode>` ({"model", "effort"}), never above the runtime ceiling."""
     choice = runtime_config().get("coordinator", {}).get(mode)
     if mode not in ("routine", "judgment") or not choice:
         die(f"runtimes.json has no coordinator.{mode} ({{\"model\", \"effort\"}}); modes: routine, judgment")
-    model, effort, _ = apply_ceiling("claude", choice.get("model"), choice.get("effort"), "")
-    if effort and effort not in RUNTIMES["claude"]["efforts"]:
+    order = runtime_config().get("order", ["claude"])
+    rt = order[0] if order else "claude"
+    if rt not in RUNTIMES:
+        rt = "claude"
+    model, effort, _ = apply_ceiling(rt, choice.get("model"), choice.get("effort"), "")
+    if effort and effort not in RUNTIMES[rt]["efforts"]:
         die(f"invalid coordinator effort '{effort}'")
-    return ["claude", *(["--model", model] if model else []), *(["--effort", effort] if effort else [])]
+    if rt == "pi":
+        return ["pi", *(["--model", model] if model else []), *(["--thinking", effort] if effort else [])]
+    return [RUNTIMES[rt]["cli"], *(["--model", model] if model else []), *(["--effort", effort] if effort else [])]
 
 
 def cmd_coordinator(args):
@@ -1287,6 +1312,15 @@ def runtime_launch(runtime, agent, model, effort, kit=None):
     its `kit` (employee_kit): its own rules file and its hat's deny policy replace the shared ones."""
     rules = worker_rules()
     model_args = (["--model", model] if model else [])
+    if runtime == "pi":
+        rs = runtime_settings("pi")
+        args = ["--approve", "-n", agent, "--append-system-prompt", str((kit or {}).get("rules", rules)),
+                *model_args, *(["--thinking", effort] if effort else [])]
+        if kit and kit.get("pi_extension"):
+            args.extend(["--extension", str(kit["pi_extension"])])
+        for tool in rs.get("exclude_tools", []):
+            args.append(f"--exclude-tools={tool}")
+        return [], args
     if runtime == "claude":
         # --add-dir: workers read their brief, rules and knowledge from the profile outside their worktree.
         return [], ["--permission-mode", "auto", "-n", agent, "--append-system-prompt-file", str((kit or {}).get("rules", rules)),
@@ -1315,12 +1349,14 @@ def employee_kit(name, hat, repo, tags, sid, agent, worktree):
     pack = emp.make_pack(name, repo, hat, tags, f"S{sid}")[1]
     rules = worker_rules_text() + "\n\n" + emp.employee_rules(name, hat, pack)
     kit = {"pack": pack, "rules": out / f"{agent}-rules.md", "instructions": out / f"{agent}-instructions",
-           "claude_settings": out / f"{agent}-settings.json", "copilot_plugin": out / f"{agent}-plugin"}
+           "claude_settings": out / f"{agent}-settings.json", "copilot_plugin": out / f"{agent}-plugin",
+           "pi_extension": out / f"{agent}-extension.ts"}
     kit["instructions"].mkdir(parents=True, exist_ok=True)
     kit["rules"].write_text(rules)
     (kit["instructions"] / "zed-worker.instructions.md").write_text(rules)
     kit["claude_settings"].write_text(json.dumps(zeddeny.claude_settings(ZED_HOME), indent=2) + "\n")
     zeddeny.copilot_plugin(kit["copilot_plugin"], ZED_HOME)
+    zeddeny.pi_extension(kit["pi_extension"], ZED_HOME)
     kit["deny_tools"] = zeddeny.copilot_deny_tools(emp.load_manifest(hat))
     env = [f"ZED_EMPLOYEE={name}", f"ZED_HAT={hat}", f"ZED_SESSION=S{sid}", f"ZED_WORKTREE={worktree}",
            f"ZED_PROFILE_DIR={PROFILE_DIR}"]  # so zed-employee and zed-deny find this profile, wherever it is
@@ -1435,11 +1471,11 @@ def cmd_brief(args):
 
 def cmd_spawn(args, worktree=None):
     """spawn <task-id> repo=<repo> base=<branch> branch=<branch> brief=<path> [name=<agent>]
-    [runtime=auto|claude|copilot] [model=] [effort=] [kind=<worktype|investigation|design…>] [handoff=<note>]
+    [runtime=auto|pi|claude|copilot] [model=] [effort=] [kind=<worktype|investigation|design…>] [handoff=<note>]
     [employee=<name> hat=<build|review|qa|…> [tags=a,b] [origin=zed|user|schedule]]  (an employee's assignment)
     [ephemeral=<why no employee fits>] [copilot_reason=<why Copilot while Claude is usable>]"""
     if not args:
-        die("spawn <task-id> repo=... base=... branch=... brief=<file> [name=...] [runtime=auto|claude|copilot] "
+        die("spawn <task-id> repo=... base=... branch=... brief=<file> [name=...] [runtime=auto|pi|claude|copilot] "
             "[model=] [effort=] [kind=] [from=] [handoff=<note>] [employee= hat= tags= origin=]")
     tid = int(args[0].lstrip("T"))
     kv = parse_kv(args[1:])
@@ -1959,10 +1995,10 @@ def cmd_adopt(args):
 
 
 def cmd_handoff(args):
-    """handoff <S|agent> [runtime=auto|claude|copilot] [brief=<file>] [model=] [effort=] [copilot_reason=<why>] — move a stopped worker (e.g. one paused
+    """handoff <S|agent> [runtime=auto|pi|claude|copilot] [brief=<file>] [model=] [effort=] [copilot_reason=<why>] — move a stopped worker (e.g. one paused
     by a usage limit) to a new session on another runtime, in the same worktree and branch. Only with the user's OK."""
     if not args:
-        die("handoff <S|agent> [runtime=auto|claude|copilot] [brief=<file>]")
+        die("handoff <S|agent> [runtime=auto|pi|claude|copilot] [brief=<file>]")
     conn = db()
     require_lock()
     ref = session_ref(args[0])
@@ -3202,7 +3238,7 @@ def cmd_help(args):
                                      scaffold the brief from the task, projects.json, repo notes and plan
                                      block; leaves <FILL: …> for the model, which spawn refuses
   spawn <T> repo= base= branch= brief=<file> [name=<agent>] [from=<start-ref, default origin/<base>>]
-        [runtime=auto|claude|copilot] [model=] [effort=] [kind=] [handoff=<note>]
+        [runtime=auto|pi|claude|copilot] [model=] [effort=] [kind=] [handoff=<note>]
                                      runtime/model/effort default to the profile's order and model policy;
                                      kind (default: the task's worktype) picks the effort by model_policy.effort_by_kind;
                                      beyond runtimes.<rt>.max_running the task is queued (exit 75)

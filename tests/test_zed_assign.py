@@ -290,6 +290,12 @@ class RenderedPolicyTests(AssignCase):
         self.assertEqual(settings["hooks"]["Stop"][0]["hooks"][0]["command"], f"{HOME / 'bin' / 'zed-employee'} stop-guard")
         self.assertEqual(json.loads((kit["copilot_plugin"] / "plugin.json").read_text())["name"], "zed-deny")
         self.assertIn("ZED_HAT=review", env)
+        _, pi_args = self.z.runtime_launch("pi", "quill-t20", None, None, kit)
+        self.assertIn("--extension", pi_args)
+        self.assertEqual(pi_args[pi_args.index("--extension") + 1], str(kit["pi_extension"]))
+        self.assertTrue(kit["pi_extension"].exists())
+        self.assertIn("zed-deny", kit["pi_extension"].read_text())
+        self.assertIn("stop-guard", kit["pi_extension"].read_text())
 
     def test_a_plain_worker_is_launched_as_before(self):
         _, claude = self.z.runtime_launch("claude", "t1-api", None, None)
@@ -297,6 +303,8 @@ class RenderedPolicyTests(AssignCase):
         env, copilot = self.z.runtime_launch("copilot", "t1-api", None, None)
         self.assertEqual(env, [f"COPILOT_CUSTOM_INSTRUCTIONS_DIRS={self.z.COPILOT_INSTRUCTIONS_DIR}"])
         self.assertNotIn("--plugin-dir", copilot)
+        _, pi_args = self.z.runtime_launch("pi", "t1-api", None, None)
+        self.assertNotIn("--extension", pi_args)
 
 
 if __name__ == "__main__":
