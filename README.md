@@ -44,6 +44,7 @@ about you lives in **`profile/`**, which exists only on your profile branch.
 | `bin/zed` | Task DB and herdr session driver (`bin/zed help`) |
 | `bin/bb` | Bitbucket PR helper for workers |
 | `bin/zed-setup` | Prerequisite check + git guard hooks (`hooks/`) |
+| `bin/zed-employee`, `bin/zed-deny` | Named, persistent employees with hats (build, review, qa): `zed spawn employee= hat=`, `zed assign`, `zed-employee board|finish` (see `docs/runtimes/employees-pilot-e2e.md`) |
 | `bin/zed-core-sync` | Carries core improvements from your profile branch to `main` |
 | `profile.template/` | The skeleton onboarding copies to `profile/` |
 | `profile/` | Yours: `profile.md`, `rules.md` (your rules for workers), `lessons.md`, `knowledge/`, `config/` (incl. `runtimes.json`: which runtimes you have, in what order, and how models are chosen), `briefs/`, `db/`, `STATUS.md` |

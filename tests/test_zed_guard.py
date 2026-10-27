@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import tempfile
@@ -19,9 +20,9 @@ def git(cwd, *a, check=True):
 class PureTests(unittest.TestCase):
     def test_protected(self):
         pats = guard.DEFAULT_PROTECTED
-        for b in ("main", "deploy", "releases/v6.2.1", "velocity-build", "medusa"):
+        for b in ("main", "master", "releases/v6.2.1"):
             self.assertTrue(guard.is_protected(b, pats), b)
-        for b in ("story/ment-1-x", "chore/releases", "mainline"):
+        for b in ("story/abc-1-x", "chore/releases", "mainline", "deploy", "medusa"):
             self.assertFalse(guard.is_protected(b, pats), b)
 
     def test_commit_message(self):
@@ -74,8 +75,9 @@ class HookTests(unittest.TestCase):
         git(r / "clone", "worktree", "add", "-q", "-b", "task/ment-9-x", str(self.wt), "origin/main")
         self.r = r
 
-    def install(self, *extra):
-        out = subprocess.run([GUARD, "install", str(self.wt), *extra], capture_output=True, text=True)
+    def install(self, *extra, profile=None):
+        env = {**os.environ, "ZED_PROFILE_DIR": profile or str(self.r / "no-profile")}
+        out = subprocess.run([GUARD, "install", str(self.wt), *extra], capture_output=True, text=True, env=env)
         self.assertEqual(out.returncode, 0, out.stderr)
 
     def commit(self, msg, name="f.txt"):
@@ -97,10 +99,36 @@ class HookTests(unittest.TestCase):
     def test_no_commit_format_and_protected_branch(self):
         self.install("--no-commit-format")
         self.assertEqual(self.commit("anything goes").returncode, 0)
-        git(self.wt, "checkout", "-q", "-b", "deploy")
-        r = self.commit("on deploy", "g.txt")
+        git(self.wt, "checkout", "-q", "-b", "main2")
+        self.assertEqual(self.commit("on a non-default name", "g.txt").returncode, 0)  # core knows only generic names
+        git(self.wt, "checkout", "-q", "-b", "master")
+        r = self.commit("on master", "h.txt")
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("protected branch 'deploy'", r.stderr)
+        self.assertIn("protected branch 'master'", r.stderr)
+
+    def test_profile_settings_drive_branches_and_format(self):
+        prof = self.r / "profile"
+        (prof / "config").mkdir(parents=True)
+        (prof / "config" / "settings.json").write_text(json.dumps({"guard": {
+            "protected": ["deploy", "rel-*"], "commit_format": r"^TKT#\d+: \S", "commit_example": "TKT#1: Add it"}}))
+        self.install("--base", "dev", profile=str(prof))
+        bad = self.commit("ABC-1 | wrong format")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("TKT#1: Add it", bad.stderr)
+        self.assertEqual(self.commit("TKT#7: right format", "g.txt").returncode, 0)
+        for branch in ("deploy", "rel-2", "dev"):
+            git(self.wt, "checkout", "-q", "-B", branch)
+            r = self.commit(f"TKT#8: on {branch}", f"{branch}.txt")
+            self.assertIn(f"protected branch '{branch}'", r.stderr)
+
+    def test_empty_commit_message_file_is_a_readable_refusal(self):
+        self.install("--jira", "ABC-9")
+        empty = self.r / "msg"
+        empty.write_text("")
+        r = subprocess.run([GUARD, "hook", "commit-msg", str(empty)], cwd=self.wt, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("must start with 'ABC-9 | '", r.stderr)
 
     def test_push_rules(self):
         self.install("--jira", "MENT-9")

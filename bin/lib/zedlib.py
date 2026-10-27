@@ -65,6 +65,10 @@ def projects():
     return (read_json(PROJECTS_PATH, {}) or {}).get("repos", {})
 
 
+def settings():
+    return read_json(PROFILE_DIR / "config" / "settings.json", {}) or {}
+
+
 def expand(path):
     return Path(os.path.expanduser(str(path)))
 

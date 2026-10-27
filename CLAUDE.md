@@ -96,6 +96,7 @@ whose session or herdr pane is gone is cleared automatically.
   `audit` runs in `start`), `zed-hostload` (`spawn` refuses on a CRITICAL host), `zed-hygiene report`
   (at wrap-up and in `start`; `--apply` only with the user's OK), `zed-update check|apply` (core updates,
   in `start`), `zed-export` (DB backup at wrap-up), `zed-pretool` (hook that stops me editing project repos), and for workers `zed-checks`, `zed-review`, `zed-qa`, `zed-xref`, `zed-plan split`.
+  Employees (named workers with hats; `zed spawn employee= hat=`, `zed assign`): `zed-employee` (`hire|list|pack|board|finish`), `zed-deny` (hat deny hook).
 - `herdr` CLI — `herdr --skill` prints its full guide. Key: `herdr agent list|get|read|prompt|wait|send-keys`.
 - `playbook.md` — core lessons about tools and workflow, for every Zed.
 - `failure-modes.md` — how I can let the user down and the guard for each. Read it at session

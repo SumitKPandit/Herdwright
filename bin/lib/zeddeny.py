@@ -49,6 +49,14 @@ def denied_path(path, patterns, worktree, profile, cwd):
     return None
 
 
+UNRESOLVED = re.compile(r"[$`]|^~[^/]")
+
+
+def unresolved(path):
+    """True when the shell would expand `path` (variable, command substitution, `~user`), which a hook cannot follow."""
+    return bool(UNRESOLVED.search(str(path)))
+
+
 def command_denied(words, prefixes):
     """The denied prefix a simple command starts with (the program is compared by basename), or None."""
     for prefix in prefixes:
@@ -71,6 +79,12 @@ def shell_problem(cmd, manifest, worktree, profile, cwd):
             words = words[1:]
         if not words:
             continue
+        if Path(words[0]).name == "cd":
+            # follow `cd <dir> && ...` so later relative targets resolve where the shell will; `cd` with no usable
+            # argument (`cd`, `cd -`, `cd $X`) leaves the guess unchanged
+            if len(words) > 1 and not unresolved(words[1]) and words[1] != "-":
+                cwd = os.path.realpath(Path(os.path.expanduser(words[1])) if Path(os.path.expanduser(words[1])).is_absolute() else Path(cwd) / words[1])
+            continue
         if prefix := command_denied(words, deny["commands"]):
             return f"`{prefix}` is denied to this hat: anything outward goes to Zed as a draft"
         targets = [words[i + 1] for i, w in enumerate(words[:-1]) if w in zedshell.REDIRECTS and not words[i + 1].startswith("&")]
@@ -78,6 +92,8 @@ def shell_problem(cmd, manifest, worktree, profile, cwd):
         if name in zedshell.FILE_WRITERS or (name in ("sed", "perl") and any(re.fullmatch(r"-\w*i\w*", w) for w in words[1:])):
             targets += [w for w in words[1:] if not w.startswith("-")]
         for t in targets:
+            if unresolved(t):
+                return f"writing {t} cannot be checked (the shell expands it): use a literal absolute path"
             if pattern := denied_path(t, patterns, worktree, profile, cwd):
                 return f"writing {t} is denied to this hat ({pattern})"
         if name == "git" and read_only:

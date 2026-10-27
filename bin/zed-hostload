@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """zed-hostload — is this Mac healthy enough to start another worker? Memory, swap and agent RSS, no model.
 
-Ported from firstmate's fm-jev-mem-guard (RSS and swap thrashing guard) and the host-headroom half of
-fm-capacity, rewritten for macOS (memory_pressure, vm_stat, sysctl, ps). Read-only and fail-open: if a reading is
+An RSS and swap thrashing guard plus host-headroom check for macOS (memory_pressure, vm_stat, sysctl, ps).
+Read-only and fail-open: if a reading is
 unavailable the status is UNKNOWN and the exit code is 0, never a false alarm. The recommendation is text for the
-user, never a command. Counting workers is S21's `max_running`; this guards memory.
+user, never a command. Counting workers is `max_running` in runtimes.json; this guards memory.
 
 Usage
   zed-hostload check [--json] [--warn-free-pct 20] [--crit-free-pct 8] [--warn-swap-gb 4] [--crit-swap-gb 8]

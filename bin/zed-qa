@@ -15,7 +15,7 @@ Usage
       (clean with a failed or blocked case; blockers with none). exit 0 ok, 1 problems listed, 2 no report found
 
 Report shape (what `plan` writes):
-  # QA report: T22
+  # QA report: T12
   URL: http://localhost:3000        Branch: feature/x        Commit: abc1234          (one per line)
   Console errors: none | what appeared
   ## Cases

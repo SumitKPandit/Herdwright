@@ -58,6 +58,21 @@ class DecideTests(unittest.TestCase):
             self.assertIsNone(self.bash(hat, "gh pr view 12"), hat)
             self.assertIsNone(self.bash(hat, "echo gh pr comment"), hat)
 
+    def test_cd_in_the_command_line_moves_where_relative_targets_resolve(self):
+        emp_dir = self.profile / "employees"
+        for command in (f"cd {emp_dir}/quill && touch x", f"cd {emp_dir} && touch quill/x", f"cd {emp_dir}; echo y > quill/x"):
+            for hat in ("build", "review"):
+                self.assertIn("denied", self.bash(hat, command), (hat, command))
+        self.assertIsNone(self.bash("review", f"cd {self.evidence} && touch x"))  # was a false deny
+        self.assertIn("denied", self.bash("review", f"cd {self.evidence} && cd {self.wt}/src && touch x"))
+        self.assertIsNone(self.bash("build", "cd src && touch x"))
+
+    def test_targets_the_shell_would_expand_cannot_be_checked(self):
+        for command in ("touch $D/x", "echo hi > `pwd`/x", "touch ~root/x"):
+            self.assertIn("cannot be checked", self.bash("build", command), command)
+        self.assertIsNone(self.bash("build", "echo $HOME > src/a.txt"))  # only the target matters
+        self.assertIsNone(self.bash("build", "touch ~/x"))
+
     def test_a_read_only_hat_may_not_write_git_but_a_builder_may(self):
         self.assertIn("denied", self.bash("review", "git commit -m x"))
         self.assertIn("denied", self.bash("qa", f"git -C {self.wt} add -A"))

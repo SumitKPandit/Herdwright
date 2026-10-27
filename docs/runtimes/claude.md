@@ -25,9 +25,13 @@ Verdicts: `yes` works as needed, `partial` works with the stated limit, `no` una
   for timing probes.
 - First start in a new folder shows the trust dialog; `bin/zed` already handles it.
 
-## Hat deny policy as built (T23, verified 2026-10-27, Claude Code 2.1.311)
+## Hat deny policy as built (verified 2026-10-27, Claude Code 2.1.311)
 
 `spawn employee= hat=` writes `profile/.cache/employees/<name>/<agent>-settings.json` (a `PreToolUse` hook, matcher
 `*`, command `bin/zed-deny`) and starts the session with `--settings <file>`. A real `claude -p` session with
 `ZED_EMPLOYEE=quill ZED_HAT=review` was denied both `gh pr comment 1 --body hi` (Bash) and a `Write` into the worktree;
 the model saw `PreToolUse:<tool> hook error: ... zed-deny: ...` and nothing ran. The hook denies by exit 2 + stderr.
+
+Limits of the shell check (both runtimes; it is best-effort, git itself is guarded by zed-guard): it follows `cd <dir>` inside one
+command line, but a write through an interpreter (`python3 -c "open(...)"`) is not seen, and a write target the shell would expand
+(`$VAR`, a backtick, `~user`) is denied as "cannot be checked": use a literal absolute path.

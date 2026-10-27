@@ -38,13 +38,21 @@ def employee_dir(name):
 # ---------------------------------------------------------------- frontmatter
 
 
+LIST_ITEM = re.compile(r'\s*("(?:[^"\\]|\\.)*"|[^,]*)\s*(?:,|$)')
+
+
+def _item(text):
+    text = text.strip()
+    return json.loads(text) if text[:1] == '"' else text
+
+
 def _scalar(value):
     value = value.strip()
     if value[:1] in ('"', "'"):
         return json.loads(value) if value[0] == '"' else value[1:-1]
     value = re.sub(r"\s+#.*$", "", value)
     if value.startswith("["):
-        return [v.strip() for v in value.strip("[]").split(",") if v.strip()]
+        return [_item(v) for v in LIST_ITEM.findall(value[1:value.rindex("]")]) if v.strip()]
     if value in ("true", "false"):
         return value == "true"
     return int(value) if re.fullmatch(r"-?\d+", value) else value
@@ -68,7 +76,7 @@ def render_frontmatter(fields):
         if isinstance(v, bool):
             return "true" if v else "false"
         if isinstance(v, list):
-            return "[" + ", ".join(v) + "]"
+            return "[" + ", ".join(json.dumps(i) if re.search(r"[,\[\]#\"]|^\s|\s$", i) else i for i in v) + "]"
         return json.dumps(v) if isinstance(v, str) and re.search(r"[:#\"]|^\s|\s$", v) else str(v)
     return "---\n" + "".join(f"{k}: {fmt(v)}\n" for k, v in fields.items()) + "---\n"
 

@@ -1,6 +1,6 @@
 # Employees pilot, end to end on both runtimes (step 3.6)
 
-Run 2026-10-27 by T23 in a throwaway profile (own lock, own bare repo `api`, Claude Code `claude-haiku-5-5` at low
+Run 2026-10-27 in a throwaway profile (own lock, own bare repo `api`, Claude Code `claude-haiku-5-5` at low
 effort, Copilot CLI 1.0.104 on its default model), through the real `bin/zed spawn employee= hat=`, one session at a
 time, every session closed afterwards. Task T1 "Role guard": `require_role(user)` in `guard.py`. The stubbed-herdr
 version of the same flow is `tests/test_zed_employee_flow.py`.

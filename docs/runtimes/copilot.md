@@ -24,9 +24,9 @@ Verdicts: `yes` works as needed, `partial` works with the stated limit, `no` una
 - Copilot may merge several commands into one tool call; give explicit "one call each" instructions in probes.
 - `--model auto` is accepted; an unavailable model name aborts with `Model "..." from --model flag is not available.`
 - `--model auto` works only with `-p`. In an interactive session it never finishes loading (footer `Loading: ... waiting on
-  extensions; ide`) and the first prompt stays queued; leave the model unset or name one (T23 end-to-end run).
+  extensions; ide`) and the first prompt stays queued; leave the model unset or name one (end-to-end run).
 
-## Hat deny policy as built (T23, verified 2026-10-27, Copilot CLI 1.0.103)
+## Hat deny policy as built (verified 2026-10-27, Copilot CLI 1.0.103)
 
 `spawn employee= hat=` writes a per-session plugin `profile/.cache/employees/<name>/<agent>-plugin/` (`plugin.json`,
 `hooks/hooks.json` with a PascalCase `PreToolUse` hook running `bin/zed-deny`) and starts Copilot with `--plugin-dir`
@@ -36,3 +36,7 @@ Copilot's edit tool arrives at the hook as `tool_name` `Edit` with `tool_input` 
 (`*** Add File: b.py` ...), not a JSON object: `zed-deny` reads the paths from the `*** Add|Update|Delete File:` and
 `*** Move to:` lines. Edits through the shell are caught by the `Bash` rule (redirects, rm/mv/cp/tee, sed -i).
 Not caught on either runtime: a program that writes files itself (e.g. `python -c`); git stays guarded by `zed-guard`.
+
+Limits of the shell check (both runtimes; it is best-effort, git itself is guarded by zed-guard): it follows `cd <dir>` inside one
+command line, but a write through an interpreter (`python3 -c "open(...)"`) is not seen, and a write target the shell would expand
+(`$VAR`, a backtick, `~user`) is denied as "cannot be checked": use a literal absolute path.

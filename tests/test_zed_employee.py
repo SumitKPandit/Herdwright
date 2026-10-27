@@ -109,6 +109,11 @@ class FrontmatterTests(unittest.TestCase):
         self.assertEqual(parsed, fields)
         self.assertEqual(body, "# X")
 
+    def test_list_items_with_commas_and_brackets_roundtrip(self):
+        fields = {"strengths": ["fast, careful", "uses [x]", 'says "no"', "plain", "# tag"], "none": []}
+        parsed, _ = emp.parse_frontmatter(emp.render_frontmatter(fields) + "# X\n")
+        self.assertEqual(parsed, fields)
+
     def test_comments_and_missing_block(self):
         self.assertEqual(emp.parse_frontmatter("---\nruntime: auto   # the profile order\n---\n")[0], {"runtime": "auto"})
         self.assertEqual(emp.parse_frontmatter("no block"), ({}, "no block"))
