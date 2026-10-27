@@ -794,6 +794,44 @@ class ZedTests(unittest.TestCase):
             self.assertIsNone(self.z.pr_snapshot("https://github.com/o/r/pull/1"))
         self.assertIsNone(self.z.pr_snapshot("https://example.com/x"))
 
+    def test_pr_polling_reports_merge_new_reviews_and_failing_checks_only(self):
+        conn = self.session()
+        conn.execute("UPDATE sessions SET pr_url='https://github.com/o/r/pull/1', status='finished'")
+        conn.commit()
+        s = lambda: conn.execute("SELECT * FROM sessions").fetchone()
+        alerts = {}
+        snaps = iter([{"state": "open", "reviews": 1, "checks": "pending"},    # baseline: silent
+                      {"state": "open", "reviews": 1, "checks": "pending"},    # unchanged: silent
+                      {"state": "open", "reviews": 3, "checks": "failing"},    # 2 new + failing
+                      {"state": "open", "reviews": 3, "checks": "failing"},    # same failure: silent
+                      {"state": "merged", "reviews": 3, "checks": "passing"}])
+        with patch.object(self.z, "PR_POLL_SECONDS", 0), patch.object(self.z, "pr_snapshot", side_effect=lambda url: next(snaps)):
+            self.assertEqual(self.z.pr_events(conn, s(), alerts), [])
+            self.assertEqual(self.z.pr_events(conn, s(), alerts), [])
+            lines = self.z.pr_events(conn, s(), alerts)
+            self.assertIn("2 new review(s)/comment(s)", lines[0])
+            self.assertIn("failing checks", lines[1])
+            self.assertEqual(self.z.pr_events(conn, s(), alerts), [])
+            merged = self.z.pr_events(conn, s(), alerts)
+            self.assertIn("was merged", merged[0])
+        self.assertEqual(conn.execute("SELECT pr_state FROM sessions").fetchone()[0], "merged")
+        self.assertIsNone(conn.execute(self.z.OPEN_PRS).fetchone())  # no longer polled or tracked
+        with patch.object(self.z, "PR_POLL_SECONDS", 300), patch.object(self.z, "pr_snapshot", side_effect=AssertionError):
+            self.assertEqual(self.z.pr_events(conn, s(), {1: {"pr_at": self.z.time.time()}}), [])  # slow interval
+
+    def test_watch_polls_prs_of_finished_sessions_and_has_tracked_work(self):
+        conn = self.session()
+        conn.execute("UPDATE sessions SET pr_url='https://github.com/o/r/pull/1', status='finished'")
+        conn.commit()
+        self.assertTrue(self.z.has_tracked_work())
+        with patch.object(self.z, "require_lock"), patch.object(self.z, "holds_lock", return_value=True), \
+                patch.object(self.z, "claim_watcher", return_value=True), patch.object(self.z, "PR_POLL_SECONDS", 0), \
+                patch.object(self.z, "live_agents", return_value={}), \
+                patch.object(self.z, "pr_snapshot", return_value={"state": "closed", "reviews": 0, "checks": None}):
+            self.assertTrue(self.z.cmd_watch(["--once", "0.01"]))
+        self.assertIn("was closed", self.output.getvalue())
+        self.assertFalse(self.z.has_tracked_work())
+
 
 if __name__ == "__main__":
     unittest.main()

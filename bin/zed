@@ -119,6 +119,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   effort TEXT,
   brief TEXT,
   credits REAL,  -- Copilot AI credits used, as last read from the session's footer
+  pr_state TEXT,  -- open | merged | closed, as last polled by the watcher
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -161,7 +162,7 @@ def db():
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(sessions)")]
     # migrate DBs created before these columns existed
     for col, decl in [("external", "INTEGER NOT NULL DEFAULT 0"), ("runtime", "TEXT NOT NULL DEFAULT 'claude'"),
-                      ("model", "TEXT"), ("effort", "TEXT"), ("brief", "TEXT"), ("credits", "REAL")]:
+                      ("model", "TEXT"), ("effort", "TEXT"), ("brief", "TEXT"), ("credits", "REAL"), ("pr_state", "TEXT")]:
         if col not in cols:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
     return conn
@@ -1778,6 +1779,38 @@ def scan_working(conn, s, alerts):
     return f"S{s['id']} T{s['task_id']} {s['agent']} · new ZED:{block['kind']} while still working\n{record_block(conn, s, block)}"
 
 
+PR_POLL_SECONDS = 300  # how often the watcher looks at a session's open PR (gh / bin/bb: no model tokens)
+OPEN_PRS = ("SELECT * FROM sessions WHERE pr_url IS NOT NULL AND status!='closed' AND external=0 "
+            "AND COALESCE(pr_state,'open')='open'")
+
+
+def pr_events(conn, s, alerts):
+    """Zero-token PR polling: lines for a PR that was merged or closed, got new reviews or comments, or whose
+    checks started failing. The first look only records the baseline."""
+    seen = alerts.setdefault(s["id"], {})
+    if time.time() - seen.get("pr_at", 0) < PR_POLL_SECONDS:
+        return []
+    seen["pr_at"] = time.time()
+    snap = pr_snapshot(s["pr_url"])
+    if snap is None:
+        return []
+    before, seen["pr"] = seen.get("pr"), snap
+    tag = f"S{s['id']} T{s['task_id']} {s['agent']} · PR {s['pr_url']}"
+    out = []
+    if snap["state"] != "open":
+        conn.execute("UPDATE sessions SET pr_state=? WHERE id=?", (snap["state"], s["id"]))
+        out.append(f"{tag} was {snap['state']} (the task is the user's to mark done; `wrap-up` when ready)")
+    else:
+        conn.execute("UPDATE sessions SET pr_state='open' WHERE id=? AND pr_state IS NULL", (s["id"],))
+        if before and snap["reviews"] > before["reviews"]:
+            out.append(f"{tag} has {snap['reviews'] - before['reviews']} new review(s)/comment(s)")
+        if snap["checks"] == "failing" and (before or {}).get("checks") != "failing":
+            out.append(f"{tag} has failing checks")
+    for line in out:
+        log_event(conn, s["task_id"], "pr", line)
+    return out
+
+
 def lapse_tick(s, state, seq, alerts):
     """Protocol lapse: idle with no ZED block. The first one is nudged with the standard prompt without
     waking Zed; one after a nudge is returned as an event line."""
@@ -1928,7 +1961,8 @@ def cmd_watch(args):
         try:
             conn = db()
             sessions = conn.execute("SELECT * FROM sessions WHERE status IN ('running','waiting_user')").fetchall()
-            tracked = bool(sessions)
+            open_prs = conn.execute(OPEN_PRS).fetchall()
+            tracked = bool(sessions or open_prs)
             live = live_agents()
             for s in sessions:
                 a = live.get(s["pane_id"])
@@ -1968,7 +2002,17 @@ def cmd_watch(args):
                     if line:
                         events.append(line)
                     prev[key] = snapshot
-            events += delivery_events(alerts)
+                if state == "working" and (line := scan_working(conn, s, alerts)):
+                    events.append(line)
+                lapse = lapse_tick(s, state, snapshot["sequence"], alerts)
+                if lapse:
+                    kind, text = lapse
+                    if kind == "nudge":
+                        log_event(conn, s["task_id"], "auto", text)
+                    else:
+                        events.append(text)
+            for s in open_prs:
+                events.extend(pr_events(conn, s, alerts))
             first = False
             conn.commit()
             conn.close()
@@ -2132,7 +2176,8 @@ def arm_ran_since(ts):
 def has_tracked_work():
     conn = db()
     try:
-        return conn.execute("SELECT COUNT(*) FROM sessions WHERE status IN ('running','waiting_user')").fetchone()[0] > 0
+        return bool(conn.execute("SELECT COUNT(*) FROM sessions WHERE status IN ('running','waiting_user')").fetchone()[0]
+                    or conn.execute(OPEN_PRS).fetchone())
     finally:
         conn.close()
 
