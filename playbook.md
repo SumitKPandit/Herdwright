@@ -117,3 +117,7 @@ Facts about a particular user or their work never go here (they go to the profil
   (`perl -e 'alarm 60; exec @ARGV' python3 -m unittest …`, since `timeout` is absent), use throwaway
   `ZED_PROFILE_DIR`s, and stop your own background runs by PID or `TaskStop`, never `pkill -f` on a
   pattern that other sessions' processes (watchers, hooks) also match.
+- **PR review posting.** `gh pr review <n> -R <owner>/<repo> --approve -b "<text>"` prints nothing on
+  success; verify with `gh pr view --json reviews`. `bin/bb` has no approve/comment subcommands yet;
+  workers have been calling the Bitbucket REST API (`POST …/pullrequests/<id>/approve`, `…/comments`)
+  with bb's Keychain credential. Adding `bb pr approve|comment` is the deterministic fix (directive 9).
