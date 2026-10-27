@@ -2866,14 +2866,16 @@ def dashboard_task(conn, t, agents):
             else:
                 live = agents[s["pane_id"]]["agent_status"] if s["pane_id"] in agents else "gone"
         sessions.append({k: s[k] for k in ("id", "agent", "repo", "branch", "base", "status", "runtime", "model",
-                                           "effort", "credits", "pr_url", "external")} | {"live": live})
+                                           "effort", "credits", "pr_url", "external", "employee", "hat", "verdict")} | {"live": live})
     rating = conn.execute("SELECT * FROM inbox WHERE task_id=? AND kind='rating' ORDER BY id DESC LIMIT 1", (t["id"],)).fetchone()
+    done, total = task_plan_progress(t["id"])
     return {k: t[k] for k in ("id", "title", "jira", "worktype", "description", "status", "created_at", "updated_at")} | {
         "sessions": sessions,
         "events": [dict(e) for e in conn.execute(
             "SELECT ts, kind, text FROM events WHERE task_id=? ORDER BY id DESC LIMIT 10", (t["id"],))],
         "feedback": [dict(i) for i in conn.execute("SELECT * FROM inbox WHERE task_id=? ORDER BY id DESC LIMIT 5", (t["id"],))],
         "rating": dict(rating) if rating else None,
+        "plan": {"done": done, "total": total} if total else None,
         "can_rate": t["status"] in RATABLE_STATES}
 
 
@@ -2892,6 +2894,20 @@ def dashboard_zed():
     if active:
         zed |= {"runtime": holder.get("runtime") or "claude", "since": holder.get("acquired_at")}
     return zed
+
+
+def dashboard_team(conn):
+    """The employees (who is on what, in which hat) and the work waiting for one, as `zed-employee board` has it."""
+    working = {r["employee"]: r for r in conn.execute(
+        f"SELECT id, task_id, employee, hat, repo FROM sessions WHERE employee IS NOT NULL AND status IN ({','.join('?' * len(zedassign.OPEN))})",
+        zedassign.OPEN)}
+    people = []
+    for name in emp.names():
+        fields = emp.load_employee(name)[0]
+        s = working.get(name)
+        people.append({"name": name, "voice": fields.get("voice"), "senior": fields.get("senior") is True or fields.get("senior") == "true",
+                       "assignment": {k: s[k] for k in ("id", "task_id", "hat", "repo")} if s else None})
+    return {"employees": people, "waits": zedassign.board(conn)["waits"]}
 
 
 def dashboard_state(conn, agents):
@@ -2915,7 +2931,7 @@ def dashboard_state(conn, agents):
     return {"groups": groups, "questions": questions, "repos": dashboard_repos(), "herdr": agents is not None,
             "inbox": [dict(i) for i in conn.execute("SELECT * FROM inbox ORDER BY id DESC LIMIT 20")],
             "pending_feedback": conn.execute("SELECT COUNT(*) FROM inbox WHERE status='new'").fetchone()[0],
-            "zed": dashboard_zed()}
+            "zed": dashboard_zed(), "team": dashboard_team(conn)}
 
 
 def dashboard_server(port, token):

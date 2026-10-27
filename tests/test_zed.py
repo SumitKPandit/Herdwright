@@ -1323,6 +1323,33 @@ class ZedTests(unittest.TestCase):
         self.assertFalse(unreachable["herdr"])
         self.assertEqual({s["live"] for g in unreachable["groups"] for t in g["tasks"] for s in t["sessions"]}, {"unavailable", None})
 
+    def test_dashboard_state_shows_employees_hats_verdicts_and_plan_progress(self):
+        conn = self.z.db()
+        self.addCleanup(conn.close)
+        self.projects("api")
+        task = self.task(conn, "active", "Build it")
+        for hat, employee, status, verdict in [("build", "pip", "closed", None), ("qa", "sol", "closed", "blockers"), ("review", "kit", "running", None)]:
+            conn.execute("INSERT INTO sessions(task_id,repo,base,branch,worktree,agent,status,employee,hat,verdict,created_at,updated_at) "
+                         "VALUES (?,?,?,?,?,?,?,?,?,?,'now','now')", (task, "api", "main", "story/x", "/tmp/wt", f"{hat}-api", status, employee, hat, verdict))
+        conn.commit()
+        for name, senior in (("pip", "false"), ("kit", "true"), ("sol", "false")):
+            (self.root / "employees" / name).mkdir(parents=True)
+            (self.root / "employees" / name / "employee.md").write_text(f"---\nname: {name}\nvoice: v\nsenior: {senior}\n---\n# {name}\n")
+        (self.root / "briefs").mkdir()
+        (self.root / "briefs" / f"T{task}-api-plan.md").write_text("- [x] one\n- [ ] two\n")
+        with patch.object(self.z.emp, "employees_dir", return_value=self.root / "employees"):
+            state = self.z.dashboard_state(conn, {})
+        json.dumps(state)
+        team = {e["name"]: e for e in state["team"]["employees"]}
+        self.assertEqual(team["kit"]["assignment"]["hat"], "review")
+        self.assertTrue(team["kit"]["senior"])
+        self.assertIsNone(team["sol"]["assignment"])
+        self.assertEqual([w["kind"] for w in state["team"]["waits"]], ["fix"])
+        task_json = state["groups"][0]["tasks"][0]
+        self.assertEqual(task_json["plan"], {"done": 1, "total": 2})
+        self.assertEqual([(s["employee"], s["hat"], s["verdict"]) for s in task_json["sessions"]],
+                         [("pip", "build", None), ("sol", "qa", "blockers"), ("kit", "review", None)])
+
     def test_dashboard_state_limits_finished_tasks_and_reports_ratings(self):
         conn = self.z.db()
         self.addCleanup(conn.close)

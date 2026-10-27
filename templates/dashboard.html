@@ -156,6 +156,12 @@ button:disabled { cursor: progress; opacity: .65; }
         <p class="dim" id="q-empty">Nothing is waiting for you.</p>
         <div id="q-list"></div>
       </section>
+      <section class="panel" id="team-panel" aria-labelledby="team-h">
+        <h2 id="team-h">Team</h2>
+        <p class="dim" id="team-empty">No employees hired yet.</p>
+        <ul class="items" id="team-list"></ul>
+        <ul class="items" id="team-waits"></ul>
+      </section>
       <section class="panel" id="new-task" aria-labelledby="n-h">
         <h2 id="n-h">New task</h2>
         <form class="fb" data-kind="task" style="margin-top:0">
@@ -237,13 +243,16 @@ function prLink(url) {
 const needsAttention = t => t.status === 'waiting_user' || t.sessions.some(s => s.live === 'blocked' || s.live === 'gone');
 const ratingBadge = r => (r.rating === 'good' ? badge('ok', 'Rated good') : badge('problem', 'Rated not good'));
 
+const VERDICT = {clean: ['ok', 'Clean'], blockers: ['problem', 'Blockers']};
+
 function sessionRow(s) {
   const live = s.live ? LIVE[s.live] || ['neutral', s.live, ''] : null;
   const [tone, label, hint] = live || [...(SESSION[s.status] || ['neutral', s.status]), ''];
   const runtime = [s.runtime, s.model, s.effort && `(${s.effort})`].filter(Boolean).join(' ');
   return html`<li class="session">
     <div class="s-line"><span class="chip">S${s.id}</span> <strong>${s.agent}</strong> <span class="dim">${s.repo}${s.external ? ' · external' : ''}</span>
-      ${badge(tone, label, hint)} ${prLink(s.pr_url)}</div>
+      ${s.employee ? html`<span class="chip">${s.employee} · ${s.hat}</span>` : ''}
+      ${badge(tone, label, hint)}${VERDICT[s.verdict] ? badge(...VERDICT[s.verdict]) : ''} ${prLink(s.pr_url)}</div>
     <div class="s-meta">${s.branch} ← ${s.base} · ${runtime}${s.credits != null ? ` · ${s.credits} AI credits` : ''} · session ${s.status}</div>
   </li>`;
 }
@@ -256,6 +265,7 @@ function taskSummary(t) {
       <h3>${t.title}</h3>
       ${badge(tone, label)}${t.rating ? ratingBadge(t.rating) : ''}
     </div>
+    ${t.plan ? html`<p class="dim">Plan: ${t.plan.done} of ${t.plan.total} steps done <progress max="${t.plan.total}" value="${t.plan.done}"></progress></p>` : ''}
     ${t.sessions.length ? html`<ul class="sessions">${t.sessions.map(sessionRow)}</ul>` : ''}
     ${last ? html`<p class="latest"><span class="kind">${last.kind}</span> ${last.text} ${when(last.ts)}</p>` : ''}`;
 }
@@ -388,6 +398,17 @@ function renderInbox(items) {
   setHtml($('#i-list'), html`${items.map(i => html`<li>${feedbackItem(i, true)}</li>`)}`);
 }
 
+const WAIT = {new: 'needs someone to start it', fix: 'has blockers to fix', review: 'needs a review', qa: 'needs QA',
+  ready: 'passed review and QA: ready to check'};
+
+function renderTeam(team) {
+  $('#team-empty').hidden = team.employees.length > 0;
+  setHtml($('#team-list'), html`${team.employees.map(e => html`<li><strong>${e.name}</strong>${e.senior ? ' (senior)' : ''}
+    ${e.assignment ? html`<span class="dim">on T${e.assignment.task_id} · ${e.assignment.hat} · ${e.assignment.repo}</span>` : badge('ok', 'free')}</li>`)}`);
+  setHtml($('#team-waits'), html`${team.waits.map(w => html`<li><span class="chip">T${w.task}</span> ${WAIT[w.kind] || w.kind}
+    ${w.may.length ? html`<span class="dim">· could be: ${w.may.join(', ')}</span>` : ''}</li>`)}`);
+}
+
 function renderTiles(state) {
   const tiles = [['Needs you', state.questions.length, state.questions.length ? 'attention' : ''],
     ...state.groups.map(g => [g.total === undefined ? g.title : 'Finished', g.total ?? g.tasks.length, '']),
@@ -441,6 +462,7 @@ function render() {
   renderTiles(state);
   renderQuestions(state.questions);
   renderGroups(state.groups);
+  renderTeam(state.team);
   renderInbox(state.inbox);
   renderRepos(state.repos);
 }
