@@ -10,6 +10,7 @@ Facts about both runtimes' hook protocols are in docs/runtimes/*.md.
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -83,6 +84,13 @@ def command_denied(words, prefixes):
     return None
 
 
+def gate_reason(worktree):
+    """Why the worktree's HEAD may not leave it yet (`bin/zed gate check`: clean review and qa by non-authors), or None."""
+    zed = Path(__file__).resolve().parent.parent / "zed"
+    r = subprocess.run([sys.executable, str(zed), "gate", "check", "HEAD", str(worktree)], capture_output=True, text=True)
+    return None if r.returncode == 0 else (r.stderr.strip() or r.stdout.strip() or "the merge gate did not pass")
+
+
 def shell_problem(cmd, manifest, worktree, profile, cwd):
     deny = manifest["deny"]
     patterns, exceptions = [EMPLOYEE_DATA, *deny["edit"]], deny.get("except", [])
@@ -113,6 +121,9 @@ def shell_problem(cmd, manifest, worktree, profile, cwd):
             continue
         if prefix := command_denied(words, deny["commands"]):
             return f"`{prefix}` is denied to this hat: anything outward goes to Zed as a draft"
+        if prefix := command_denied(words, deny.get("gated", [])):
+            if reason := gate_reason(worktree):
+                return f"`{prefix}` waits for a clean review and qa of this branch: {reason}"
         targets = [words[i + 1] for i, w in enumerate(words[:-1]) if w in zedshell.REDIRECTS and not words[i + 1].startswith("&")]
         name = Path(words[0]).name
         if name in zedshell.FILE_WRITERS or (name in ("sed", "perl") and any(re.fullmatch(r"-\w*i\w*", w) for w in words[1:])):

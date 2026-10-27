@@ -8,7 +8,10 @@ to the model). An unknown hat allows the call (no policy); any other internal er
 
 It denies, per the hat: edits matching `deny.edit` (`**` = nothing in the worktree), shell commands starting with a
 `deny.commands` prefix, shell writes (redirects, rm/mv/cp/tee..., sed -i) to a denied path, git writes in the worktree
-for a hat that may not edit, subagents when `subagents` is `none`; and for every hat edits to profile/employees/**.
+for a hat that may not edit (the worktree, and the checkout holding the profile), subagents when `subagents` is `none`;
+for every hat edits to profile/employees/**. `deny.except` globs stay writable inside a denied area (review/qa: their plan,
+findings draft and status log); a command starting with a `deny.gated` prefix (`gh pr create`) runs only once
+`bin/zed gate check HEAD` passes.
 Not caught: a script that writes files itself (python -c ...). `bin/zed-guard` still guards git.
 
 Test:  echo '{"tool_name":"Bash","tool_input":{"command":"gh pr comment 1"}}' | ZED_EMPLOYEE=quill ZED_HAT=review zed-deny --explain

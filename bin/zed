@@ -1536,7 +1536,7 @@ def cmd_spawn(args, worktree=None):
         if actual != kv["branch"]:
             die(f"worktree {worktree} is on '{actual}', not '{kv['branch']}'; left untouched")
         guard = run([sys.executable, str(ZED_HOME / "bin" / "zed-guard"), "install", str(worktree), "--repo", kv["repo"],
-                     "--base", kv["base"], *(["--jira", t["jira"]] if t["jira"] else ["--no-commit-format"])], check=False)
+                     "--base", kv["base"], "--gate", *(["--jira", t["jira"]] if t["jira"] else ["--no-commit-format"])], check=False)
         if guard.returncode and "already pointing" not in guard.stderr:  # a reused worktree keeps its guard
             die(f"could not install the git guard in {worktree}; no worker started:\n{guard.stderr.strip() or guard.stdout.strip()}")
 

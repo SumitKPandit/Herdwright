@@ -1,7 +1,8 @@
 {
   "scripts": ["zed-plan", "zed-checks", "zed-guard", "zed-pr", "zed-xref", "zed-employee"],
   "skills": ["implement", "raise-pr", "address-findings", "answer-peer", "finish"],
-  "deny": {"edit": ["profile/employees/**"], "commands": ["gh pr review", "gh pr comment", "bb pr comment"]},
+  "deny": {"edit": ["profile/employees/**"], "commands": ["gh pr review", "gh pr comment", "bb pr comment"],
+           "gated": ["gh pr create", "bb pr create"]},
   "subagents": "none",
   "kind": "implementation"
 }

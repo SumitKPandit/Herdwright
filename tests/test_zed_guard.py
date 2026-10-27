@@ -35,6 +35,21 @@ class PureTests(unittest.TestCase):
         self.assertIn("MENT-5 | ", f("MENT-6 | x", jira="MENT-5"))
         self.assertIsNone(f("anything", enforce=False))
 
+    def test_push_problems_ask_the_gate_about_branch_pushes_only(self):
+        sha, zero = "b" * 40, guard.ZERO
+        asked = []
+
+        def gate(commit):
+            asked.append(commit)
+            return "no review verdict"
+        lines = [f"refs/heads/x {sha} refs/heads/feat {zero}", f"(delete) {zero} refs/heads/gone {sha}",
+                 f"refs/tags/v1 {sha} refs/tags/v1 {zero}"]
+        problems = guard.push_problems(lines, guard.DEFAULT_PROTECTED, lambda o, n: True, gate)
+        self.assertEqual(asked, [sha])
+        self.assertEqual(problems[0], "push of 'feat' refused: no review verdict")
+        self.assertEqual(guard.push_problems(lines[:1], guard.DEFAULT_PROTECTED, lambda o, n: True, lambda c: None), [])
+        self.assertEqual(guard.push_problems(lines[:1], guard.DEFAULT_PROTECTED, lambda o, n: True), [])  # no gate: as before
+
     def test_push_problems(self):
         anc = lambda old, new: old == "a" * 40
         sha, zero = "b" * 40, guard.ZERO
@@ -160,6 +175,18 @@ class HookTests(unittest.TestCase):
         self.assertIn("force-push", forced.stderr)
         gone = git(self.wt, "push", "origin", ":task/ment-9-x", check=False)
         self.assertIn("deleting remote branch", gone.stderr)
+
+    def test_a_gated_worktree_refuses_a_push_without_review_and_qa_and_an_ungated_one_pushes(self):
+        profile = self.r / "gate-profile"
+        (profile / "db").mkdir(parents=True)
+        (profile / "profile.md").write_text("# test profile\n")
+        self.install("--jira", "MENT-9", "--gate", profile=str(profile))
+        self.assertEqual(self.commit("MENT-9 | one").returncode, 0)
+        env = {**os.environ, "ZED_PROFILE_DIR": str(profile)}
+        refused = subprocess.run(["git", "push", "origin", "HEAD:refs/heads/task/ment-9-x"], cwd=self.wt, capture_output=True, text=True, env=env)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("push of 'task/ment-9-x' refused", refused.stderr)
+        self.assertIn("no review verdict recorded", refused.stderr)
 
     def test_remove_restores_repo_hooks(self):
         self.install("--jira", "MENT-9")

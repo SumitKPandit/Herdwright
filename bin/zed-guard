@@ -15,7 +15,8 @@ Usage
       Sets `extensions.worktreeConfig true` in the repo's shared config (needed for a per-worktree core.hooksPath).
       pre-commit   refuses a commit while a protected branch is checked out
       commit-msg   refuses a message not starting `<JIRA-ID> | ` (the given --jira), or not matching the format (default `ABC-123 | `)
-      pre-push     refuses pushes to protected branches, force-pushes (non-fast-forward) and branch deletion
+      pre-push     refuses pushes to protected branches, force-pushes (non-fast-forward) and branch deletion; with --gate
+                   also any push of a head that lacks a clean review and qa by non-authors (`bin/zed gate check`)
   zed-guard remove <worktree>        undo install
   zed-guard audit [--primary] [--json]
                                      live sessions: hooks installed? worker on a protected/other branch? stale
@@ -63,8 +64,9 @@ def commit_message_problem(first_line, jira=None, enforce=True, pattern=None, ex
     return None
 
 
-def push_problems(lines, patterns, is_ancestor):
-    """lines: git's pre-push stdin ('<local-ref> <local-sha> <remote-ref> <remote-sha>'); is_ancestor(old, new) -> bool."""
+def push_problems(lines, patterns, is_ancestor, gate=None):
+    """lines: git's pre-push stdin ('<local-ref> <local-sha> <remote-ref> <remote-sha>'); is_ancestor(old, new) -> bool;
+    gate(sha) -> the reason that commit may not leave the worktree yet, or None (the merge gate: clean review and qa)."""
     problems = []
     for ln in lines:
         parts = ln.split()
@@ -80,6 +82,8 @@ def push_problems(lines, patterns, is_ancestor):
             problems.append(f"deleting remote branch '{branch}' is forbidden")
         elif remote_sha != ZERO and not is_ancestor(remote_sha, local_sha):
             problems.append(f"force-push to '{branch}' is forbidden (the push is not a fast-forward)")
+        elif gate and (reason := gate(local_sha)):
+            problems.append(f"push of '{branch}' refused: {reason}")
     return problems
 
 
@@ -149,7 +153,7 @@ def cmd_install(a):
         f.chmod(f.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     (d / "config.json").write_text(json.dumps(
         {"protected": patterns, "jira": a.jira, "commit_format": not a.no_commit_format,
-         "commit_pattern": rules.get("commit_format"), "commit_example": rules.get("commit_example"), "chain": prev}))
+         "commit_pattern": rules.get("commit_format"), "commit_example": rules.get("commit_example"), "chain": prev, "gate": a.gate}))
     worktree_git(wt, "config", "extensions.worktreeConfig", "true")  # shared repo config: set for every guarded worktree
     r = worktree_git(wt, "config", "--worktree", "core.hooksPath", str(d))
     if not r.ok:
@@ -175,6 +179,15 @@ def read_config(wt):
     return zedlib.read_json(hook_dir(wt) / "config.json", {}) or {}
 
 
+def gate_reason(wt):
+    """A `gate(sha)` for push_problems: `bin/zed gate check` (clean review and qa by non-authors at that sha)."""
+    def gate(sha):
+        r = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "zed"), "gate", "check", sha, str(wt)],
+                           capture_output=True, text=True)
+        return None if r.returncode == 0 else (r.stderr.strip() or r.stdout.strip() or "the merge gate did not pass")
+    return gate
+
+
 def cmd_hook(a):
     wt = Path.cwd()
     cfg = read_config(wt)
@@ -194,7 +207,7 @@ def cmd_hook(a):
             return 1
     elif a.name == "pre-push":
         anc = lambda old, new: worktree_git(wt, "merge-base", "--is-ancestor", old, new).returncode == 0
-        problems = push_problems(sys.stdin.read().splitlines(), cfg["protected"], anc)
+        problems = push_problems(sys.stdin.read().splitlines(), cfg["protected"], anc, gate_reason(wt) if cfg.get("gate") else None)
         for p in problems:
             print(f"zed-guard: {p}", file=sys.stderr)
         return 1 if problems else 0
@@ -269,6 +282,7 @@ def main(argv=None):
     i.add_argument("--protected")
     i.add_argument("--repo")
     i.add_argument("--base")
+    i.add_argument("--gate", action="store_true", help="pre-push also needs `bin/zed gate check` to pass (clean review and qa at that sha)")
     sub.add_parser("remove").add_argument("worktree")
     au = sub.add_parser("audit")
     au.add_argument("--json", action="store_true")
