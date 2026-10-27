@@ -237,3 +237,40 @@ def record_intro(name, today=None):
     load_employee(name)
     with _conn() as conn:
         conn.execute("UPDATE employees SET introduced_at = ? WHERE name = ?", (today or date.today().isoformat(), name))
+
+
+# ---------------------------------------------------------------- what an assignment starts with
+
+
+def pack_path(name, session):
+    return zedlib.PROFILE_DIR / ".cache" / "employees" / name / f"{session or 'adhoc'}-pack.md"
+
+
+def make_pack(name, repo, hat, tags=(), session=None, memory_words=None, dry_run=False):
+    """Verify the repo's entries, then build the memory pack. Returns (text, path, used_ids, archived_ids); unless
+    dry_run the pack is written to profile/.cache/employees/<name>/<session>-pack.md and `uses` are recorded."""
+    if hat not in hat_names():
+        raise EmployeeError(f"unknown hat {hat!r}: one of {', '.join(hat_names())}")
+    edir = employee_dir(name)
+    fields, _ = load_employee(name)
+    zedmem.verify(edir, repo)
+    text, used, attention = zedmem.build_pack(edir, name, repo=repo, hat=hat, tags=tags,
+                                              memory_words=memory_words or fields.get("memory_words", zedmem.DEFAULT_MEMORY_WORDS))
+    if dry_run:
+        return text, None, used, []
+    archived = zedmem.record_pack(edir, repo, used, attention)
+    path = pack_path(name, session)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return text, path, used, archived
+
+
+def employee_rules(name, hat, pack):
+    """The text appended to the worker rules for an employee's session: the hat's charter, then the employee rules
+    with the name, voice, hat and the pack's path filled in."""
+    fields, _ = load_employee(name)
+    charter = (TEMPLATES / "hats" / hat / "hat.md").read_text().strip()
+    rules = (TEMPLATES / "employee-rules.md").read_text()
+    for key, value in {"NAME": name.capitalize(), "VOICE": fields.get("voice", ""), "HAT": hat, "PACK": str(pack)}.items():
+        rules = rules.replace("{{" + key + "}}", value)
+    return charter + "\n\n" + rules.strip() + "\n"

@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""zed-deny — PreToolUse hook that enforces an employee's hat policy (the `deny` block of its capabilities.json).
+
+Runs on both runtimes (Claude Code `--settings`, Copilot `--plugin-dir`; spawn writes the files). It acts only in a
+session that has ZED_EMPLOYEE and ZED_HAT in its environment; every other session passes untouched. It reads the hook
+JSON on stdin and, to deny, writes the reason to stderr and exits 2 (both runtimes block on that and show the reason
+to the model). A parse problem or an unknown hat allows the call: a guard bug must never stop the work.
+
+It denies, per the hat: edits matching `deny.edit` (`**` = nothing in the worktree), shell commands starting with a
+`deny.commands` prefix, shell writes (redirects, rm/mv/cp/tee..., sed -i) to a denied path, git writes in the worktree
+for a hat that may not edit, subagents when `subagents` is `none`; and for every hat edits to profile/employees/**.
+Not caught: a script that writes files itself (python -c ...). `bin/zed-guard` still guards git.
+
+Test:  echo '{"tool_name":"Bash","tool_input":{"command":"gh pr comment 1"}}' | ZED_EMPLOYEE=quill ZED_HAT=review zed-deny --explain
+"""
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import zeddeny  # noqa: E402
+import zedemployee as emp  # noqa: E402
+import zedlib  # noqa: E402
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="zed-deny", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--explain", action="store_true", help="print the decision in words and exit 0")
+    a = ap.parse_args(argv)
+    hat = os.environ.get("ZED_HAT")
+    if not (os.environ.get("ZED_EMPLOYEE") and hat):
+        return 0
+    try:
+        payload = json.load(sys.stdin)
+        worktree = os.environ.get("ZED_WORKTREE") or payload.get("cwd") or os.getcwd()
+        reason = zeddeny.decide(payload, emp.load_manifest(hat), worktree, zedlib.PROFILE_DIR)
+    except Exception:  # fail open
+        return 0
+    if a.explain:
+        print(f"deny: {reason}" if reason else "allow")
+        return 0
+    if reason:
+        print(f"zed-deny: {reason}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

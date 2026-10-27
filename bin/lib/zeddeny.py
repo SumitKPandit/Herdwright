@@ -1,0 +1,142 @@
+"""A hat's `deny` policy (templates/employees/hats/<hat>/capabilities.json), decided once and rendered per runtime
+(design R2). The decision lives here; the hook script bin/zed-deny only feeds it a tool call.
+
+  Claude Code   a PreToolUse command hook in a per-session settings file (`claude --settings`)
+  Copilot CLI   a PreToolUse hook in a per-session plugin (`--plugin-dir`) and `--deny-tool shell(<prefix>)` flags
+  both          git itself is guarded by bin/zed-guard, which spawn installs in the worktree
+
+Facts about both runtimes' hook protocols are in docs/runtimes/*.md.
+"""
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import zedshell  # noqa: E402
+
+EDIT_TOOLS = {"edit", "write", "notebookedit", "multiedit", "create", "str_replace", "str_replace_editor", "apply_patch"}
+PATH_KEYS = ("file_path", "path", "notebook_path", "filePath")
+PATCH_FILE = re.compile(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$", re.M)
+SUBAGENT_TOOLS = {"agent", "task"}
+EMPLOYEE_DATA = "profile/employees/**"  # every hat: employee records change only through `zed-employee`
+
+
+def glob_regex(pattern):
+    """`**` matches anything including `/`; `*` and `?` stay inside one path segment."""
+    out, i = "", 0
+    while i < len(pattern):
+        if pattern.startswith("**", i):
+            out, i = out + ".*", i + 2
+        else:
+            c = pattern[i]
+            out += "[^/]*" if c == "*" else "[^/]" if c == "?" else re.escape(c)
+            i += 1
+    return re.compile(out + r"\Z")
+
+
+def denied_path(path, patterns, worktree, profile, cwd):
+    """The pattern that denies `path`, or None. A pattern beginning `profile/` is relative to the profile folder,
+    any other to the worktree; paths outside both (scratch, evidence directories, /tmp) are never denied."""
+    p = Path(os.path.expanduser(str(path)))
+    p = Path(os.path.realpath(p if p.is_absolute() else Path(cwd) / p))
+    for pattern in patterns:
+        base, rel_pattern = (Path(profile), pattern[len("profile/"):]) if pattern.startswith("profile/") else (Path(worktree), pattern)
+        base = Path(os.path.realpath(base))
+        if (p == base or base in p.parents) and glob_regex(rel_pattern).match(str(p.relative_to(base))):
+            return pattern
+    return None
+
+
+def command_denied(words, prefixes):
+    """The denied prefix a simple command starts with (the program is compared by basename), or None."""
+    for prefix in prefixes:
+        want = prefix.split()
+        if len(words) >= len(want) and Path(words[0]).name == want[0] and words[1:len(want)] == want[1:]:
+            return prefix
+    return None
+
+
+def shell_problem(cmd, manifest, worktree, profile, cwd):
+    deny = manifest["deny"]
+    patterns = [EMPLOYEE_DATA, *deny["edit"]]
+    try:
+        cmds = zedshell.split_commands(zedshell.tokens(cmd))
+    except ValueError:
+        return None  # unbalanced quotes: fail open, like the other hooks
+    read_only = "**" in deny["edit"]  # a hat that may not edit at all may not commit either
+    for words, _ in cmds:
+        while words and re.fullmatch(r"\w+=.*", words[0]):
+            words = words[1:]
+        if not words:
+            continue
+        if prefix := command_denied(words, deny["commands"]):
+            return f"`{prefix}` is denied to this hat: anything outward goes to Zed as a draft"
+        targets = [words[i + 1] for i, w in enumerate(words[:-1]) if w in zedshell.REDIRECTS and not words[i + 1].startswith("&")]
+        name = Path(words[0]).name
+        if name in zedshell.FILE_WRITERS or (name in ("sed", "perl") and any(re.fullmatch(r"-\w*i\w*", w) for w in words[1:])):
+            targets += [w for w in words[1:] if not w.startswith("-")]
+        for t in targets:
+            if pattern := denied_path(t, patterns, worktree, profile, cwd):
+                return f"writing {t} is denied to this hat ({pattern})"
+        if name == "git" and read_only:
+            sub, repo = zedshell.git_target(words, cwd)
+            if sub in zedshell.GIT_WRITE and denied_path(repo, ["**"], worktree, profile, cwd):
+                return f"`git {sub}` in the worktree is denied: this hat does not change the repo"
+    return None
+
+
+def edit_paths(tool_input):
+    """The files an edit tool call touches. Claude passes a dict with a path; Copilot's `Edit` passes an apply_patch
+    text (verified 2026-10-27) whose `*** Add|Update|Delete File:` and `*** Move to:` lines name them."""
+    if isinstance(tool_input, str):
+        return [m.group(1).strip() for m in PATCH_FILE.finditer(tool_input)]
+    path = next((tool_input[k] for k in PATH_KEYS if tool_input.get(k)), None)
+    return [path] if path else []
+
+
+def decide(payload, manifest, worktree, profile):
+    """Reason to deny this tool call for an employee wearing the hat `manifest` describes, or None to allow it."""
+    tool = str(payload.get("tool_name", "")).lower()
+    inp = payload.get("tool_input") or {}
+    cwd = payload.get("cwd") or os.getcwd()
+    if tool in EDIT_TOOLS:
+        paths = edit_paths(inp)
+        if not paths:
+            return "an edit that names no file cannot be checked, so it is denied" if "**" in manifest["deny"]["edit"] else None
+        for path in paths:
+            if pattern := denied_path(path, [EMPLOYEE_DATA, *manifest["deny"]["edit"]], worktree, profile, cwd):
+                return f"editing {path} is denied to this hat ({pattern})" + \
+                       ("; use `zed-employee remember|refresh|drop`" if pattern == EMPLOYEE_DATA else "")
+    elif tool == "bash":
+        return shell_problem(inp.get("command", "") if isinstance(inp, dict) else "", manifest, worktree, profile, cwd)
+    elif tool in SUBAGENT_TOOLS and manifest["subagents"] == "none":
+        return "this hat starts no subagents"
+    return None
+
+
+# ---------------------------------------------------------------- rendering
+
+
+def hook_command(zed_home):
+    return str(Path(zed_home) / "bin" / "zed-deny")
+
+
+def claude_settings(zed_home):
+    """Contents of the per-session `claude --settings` file (additive to the project's own settings)."""
+    return {"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": hook_command(zed_home), "timeout": 10}]}]}}
+
+
+def copilot_plugin(directory, zed_home, name="zed-deny"):
+    """A per-session Copilot plugin carrying the hook (PascalCase event names are required; see docs/runtimes/copilot.md)."""
+    directory = Path(directory)
+    (directory / "hooks").mkdir(parents=True, exist_ok=True)
+    (directory / "plugin.json").write_text(json.dumps({"name": name, "version": "1.0.0", "description": "Zed hat deny policy"}, indent=2) + "\n")
+    hooks = {"version": 1, "hooks": {"PreToolUse": [{"type": "command", "bash": hook_command(zed_home), "timeoutSec": 10}]}}
+    (directory / "hooks" / "hooks.json").write_text(json.dumps(hooks, indent=2) + "\n")
+    return directory
+
+
+def copilot_deny_tools(manifest):
+    return [f"shell({prefix})" for prefix in manifest["deny"]["commands"]]

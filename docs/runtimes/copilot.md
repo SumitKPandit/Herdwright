@@ -23,3 +23,14 @@ Verdicts: `yes` works as needed, `partial` works with the stated limit, `no` una
   session shows `blocked` until answered.
 - Copilot may merge several commands into one tool call; give explicit "one call each" instructions in probes.
 - `--model auto` is accepted; an unavailable model name aborts with `Model "..." from --model flag is not available.`
+
+## Hat deny policy as built (T23, verified 2026-10-27, Copilot CLI 1.0.103)
+
+`spawn employee= hat=` writes a per-session plugin `profile/.cache/employees/<name>/<agent>-plugin/` (`plugin.json`,
+`hooks/hooks.json` with a PascalCase `PreToolUse` hook running `bin/zed-deny`) and starts Copilot with `--plugin-dir`
+plus one `--deny-tool=shell(<prefix>)` per denied command. A real `copilot -p` session was denied both a file creation
+and `gh pr comment 1 --body hi` ("Denied by preToolUse hook: hook exited with code 2"); `Changes +0 -0`.
+Copilot's edit tool arrives at the hook as `tool_name` `Edit` with `tool_input` a **string** in apply_patch format
+(`*** Add File: b.py` ...), not a JSON object: `zed-deny` reads the paths from the `*** Add|Update|Delete File:` and
+`*** Move to:` lines. Edits through the shell are caught by the `Bash` rule (redirects, rm/mv/cp/tee, sed -i).
+Not caught on either runtime: a program that writes files itself (e.g. `python -c`); git stays guarded by `zed-guard`.

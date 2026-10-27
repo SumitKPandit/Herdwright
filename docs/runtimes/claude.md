@@ -24,3 +24,10 @@ Verdicts: `yes` works as needed, `partial` works with the stated limit, `no` una
 - Claude backgrounds a foreground `sleep` and long commands; it can refuse a bare long `sleep`. Use a script
   for timing probes.
 - First start in a new folder shows the trust dialog; `bin/zed` already handles it.
+
+## Hat deny policy as built (T23, verified 2026-10-27, Claude Code 2.1.311)
+
+`spawn employee= hat=` writes `profile/.cache/employees/<name>/<agent>-settings.json` (a `PreToolUse` hook, matcher
+`*`, command `bin/zed-deny`) and starts the session with `--settings <file>`. A real `claude -p` session with
+`ZED_EMPLOYEE=quill ZED_HAT=review` was denied both `gh pr comment 1 --body hi` (Bash) and a `Write` into the worktree;
+the model saw `PreToolUse:<tool> hook error: ... zed-deny: ...` and nothing ran. The hook denies by exit 2 + stderr.

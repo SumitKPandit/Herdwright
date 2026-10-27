@@ -119,21 +119,11 @@ def cmd_verify(args):
 
 def cmd_pack(args):
     name = employee_name(args)
-    if args.hat not in emp.hat_names():
-        raise emp.EmployeeError(f"unknown hat {args.hat!r}: one of {', '.join(emp.hat_names())}")
-    edir = emp.employee_dir(name)
-    fields, _ = emp.load_employee(name)
-    zedmem.verify(edir, args.repo)
-    text, used, attention = zedmem.build_pack(edir, name, repo=args.repo, hat=args.hat, tags=csv(args.tags),
-                                              memory_words=args.memory_words or fields.get("memory_words", zedmem.DEFAULT_MEMORY_WORDS))
+    text, path, used, archived = emp.make_pack(name, args.repo, args.hat, csv(args.tags), args.session, args.memory_words, args.dry_run)
     if args.dry_run:
         print(text)
         return
-    archived = zedmem.record_pack(edir, args.repo, used, attention)
-    out = zedlib.PROFILE_DIR / ".cache" / "employees" / name / f"{args.session or 'adhoc'}-pack.md"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(text)
-    print(text if args.print else f"{out} ({len(used)} entries" + (f", archived {' '.join(archived)}" if archived else "") + ")")
+    print(text if args.print else f"{path} ({len(used)} entries" + (f", archived {' '.join(archived)}" if archived else "") + ")")
 
 
 def build_parser():

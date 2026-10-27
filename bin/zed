@@ -38,6 +38,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import zedassign  # noqa: E402
+import zeddeny  # noqa: E402
+import zedemployee as emp  # noqa: E402
 import zedlib  # noqa: E402
 
 ZED_HOME = Path(__file__).resolve().parent.parent
@@ -90,6 +93,7 @@ PERMISSION_MODE_MENU = {"manual": "1", "assisted": "2", "allow-all": "3"}  # Cop
 
 TASK_STATES = ["intake", "active", "waiting_user", "in_review", "pr_open", "parked", "done", "cancelled"]
 SESSION_STATES = ["running", "waiting_user", "finished", "closed"]
+ASSIGN_ORIGINS = ["zed", "user", "schedule"]
 OPEN_TASK_STATES = ["intake", "active", "waiting_user", "in_review", "pr_open", "parked"]
 
 SCHEMA = """
@@ -1122,12 +1126,17 @@ def slugify(s, n=40):
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:n].strip("-")
 
 
-def worker_rules():
+def worker_rules_text():
     """Core worker rules + the profile's rules.md, with {{ZED_HOME}} / {{PROFILE}} filled in."""
     text = CORE_WORKER_RULES.read_text()
     if PROFILE_RULES.exists():
         text += "\n\n" + PROFILE_RULES.read_text()
-    text = text.replace("{{ZED_HOME}}", str(ZED_HOME)).replace("{{PROFILE}}", str(PROFILE_DIR))
+    return text.replace("{{ZED_HOME}}", str(ZED_HOME)).replace("{{PROFILE}}", str(PROFILE_DIR))
+
+
+def worker_rules():
+    """Write the worker rules where Claude (system-prompt file) and Copilot (instructions dir) read them."""
+    text = worker_rules_text()
     GENERATED_WORKER_RULES.parent.mkdir(parents=True, exist_ok=True)
     GENERATED_WORKER_RULES.write_text(text)
     # Copilot has no system-prompt flag; it loads *.instructions.md from COPILOT_CUSTOM_INSTRUCTIONS_DIRS.
@@ -1136,25 +1145,48 @@ def worker_rules():
     return GENERATED_WORKER_RULES
 
 
-def runtime_launch(runtime, agent, model, effort):
-    """(env for the herdr workspace, CLI arguments) to start a worker on `runtime`."""
+def runtime_launch(runtime, agent, model, effort, kit=None):
+    """(env for the herdr workspace, CLI arguments) to start a worker on `runtime`. An employee's session passes
+    its `kit` (employee_kit): its own rules file and its hat's deny policy replace the shared ones."""
     rules = worker_rules()
     model_args = (["--model", model] if model else [])
     if runtime == "claude":
         # --add-dir: workers read their brief, rules and knowledge from the profile outside their worktree.
-        return [], ["--permission-mode", "auto", "-n", agent, "--append-system-prompt-file", str(rules),
-                    "--add-dir", str(PROFILE_DIR), *model_args, *(["--effort", effort] if effort else [])]
+        return [], ["--permission-mode", "auto", "-n", agent, "--append-system-prompt-file", str((kit or {}).get("rules", rules)),
+                    "--add-dir", str(PROFILE_DIR), *model_args, *(["--effort", effort] if effort else []),
+                    *(["--settings", str(kit["claude_settings"])] if kit else [])]
     rs = runtime_settings("copilot")
     # Interactive mode, never autopilot: in autopilot Copilot answers its own questions with a guess.
     # --experimental: needed for Assisted Permissions (selected after start, see set_copilot_permissions).
     # --add-dir: Copilot limits file access to the worktree; workers read their brief and knowledge
     # in the profile and use Zed's tools (e.g. bin/bb).
-    return [f"COPILOT_CUSTOM_INSTRUCTIONS_DIRS={COPILOT_INSTRUCTIONS_DIR}"], [
+    return [f"COPILOT_CUSTOM_INSTRUCTIONS_DIRS={(kit or {}).get('instructions', COPILOT_INSTRUCTIONS_DIR)}"], [
         "--mode", "interactive", "--experimental", "-n", agent, "--add-dir", str(PROFILE_DIR), "--add-dir", str(ZED_HOME),
         *model_args,
         *(["--reasoning-effort", effort] if effort else []),
         *[f"--allow-tool={a}" for a in rs.get("allow_tools", [])],
-        *[f"--deny-tool={d}" for d in rs.get("deny_tools", [])]]
+        *[f"--deny-tool={d}" for d in rs.get("deny_tools", []) + (kit or {}).get("deny_tools", [])],
+        *(["--plugin-dir", str(kit["copilot_plugin"])] if kit else [])]
+
+
+def employee_kit(name, hat, repo, tags, sid, agent, worktree):
+    """What an employee's session starts with, written under profile/.cache/employees/<name>/: the memory pack, the
+    rules (worker rules, hat charter, employee rules), and the hat's deny policy rendered for both runtimes
+    (bin/zed-deny as a hook; Copilot also gets --deny-tool flags). Returns the kit for runtime_launch, plus the env
+    that identifies the session to its hooks and scripts."""
+    out = PROFILE_DIR / ".cache" / "employees" / name
+    pack = emp.make_pack(name, repo, hat, tags, f"S{sid}")[1]
+    rules = worker_rules_text() + "\n\n" + emp.employee_rules(name, hat, pack)
+    kit = {"pack": pack, "rules": out / f"{agent}-rules.md", "instructions": out / f"{agent}-instructions",
+           "claude_settings": out / f"{agent}-settings.json", "copilot_plugin": out / f"{agent}-plugin"}
+    kit["instructions"].mkdir(parents=True, exist_ok=True)
+    kit["rules"].write_text(rules)
+    (kit["instructions"] / "zed-worker.instructions.md").write_text(rules)
+    kit["claude_settings"].write_text(json.dumps(zeddeny.claude_settings(ZED_HOME), indent=2) + "\n")
+    zeddeny.copilot_plugin(kit["copilot_plugin"], ZED_HOME)
+    kit["deny_tools"] = zeddeny.copilot_deny_tools(emp.load_manifest(hat))
+    env = [f"ZED_EMPLOYEE={name}", f"ZED_HAT={hat}", f"ZED_SESSION=S{sid}", f"ZED_WORKTREE={worktree}"]
+    return kit, env
 
 
 def set_copilot_permissions(agent):
@@ -1264,10 +1296,11 @@ def cmd_brief(args):
 
 def cmd_spawn(args, worktree=None):
     """spawn <task-id> repo=<repo> base=<branch> branch=<branch> brief=<path> [name=<agent>]
-    [runtime=auto|claude|copilot] [model=] [effort=] [kind=<worktype|investigation|design…>] [handoff=<note>]"""
+    [runtime=auto|claude|copilot] [model=] [effort=] [kind=<worktype|investigation|design…>] [handoff=<note>]
+    [employee=<name> hat=<build|review|qa|…> [tags=a,b] [origin=zed|user|schedule]]  (an employee's assignment)"""
     if not args:
         die("spawn <task-id> repo=... base=... branch=... brief=<file> [name=...] [runtime=auto|claude|copilot] "
-            "[model=] [effort=] [kind=] [from=] [handoff=<note>]")
+            "[model=] [effort=] [kind=] [from=] [handoff=<note>] [employee= hat= tags= origin=]")
     tid = int(args[0].lstrip("T"))
     kv = parse_kv(args[1:])
     for k in ("repo", "base", "branch", "brief"):
@@ -1287,12 +1320,31 @@ def cmd_spawn(args, worktree=None):
     missing = [h for h in ("## Plan", "## Definition of done") if h not in brief.read_text()]
     if missing:
         die(f"brief {brief.name} lacks {', '.join(missing)} (templates/brief.md); no worker starts without a plan")
+    employee, hat = kv.get("employee"), kv.get("hat")
+    if bool(employee) != bool(hat):
+        die("employee= and hat= go together (`bin/zed assign <employee> <T> hat=... repo=... base=... branch=... brief=...`)")
+    if kv.get("origin", "zed") not in ASSIGN_ORIGINS:
+        die(f"origin must be one of {', '.join(ASSIGN_ORIGINS)}")
+    tags = [x for x in kv.get("tags", "").split(",") if x]
+    sid = hat_kind = employee_runtime = None
+    if employee:
+        try:
+            employee_runtime = emp.load_employee(employee)[0].get("runtime")
+            hat_kind = emp.load_manifest(hat)["kind"]
+            zedassign.check_assignment(conn, employee, hat, tid, kv["repo"], kv["branch"],
+                                       None if p.get("worktrees") is False else worktree or worktree_path(kv["repo"], kv["branch"]))
+        except (zedassign.Refused, emp.EmployeeError) as e:
+            if getattr(e, "queued", False):
+                print(f"zed: queued: {e}", file=sys.stderr)
+                sys.exit(75)
+            die(f"refused: {e}")
+        sid = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM sessions").fetchone()[0]  # the pack is named by it
     host = run([sys.executable, str(ZED_HOME / "bin" / "zed-hostload"), "check"], check=False)
     if host.returncode == 2:
         die(f"host is overloaded, not spawning (zed-hostload):\n{host.stdout.strip()}")
     if host.returncode == 1:
         print(f"zed: warning: host is under load (zed-hostload): {host.stdout.strip().splitlines()[0]}", file=sys.stderr)
-    runtime = choose_runtime(kv.get("runtime", "auto"))
+    runtime = choose_runtime(kv.get("runtime") or (employee_runtime if employee_runtime != "auto" else None) or "auto")
     if runtime == "claude" and (warning := quota_warning()):
         print(f"zed: warning: {warning}", file=sys.stderr)
     require_capacity(conn, runtime, tid)  # a handoff has already closed the session it replaces
@@ -1302,14 +1354,19 @@ def cmd_spawn(args, worktree=None):
     elif "effort" in kv:
         effort, model_why = kv["effort"], model_why + "; effort given to spawn"
     if "effort" not in kv and not runtime_settings(runtime).get("effort"):
-        effort, model_why = effort_for_kind(runtime, kv.get("kind") or t["worktype"], effort, model_why)
+        kind = kv.get("kind") or t["worktype"]
+        if hat_kind in (runtime_config().get("model_policy", {}).get("effort_by_kind") or {}) and "kind" not in kv:
+            kind = hat_kind  # the hat's own kind, when the profile's policy has an effort for it
+        effort, model_why = effort_for_kind(runtime, kind, effort, model_why)
     if effort and effort not in RUNTIMES[runtime]["efforts"]:
         die(f"invalid effort '{effort}' for {runtime}: {RUNTIMES[runtime]['efforts']}")
     model, effort, model_why = apply_ceiling(runtime, model, effort, model_why)
     if runtime == "copilot" and runtime_settings(runtime).get("permission_mode", "assisted") not in PERMISSION_MODE_MENU:
         die("copilot permission_mode must be manual, assisted or allow-all")
 
-    agent = kv.get("name") or f"t{tid}-{slugify(kv['repo'], 12)}"
+    agent = kv.get("name") or (f"{employee}-t{tid}-{hat}" if employee else f"t{tid}-{slugify(kv['repo'], 12)}")
+    if employee and "name" not in kv and conn.execute("SELECT 1 FROM sessions WHERE agent=? AND status!='closed'", (agent,)).fetchone():
+        agent = f"{agent}-{sid}"  # an earlier session of the same name is still open (finished, not yet closed)
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", agent):
         die(f"bad agent name '{agent}'")
     reuse_worktree = worktree is not None
@@ -1350,7 +1407,9 @@ def cmd_spawn(args, worktree=None):
 
     # 2. herdr workspace + agent CLI
     require_lock()
-    env, cli_args = runtime_launch(runtime, agent, model, effort)
+    kit, employee_env = employee_kit(employee, hat, kv["repo"], tags, sid, agent, worktree) if employee else (None, [])
+    env, cli_args = runtime_launch(runtime, agent, model, effort, kit)
+    env += employee_env
     label = f"T{tid} {t['jira'] or ''} {kv['repo']}".strip()
     ws = herdr_json(["workspace", "create", "--cwd", str(worktree), "--label", label, "--no-focus",
                      *[a for e in env for a in ("--env", e)]])["result"]
@@ -1368,14 +1427,16 @@ def cmd_spawn(args, worktree=None):
     perm_error = set_copilot_permissions(agent) if runtime == "copilot" and r.returncode == 0 else None
     ts = now()
     cur = conn.execute(
-        "INSERT INTO sessions(task_id,repo,base,branch,worktree,agent,workspace_id,pane_id,status,runtime,model,effort,"
-        "brief,scratch,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (tid, kv["repo"], kv["base"], kv["branch"], str(worktree), agent, ws_id, pane_id, "running",
-         runtime, model, effort, str(brief), str(scratch) if scratch else None, ts, ts))
+        "INSERT INTO sessions(id,task_id,repo,base,branch,worktree,agent,workspace_id,pane_id,status,runtime,model,effort,"
+        "brief,scratch,employee,hat,origin,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (sid, tid, kv["repo"], kv["base"], kv["branch"], str(worktree), agent, ws_id, pane_id, "running",
+         runtime, model, effort, str(brief), str(scratch) if scratch else None, employee, hat,
+         kv.get("origin", "zed") if employee else kv.get("origin"), ts, ts))
     sid = cur.lastrowid
     conn.execute("UPDATE tasks SET status='active' WHERE id=? AND status IN ('intake','parked')", (tid,))
     log_event(conn, tid, "spawn", f"S{sid} {agent} on {kv['repo']} {kv['branch']} ← {kv['base']} ({worktree}); "
-              f"{runtime} model {model or 'default'} effort {effort or 'default'} ({model_why})")
+              f"{runtime} model {model or 'default'} effort {effort or 'default'} ({model_why})"
+              + (f"; {employee} wearing {hat}" if employee else ""))
     touch_task(conn, tid)
     conn.commit()
     write_status(conn)
@@ -1390,9 +1451,11 @@ def cmd_spawn(args, worktree=None):
     text = (f"You are the engineering worker, NOT the Zed coordinator, for session S{sid} / task T{tid}. "
             f"Do not onboard, acquire the coordinator lock, or change the coordinator's task database. "
             f"Zed's home is {ZED_HOME}; the user's profile is {PROFILE_DIR}. "
-            f"Read your worker rules at {GENERATED_WORKER_RULES} and your brief at {brief}, then "
+            f"Read your worker rules at {kit['rules'] if kit else GENERATED_WORKER_RULES} and your brief at {brief}, then "
             f"{PROFILE_DIR}/knowledge/repos/{kv['repo']}.md if it exists. "
             f"Your status file is {STATUS_DIR}/S{sid}.log (see 'Report status' in your rules). ")
+    if employee:
+        text += employee_intro(conn, employee, hat, kit, tid)
     if scratch:
         text += (f"Your scratch folder is {scratch}: keep every clone, download and temporary file there and nowhere "
                  f"else in the project; Zed deletes it when your session closes. ")
@@ -1407,6 +1470,25 @@ def cmd_spawn(args, worktree=None):
     if not prompt_ok:
         die(f"S{sid}: brief submission did not report activity; inspect before retrying:\n{prompt_error}")
     return sid
+
+
+def cmd_assign(args):
+    """assign <employee> <task-id> hat=<hat> repo= base= branch= brief= [tags=] [origin=] …: `spawn` for an employee."""
+    if len(args) < 2:
+        die("assign <employee> <task-id> hat=<build|review|qa> repo=... base=... branch=... brief=<file> [tags=a,b] [origin=zed|user|schedule]")
+    return cmd_spawn([args[1], f"employee={args[0]}", *args[2:]])
+
+
+def employee_intro(conn, name, hat, kit, tid):
+    """The employee's paragraph of the first prompt: the pack, the hat's skills, and the findings drafts earlier
+    assignments on this task left (a fix or a re-review starts from them, not from anyone's memory of the work)."""
+    text = (f"You are {name.capitalize()}, a named employee wearing the {hat} hat. Read your memory pack at {kit['pack']} first. "
+            f"Skills load when they apply (`zed-employee skill show <name>`): {', '.join(emp.load_manifest(hat)['skills'])}. "
+            f"Before ZED:DONE run `zed-employee finish`. ")
+    findings = [r["text"] for r in conn.execute("SELECT text FROM events WHERE task_id=? AND kind='findings' ORDER BY id", (tid,))]
+    if findings:
+        text += "Findings drafts from earlier assignments on this task, read them: " + "; ".join(findings) + ". "
+    return text
 
 
 def cmd_session(args):
@@ -1687,7 +1769,8 @@ def cmd_handoff(args):
     conn.close()
     return cmd_spawn([str(s["task_id"]), f"repo={s['repo']}", f"base={s['base']}", f"branch={s['branch']}",
                       f"brief={brief}", f"runtime={target}", f"handoff={note}", f"name={s['agent']}",
-                      *[f"{k}={kv[k]}" for k in ("model", "effort") if k in kv]], worktree=Path(wt))
+                      *[f"{k}={kv[k]}" for k in ("model", "effort") if k in kv],
+                      *[f"{k}={s[k]}" for k in ("employee", "hat", "origin") if s[k]]], worktree=Path(wt))
 
 
 def read_screen(agent, source="visible", lines=None):
@@ -2519,6 +2602,9 @@ def cmd_help(args):
                                      runtime/model/effort default to the profile's order and model policy;
                                      kind (default: the task's worktype) picks the effort by model_policy.effort_by_kind;
                                      beyond runtimes.<rt>.max_running the task is queued (exit 75)
+        [employee= hat= tags=a,b origin=zed]   an employee's assignment (also: assign <employee> <T> hat= …);
+                                     refused for an author reviewing/QAing their own work or a second writer
+                                     on a worktree; exit 75 (queued) if the employee is busy
   session list | session set <S|agent> key=value... (status pr_url claude_session_id pane_id workspace_id base brief)
   close <S|agent> [keep-worktree] [keep-scratch] [force]
                                      (external sessions are only untracked; the landed-work test below
@@ -2557,7 +2643,7 @@ Task states:    """ + ", ".join(TASK_STATES) + """
 Session states: """ + ", ".join(SESSION_STATES))
 
 
-COMMANDS = {"task": cmd_task, "log": cmd_log, "q": cmd_q, "spawn": cmd_spawn, "session": cmd_session,
+COMMANDS = {"task": cmd_task, "log": cmd_log, "q": cmd_q, "spawn": cmd_spawn, "assign": cmd_assign, "session": cmd_session,
             "close": cmd_close, "adopt": cmd_adopt, "handoff": cmd_handoff, "watch": cmd_watch, "status": cmd_status,
             "brief": cmd_brief, "coordinator": cmd_coordinator, "quota": cmd_quota, "landed": cmd_landed, "doctor": cmd_doctor, "ack": cmd_ack, "hook": cmd_hook, "paths": cmd_paths, "start": cmd_start, "lock": cmd_lock, "runtime": cmd_runtime, "models": cmd_models, "help": cmd_help}
 
