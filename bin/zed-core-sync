@@ -17,7 +17,8 @@ Usage
   bin/zed-core-sync                     show the plan (default; changes nothing)
   bin/zed-core-sync --apply [--push]    cherry-pick onto main [and push main to --remote]
   bin/zed-core-sync --mark [<rev>]      record <rev> (default HEAD) as synced without picking
-  bin/zed-core-sync --check [--json]    list core commits not on main yet; exit 1 when there are any (`zed start`
+  bin/zed-core-sync --check [--json]    list core commits not on main yet; exit 1 when there are any, 2 when not on a
+                                        profile branch (`zed start`
                                         shows it, the watcher raises an event after an hour)
   options: --skip <sha> (repeatable), --remote <name> (default origin)
 """
@@ -40,9 +41,9 @@ def git(*args, cwd=ZED_HOME, check=True):
     return r
 
 
-def die(msg):
+def die(msg, code=1):
     print(f"zed-core-sync: {msg}", file=sys.stderr)
-    sys.exit(1)
+    sys.exit(code)
 
 
 def sync_ref(branch):
@@ -101,9 +102,9 @@ def main():
 
     branch = git("branch", "--show-current").stdout.strip()
     if not branch.startswith(PROFILE_PREFIX):
-        die(f"run this on a profile branch ({PROFILE_PREFIX}<name>), not '{branch or 'detached HEAD'}'")
+        die(f"run this on a profile branch ({PROFILE_PREFIX}<name>), not '{branch or 'detached HEAD'}'", 2 if a.check else 1)
     if git("rev-parse", "--verify", "--quiet", CORE_BRANCH, check=False).returncode != 0:
-        die(f"no local '{CORE_BRANCH}' branch")
+        die(f"no local '{CORE_BRANCH}' branch", 2 if a.check else 1)
 
     if a.mark:
         sha = git("rev-parse", a.mark).stdout.strip()

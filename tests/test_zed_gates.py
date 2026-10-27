@@ -2,6 +2,7 @@
 check, `bb pr approve|comment`, code-first `finish`. Each gate is tested for the refusal and the allowed case."""
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -42,12 +43,16 @@ class PureGateTests(unittest.TestCase):
 
     def test_relay_prompt_quotes_the_words_and_the_action(self):
         text = zedgates.relay_prompt("  yes, approve it \n", "gh pr review 12 -R o/r --approve")
-        self.assertIn('verbatim: "yes, approve it"', text)
+        self.assertIn("verbatim:\n    yes, approve it\n", text)
         self.assertIn("gh pr review 12 -R o/r --approve", text)
         with self.assertRaises(ValueError):
             zedgates.relay_prompt("", "x")
         with self.assertRaises(ValueError):
             zedgates.relay_prompt("ok", " ")
+
+    def test_relay_prompt_keeps_quotes_and_lines_in_the_words_unambiguous(self):
+        text = zedgates.relay_prompt('say "go"\nthen stop', "post it")
+        self.assertIn('    say "go"\n    then stop\n', text)
 
     def test_core_sync_stale(self):
         self.assertTrue(zedgates.core_sync_stale(1000, 1000 + 3601))
@@ -94,6 +99,16 @@ class MergeGateTests(GateCase):
         self.assertIn("no qa verdict", self.problems()[0])
         self.row("qa", "pip", "blockers", self.sha)
         self.assertIn("not clean", self.problems()[0])
+
+    def test_a_later_blockers_verdict_overrides_an_earlier_clean_one(self):
+        self.row("build", "juno")
+        self.row("review", "quill", "clean", self.sha)
+        self.row("qa", "pip", "clean", self.sha)
+        self.assertEqual(self.problems(), [])
+        self.row("review", "pip", "blockers", self.sha)  # a second reviewer, same commit
+        self.assertIn("review of", self.problems()[0])
+        self.row("review", "quill", "clean", self.sha)  # and a later clean re-run clears it
+        self.assertEqual(self.problems(), [])
 
     def test_refused_when_the_verdict_was_for_an_older_head(self):
         self.row("build", "juno")
@@ -207,9 +222,87 @@ class MergeHookTests(unittest.TestCase):
         self.git("checkout", "-q", "-b", "scratch", "profile/me")
         self.assertEqual(self.git("merge", "--no-ff", "-m", "m", "feature/x").returncode, 0)
 
-    def test_merge_command_skips_the_second_check(self):
-        r = self.git("merge", "--no-ff", "-m", "m", "feature/x", env={"ZED_MERGE_GATE_DONE": "1"})
+    def test_merge_command_skips_only_the_head_it_vetted(self):
+        sha = self.git("rev-parse", "feature/x").stdout.strip()
+        r = self.git("merge", "--no-ff", "-m", "m", "feature/x", env={"ZED_MERGE_GATE_DONE": sha})
         self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_a_blanket_skip_flag_no_longer_bypasses_the_gate(self):
+        for value in ("1", "0" * 40):
+            r = self.git("merge", "--no-ff", "-m", "m", "feature/x", env={"ZED_MERGE_GATE_DONE": value})
+            self.assertNotEqual(r.returncode, 0, value)
+            self.git("reset", "-q", "--hard", "HEAD")
+
+    def test_pulling_ones_own_branch_is_not_gated(self):
+        # origin holds an earlier commit of profile/me that the local branch has not got: a plain `git pull` merges it
+        self.git("branch", "mine-earlier", "profile/me~1")
+        self.git("checkout", "-q", "mine-earlier")
+        self.commit("f.txt", "earlier work on another machine")
+        self.git("update-ref", "refs/remotes/origin/profile/me", "HEAD")
+        self.git("checkout", "-q", "profile/me")
+        self.assertEqual(self.git("merge", "--no-ff", "-m", "m", "origin/profile/me").returncode, 0)
+        self.assertTrue((self.repo / "f.txt").exists())
+
+    def test_a_remote_ref_of_another_branch_does_not_unlock_the_merge(self):
+        self.git("update-ref", "refs/remotes/origin/feature/x", "feature/x")
+        self.assertNotEqual(self.git("merge", "--no-ff", "-m", "m", "feature/x").returncode, 0)
+
+
+class MergeHookEndToEndTests(GateCase):
+    """The real hook with the real `bin/zed gate check`, a seeded profile DB, verdict rows and the override event."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = self.root / "core"
+        self.env = {**{k: v for k, v in os.environ.items() if not k.startswith("ZED_")}, "ZED_PROFILE_DIR": str(self.profile)}
+        shutil.copytree(HOME / "bin", self.repo / "bin", ignore=shutil.ignore_patterns("__pycache__"))
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "t@t")
+        self.git("config", "user.name", "t")
+        self.git("config", "core.hooksPath", str(HOME / "hooks"))
+        self.commit("a.txt", "init")
+        self.git("checkout", "-q", "-b", self.branch)
+        self.commit("b.txt", "feature")
+        self.sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.git("checkout", "-q", "-b", "profile/me", "main")
+        self.commit("c.txt", "profile work")
+
+    def git(self, *a, env=None):
+        return subprocess.run(["git", "-C", str(self.repo), *a], capture_output=True, text=True, env=env or self.env)
+
+    def commit(self, name, msg):
+        (self.repo / name).write_text(msg)
+        self.git("add", ".")
+        self.git("commit", "-qm", msg)
+
+    def merge(self, **extra):
+        return self.git("merge", "--no-ff", "-m", "m", self.branch, env={**self.env, **extra})
+
+    def events(self):
+        return [r[0] for r in self.conn.execute("SELECT text FROM events WHERE kind='merge'")]
+
+    def test_refused_then_allowed_by_verdicts_then_override_is_logged(self):
+        self.row("build", "juno")
+        r = self.merge()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("no review verdict recorded", r.stderr)
+        self.git("reset", "-q", "--hard", "HEAD")
+
+        self.row("review", "quill", "clean", self.sha)
+        self.row("qa", "pip", "blockers", self.sha)
+        self.assertNotEqual(self.merge().returncode, 0)
+        self.git("reset", "-q", "--hard", "HEAD")
+
+        r = self.merge(ZED_GATE_OVERRIDE="user said so")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("overridden", r.stderr)
+        self.assertIn("user said so", " ".join(self.events()))
+        self.git("reset", "-q", "--hard", "HEAD~1")
+
+        self.row("qa", "pip", "clean", self.sha)
+        r = self.merge()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((self.repo / "b.txt").exists())
 
 
 class HandoffEmployeeTests(GateCase):
@@ -236,6 +329,22 @@ class HandoffEmployeeTests(GateCase):
         with patch.object(zedassign, "free_employees", return_value=[]):
             args = self.hand_off()
         self.assertIn("ephemeral=no employee is free", args)
+
+    def test_handoff_to_copilot_gives_no_reason_of_its_own(self):
+        claude = {"installed": True, "enabled": True, "limited": None}
+        with patch.object(self.z, "choose_runtime", return_value="copilot"):
+            args = self.hand_off()
+        self.assertFalse(any(a.startswith("copilot_reason=") for a in args))
+        kv = self.z.parse_kv(args[1:])
+        self.assertIn("claude is usable", zedgates.copilot_before_claude("copilot", claude, kv))
+        self.assertIsNone(zedgates.copilot_before_claude("copilot", {**claude, "limited": {"note": "cap"}}, kv))
+
+    def test_handoff_passes_the_callers_copilot_reason(self):
+        with patch.object(self.z, "choose_runtime", return_value="copilot"):
+            args = self.hand_off("copilot_reason=user asked for it")
+        self.assertIn("copilot_reason=user asked for it", args)
+        self.assertIsNone(zedgates.copilot_before_claude(
+            "copilot", {"installed": True, "enabled": True, "limited": None}, self.z.parse_kv(args[1:])))
 
     def test_nothing_eligible_refuses_before_closing_anything(self):
         with patch.object(zedassign, "suggest", return_value=[]), self.assertRaises(SystemExit):
@@ -328,7 +437,7 @@ class PromptTests(GateCase):
         with self.state("idle"):
             self.z.cmd_relay_post([f"S{self.sid}", str(words), "--action", "approve PR 7 in o/r"])
         sent = self.mock_prompt_worker.call_args.args[1]
-        self.assertIn('verbatim: "Yes, approve PR 7"', sent)
+        self.assertIn("verbatim:\n    Yes, approve PR 7\n", sent)
         self.assertIn("approve PR 7 in o/r", sent)
         with self.state("working"):
             with self.assertRaises(SystemExit):
@@ -383,6 +492,24 @@ class CoreSyncCheckTests(unittest.TestCase):
             data = json.loads(r.stdout)
             self.assertEqual(data["count"], 1)
             self.assertGreater(data["oldest"], 0)
+
+
+    def test_check_exits_2_off_a_profile_branch_so_callers_can_tell_it_from_waiting_commits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            git = lambda *a: subprocess.run(["git", "-C", tmp, *a], check=True, capture_output=True, text=True)
+            git("init", "-q", "-b", "main")
+            r = subprocess.run(["python3", str(HOME / "bin" / "zed-core-sync"), "--check"], capture_output=True, text=True, cwd=tmp)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("profile branch", r.stderr)
+
+
+class SessionRefTests(unittest.TestCase):
+    def test_session_ref(self):
+        z = _load.load("zed")
+        self.assertEqual(z.session_ref("S61"), "61")
+        self.assertEqual(z.session_ref("61"), "61")
+        self.assertEqual(z.session_ref("Sam"), "Sam")  # an agent name that starts with S
+        self.assertEqual(z.session_ref("quill-t25"), "quill-t25")
 
 
 class BbTests(unittest.TestCase):

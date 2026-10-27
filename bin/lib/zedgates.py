@@ -15,17 +15,16 @@ CORE_SYNC_STALE_SECONDS = 3600
 
 def merge_problems(conn, sha):
     """Why `sha` (a branch head) may not be merged into a working branch; empty when it may. It needs a clean review and
-    a clean qa verdict recorded for exactly this commit, each by an employee who authored none of the work."""
+    a clean qa verdict recorded for exactly this commit (the latest verdict of each hat), each by an employee who authored none of the work."""
     problems = []
     for hat in GATE_HATS:
         rows = conn.execute("SELECT * FROM sessions WHERE hat=? AND verdict_sha=? ORDER BY id DESC", (hat, sha)).fetchall()
         if not rows:
             problems.append(f"no {hat} verdict recorded for {sha[:10]} (the branch changed after it, or none was done)")
             continue
-        clean = [s for s in rows if s["verdict"] == "clean" and s["employee"]
-                 and s["employee"] not in zedassign.authors(conn, s["task_id"], s["repo"], s["branch"])]
-        if not clean:
-            last = rows[0]
+        last = rows[0]  # the latest verdict of the hat decides: a later blockers verdict (re-run, second reviewer) counts
+        if not (last["verdict"] == "clean" and last["employee"]
+                and last["employee"] not in zedassign.authors(conn, last["task_id"], last["repo"], last["branch"])):
             problems.append(f"{hat} of {sha[:10]} is not clean by a non-author (S{last['id']}: {last['employee'] or 'no employee'}, "
                             f"verdict {last['verdict'] or 'none'})")
     return problems
@@ -63,7 +62,8 @@ def relay_prompt(words, action):
     words, action = words.strip(), action.strip()
     if not words or not action:
         raise ValueError("relay-post needs the user's words and the exact action")
-    return (f'The user said, verbatim: "{words}"\n'
+    quoted = "\n".join(f"    {line}" for line in words.splitlines())
+    return (f"The user said, verbatim:\n{quoted}\n"
             f"That is their OK for exactly this action, and nothing wider: {action}\n"
             "Do it now, then confirm it landed (read it back) and report what you posted.")
 

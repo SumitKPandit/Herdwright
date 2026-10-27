@@ -653,6 +653,11 @@ def get_task(conn, tid):
     return t
 
 
+def session_ref(arg):
+    """`S61` -> `61`; an agent name or a bare id is returned unchanged."""
+    return arg[1:] if arg[:1] == "S" and arg[1:].isdigit() else arg
+
+
 def resolve_session(conn, ref):
     """Session by numeric id or agent name."""
     if str(ref).isdigit():
@@ -1529,7 +1534,7 @@ def cmd_prompt(args):
         die("prompt <S|agent> [--redirect] (<text> | --file <path>)")
     conn = db()
     require_lock()
-    s = resolve_session(conn, args[0].lstrip("S") if args[0][1:].isdigit() and args[0][0] == "S" else args[0])
+    s = resolve_session(conn, session_ref(args[0]))
     text = Path(args[2]).read_text() if args[1] == "--file" and len(args) > 2 else " ".join(args[1:])
     send_prompt(conn, s, text.strip(), redirect, "prompted by Zed")
 
@@ -1554,7 +1559,7 @@ def cmd_relay_post(args):
         print(text)
         return
     require_lock()
-    s = resolve_session(conn, args[0][1:] if args[0][0] == "S" and args[0][1:].isdigit() else args[0])
+    s = resolve_session(conn, session_ref(args[0]))
     send_prompt(conn, s, text, redirect, f"relay-post: {args[3][:120]}")
 
 
@@ -1596,7 +1601,7 @@ def cmd_merge(args):
               f"{args[0]} {sha[:10]} into {run(['git', '-C', repo_dir, 'branch', '--show-current']).stdout.strip()}"
               + (f"; gate overridden: {override}" if problems else "; gate passed"))
     conn.commit()
-    os.environ["ZED_MERGE_GATE_DONE"] = "1"  # the git hook (hooks/reference-transaction) must not ask the gate a second time
+    os.environ["ZED_MERGE_GATE_DONE"] = sha  # the git hook (hooks/reference-transaction) skips only this vetted head
     try:
         r = run(["git", "-C", repo_dir, "merge", "--no-ff", args[0]], check=False)
     finally:
@@ -1612,7 +1617,7 @@ def cmd_session(args):
     conn = db()
     if sub == "set":
         require_lock()
-        s = resolve_session(conn, rest[0].lstrip("S") if rest[0].startswith("S") and rest[0][1:].isdigit() else rest[0])
+        s = resolve_session(conn, session_ref(rest[0]))
         for k, v in parse_kv(rest[1:]).items():
             if k not in ("status", "pr_url", "claude_session_id", "pane_id", "workspace_id", "base", "brief"):
                 die(f"cannot set '{k}' on a session")
@@ -1715,7 +1720,7 @@ def cmd_landed(args):
     if not args:
         die("landed <S|agent>")
     conn = db()
-    s = resolve_session(conn, args[0][1:] if args[0].startswith("S") and args[0][1:].isdigit() else args[0])
+    s = resolve_session(conn, session_ref(args[0]))
     blockers = landed_blockers(conn, s, git_checks=project(s["repo"]).get("worktrees") is not False and not s["external"])
     if blockers:
         print(f"S{s['id']} is not landed:\n" + "\n".join(f"  - {b}" for b in blockers))
@@ -1748,7 +1753,7 @@ def cmd_close(args):
         die("close <S|agent> [keep-worktree] [keep-scratch] [force]")
     conn = db()
     require_lock()
-    ref = args[0][1:] if args[0].startswith("S") and args[0][1:].isdigit() else args[0]
+    ref = session_ref(args[0])
     s = resolve_session(conn, ref)
     if s["external"]:
         # Not ours: never close the user's pane/workspace or touch their files.
@@ -1823,13 +1828,13 @@ def cmd_adopt(args):
 
 
 def cmd_handoff(args):
-    """handoff <S|agent> [runtime=auto|claude|copilot] [brief=<file>] [model=] [effort=] — move a stopped worker (e.g. one paused
+    """handoff <S|agent> [runtime=auto|claude|copilot] [brief=<file>] [model=] [effort=] [copilot_reason=<why>] — move a stopped worker (e.g. one paused
     by a usage limit) to a new session on another runtime, in the same worktree and branch. Only with the user's OK."""
     if not args:
         die("handoff <S|agent> [runtime=auto|claude|copilot] [brief=<file>]")
     conn = db()
     require_lock()
-    ref = args[0][1:] if args[0].startswith("S") and args[0][1:].isdigit() else args[0]
+    ref = session_ref(args[0])
     s = resolve_session(conn, ref)
     kv = parse_kv([a for a in args[1:] if a != "restart"])
     if s["external"] or s["status"] == "closed":
@@ -1898,9 +1903,8 @@ def cmd_handoff(args):
     conn.close()
     return cmd_spawn([str(s["task_id"]), f"repo={s['repo']}", f"base={s['base']}", f"branch={s['branch']}",
                       f"brief={brief}", f"runtime={target}", f"handoff={note}", f"name={s['agent']}",
-                      *[f"{k}={kv[k]}" for k in ("model", "effort") if k in kv],
-                      *who,
-                      *([f"copilot_reason=handoff approved by the user ({s['runtime']} stopped)"] if target == "copilot" else [])],
+                      *[f"{k}={kv[k]}" for k in ("model", "effort", "copilot_reason") if k in kv],
+                      *who],
                      worktree=Path(wt))
 
 
