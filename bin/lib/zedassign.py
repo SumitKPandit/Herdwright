@@ -127,6 +127,8 @@ def board(conn):
     """{'free': [names], 'waits': [{kind, task, repo, branch, may}]}. kinds: `new` (a task nobody started), `fix`
     (a review or QA verdict of blockers after the latest build, and no build open), `review` / `qa` (the latest build has
     no verdict of that hat after it, and none is open), `ready` (both verdicts clean: ready-check is Zed's)."""
+    if not emp.names():
+        return {"free": [], "waits": []}
     waits = []
     for t in conn.execute("SELECT id FROM tasks WHERE status='intake' AND id NOT IN (SELECT task_id FROM sessions) ORDER BY id"):
         waits.append({"kind": "new", "task": t["id"], "repo": None, "branch": None, "may": free_employees(conn)})

@@ -267,7 +267,7 @@ def _check_src(kind, src, anchor, repo, repo_reader):
     return src, extra
 
 
-def _check_text(edir, text, exclude_id=None):
+def check_text(edir, text, exclude_id=None):
     if not text.strip():
         raise MemoryRefused("empty entry")
     words = len(text.split())
@@ -293,7 +293,7 @@ def remember(edir, kind, text, src, *, repo=None, hat=None, tags=(), anchor=None
         raise MemoryRefused("--hat applies to lessons (which craft file) and work entries (the hat worn)")
     today = today or _today()
     src_stored, extra = _check_src(kind, src, anchor, repo, repo_reader or git_reader())
-    _check_text(edir, text)
+    check_text(edir, text)
     path = entry_file(edir, kind, repo, hat)
     fields = {"tags": ",".join(t.strip() for t in tags if t.strip()), "src": src_stored, **extra}
     if kind == "work" and hat:
@@ -322,7 +322,7 @@ def refresh(edir, entry_id, *, text=None, src=None, anchor=None, repo_reader=Non
     repo = path.stem if path.parent.name == "repos" else None
     new_text = text if text is not None else entry.body
     if text is not None:
-        _check_text(edir, new_text, exclude_id=entry.id)
+        check_text(edir, new_text, exclude_id=entry.id)
     if entry.kind == "heard":
         if not (src and anchor):
             raise MemoryRefused("a heard entry becomes a fact only with the file (--src) and --anchor that confirm it")

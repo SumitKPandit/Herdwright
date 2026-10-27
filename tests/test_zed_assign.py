@@ -235,6 +235,39 @@ class SpawnWithEmployeeTests(AssignCase):
         self.assertIn(f"name={s['agent']}", args)
 
 
+class WatcherAndStartTests(AssignCase):
+    DONE = {"kind": "DONE", "items": [], "text": "x", "fields": {"Summary": "built it", "PR": "none", "QA": "ran the tests"}}
+
+    def test_a_done_without_finish_raises_the_write_back_line(self):
+        sid = self.spawn("juno", "build")
+        text = self.z.record_block(self.conn, self.session(sid), self.DONE)
+        self.assertIn(f"DONE without write-back: juno has not run `zed-employee finish` for S{sid}", text)
+
+    def test_a_done_after_finish_and_a_plain_worker_raise_nothing(self):
+        sid = self.spawn("juno", "build")
+        self.conn.execute("INSERT INTO events(task_id, ts, kind, text) VALUES (20, 'x', 'finish', ?)", (f"S{sid} juno build",))
+        self.assertNotIn("write-back", self.z.record_block(self.conn, self.session(sid), self.DONE))
+        self.conn.execute("INSERT INTO sessions(task_id,repo,base,branch,worktree,agent,status,created_at,updated_at) "
+                          "VALUES (20,'api','main','b','/w','t20-api','running','x','x')")
+        plain = self.conn.execute("SELECT * FROM sessions WHERE agent='t20-api'").fetchone()
+        self.assertNotIn("write-back", self.z.record_block(self.conn, plain, {**self.DONE, "fields": {**self.DONE["fields"], "Summary": "other"}}))
+
+    def test_start_lists_the_board_when_something_waits(self):
+        self.finish(self.spawn("juno", "build"))
+        with patch.object(self.z, "holds_lock", return_value=True), patch.object(self.z, "cmd_lock"), \
+                patch.object(self.z, "live_agents", return_value={}), patch.object(self.z, "watcher_alive", return_value=None), \
+                patch.object(self.z, "queue_pending", return_value=[]), patch.object(self.z, "quota_settings", return_value={}):
+            real_script_findings = self.z.script_findings
+            with patch.object(self.z, "script_findings", side_effect=lambda label, script, *a, **k:
+                              real_script_findings(label, script, *a, **k) if script == "zed-employee" else []):
+                self.output.truncate(0)
+                with patch.dict(os.environ, {"ZED_PROFILE_DIR": str(self.profile)}):
+                    self.z.cmd_start([])
+        out = self.output.getvalue()
+        self.assertIn("employees: who is free, what waits (zed-employee board):", out)
+        self.assertIn("review  T20 api story/ment-20-guard  may take it: pip, quill", out)
+
+
 class RenderedPolicyTests(AssignCase):
     def kit(self, hat):
         return self.z.employee_kit("quill", hat, "api", [], 7, "quill-t20", self.worktree)

@@ -1931,6 +1931,9 @@ def record_block(conn, s, block):
         else:
             conn.execute("UPDATE tasks SET status='pr_open' WHERE id=? AND status IN ('active','waiting_user','in_review')", (tid,))
     out.append(f"QA: {qa or '(missing)'}")
+    if s["employee"] and not conn.execute("SELECT 1 FROM events WHERE kind='finish' AND text LIKE ?", (f"S{sid} %",)).fetchone():
+        out.append(f"DONE without write-back: {s['employee']} has not run `zed-employee finish` for S{sid}; "
+                   "send it back to write back what it learned before accepting the work")
     for k in ("Follow-ups", "Learnings"):
         if f.get(k) and f[k].strip().lower() not in ("none", "-"):
             out.append(f"{k}: {f[k]}")
@@ -2576,6 +2579,7 @@ def cmd_start(args):
         out.append(quota_warning() or "quota: under the configured threshold (`bin/zed quota` for detail)")
     out += notes + render_brief(conn)
     if holds_lock():  # read-only sessions only report what the DB says
+        out += script_findings("employees: who is free, what waits (zed-employee board)", "zed-employee", "board", "--brief")
         out += script_findings("reality differs from the DB (zed-crew)", "zed-crew", "reconcile")
         out += script_findings("git guard (zed-guard)", "zed-guard", "audit")
         out += script_findings("core updates waiting (zed-update; `bin/zed-update apply` merges)", "zed-update", "check", "--no-fetch")

@@ -2,7 +2,7 @@
 """zed-employee — Zed's named employees: records, memory and the memory pack (no model).
 
 An employee is files under profile/employees/<name>/, not a process. Design: docs/design/employees.md, section 5.
-This is build step 2 (record + memory); `finish`, `suggest`, `board`, `report` and `postmortem` come with later steps.
+Build steps 2 (record + memory) and 3 (assignment: `finish`, `suggest`, `board`); `report` and `postmortem` come later.
 
 Usage
   zed-employee hire <name> [--voice TEXT] [--strengths a,b] [--senior|--no-senior]
@@ -24,14 +24,27 @@ Usage
   zed-employee pack [-e NAME] --repo R --hat H [--tags a,b] [--session S] [--memory-words N] [--dry-run] [--print]
       verify, then the deterministic memory pack, written to profile/.cache/employees/<name>/<session>-pack.md
 
+  Assignments (what bin/zed spawn employee= hat= starts; `finish` runs inside the employee's session):
+  zed-employee finish [--verdict clean|blockers] [--draft FILE] (--lesson TEXT ... | --none WHY) [--idea TEXT ...]
+                      [--note TEXT] [--session S] [-e NAME]
+      the write-back before ZED:DONE: lessons to the hat's craft file, the work entry from the DB and the plan, the
+      verdict on the session (review/qa; `blockers` needs the findings --draft), a log.md line, ideas to ideas.md.
+      Refuses unresolved stale entries, a missing verdict or lesson, a second finish. The watcher requires it.
+  zed-employee suggest <T> --hat H [--repo R] [--branch B] [--tags a,b] [--ambiguous] [--json]
+      the hired employees, best pick first, with the numbers behind the rank (Zed confirms)
+  zed-employee board [--json]
+      who is free, and what waits (new tasks, builds lacking a review or qa verdict, fixes) with who may take each
+
 Exit codes: 0 ok · 1 refused (the reason is printed) · 2 usage or unknown employee/hat
 """
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import zedassign  # noqa: E402
 import zedemployee as emp  # noqa: E402
 import zedlib  # noqa: E402
 import zedmem  # noqa: E402
@@ -126,6 +139,53 @@ def cmd_pack(args):
     print(text if args.print else f"{path} ({len(used)} entries" + (f", archived {' '.join(archived)}" if archived else "") + ")")
 
 
+def cmd_finish(args):
+    print("\n".join(emp.finish(employee_name(args), verdict=args.verdict, lessons=args.lesson, none_reason=args.none,
+                               draft=args.draft, ideas=args.idea, note=args.note,
+                               session=args.session or os.environ.get("ZED_SESSION"))))
+
+
+def task_id(text):
+    if not re.fullmatch(r"T?\d+", text):
+        raise emp.EmployeeError(f"{text!r} is not a task id (T20 or 20)")
+    return int(text.lstrip("T"))
+
+
+def cmd_suggest(args):
+    conn, tid = emp.connect(), task_id(args.task)
+    last = conn.execute("SELECT repo, branch FROM sessions WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+    repo = args.repo or (last["repo"] if last else None)
+    if not repo:
+        raise emp.EmployeeError(f"T{tid} has no session yet: say which repo with --repo")
+    branch = args.branch or (last["branch"] if last else None)
+    rows = zedassign.suggest(conn, tid, args.hat, repo, branch, csv(args.tags), args.ambiguous)
+
+    def render(rows):
+        out = [f"suggest T{tid} --hat {args.hat} (repo {repo}" + (f", branch {branch}" if branch else "") + ")"]
+        for i, r in enumerate((r for r in rows if r["eligible"]), 1):
+            p = r["parts"]
+            out.append(f"{i}. {r['name']:<8} score {r['score']} (memory {p['memory']}, task {p['task']}, hat {p['hat']})"
+                       f"{' senior-first' if r['lead'] else ''}  last assigned {r['last'] or 'never'}")
+        out += [f"-  {r['name']:<8} not eligible: {r['why']}" for r in rows if not r["eligible"]]
+        return out
+    zedlib.emit(rows, args.json, render)
+
+
+def cmd_board(args):
+    data = zedassign.board(emp.connect())
+
+    def render(data):
+        out = ["free: " + (", ".join(data["free"]) or "nobody"), "waiting:"]
+        for w in data["waits"]:
+            where = f"{w['repo']} {w['branch']}" if w["repo"] else "not started"
+            who = ("zed-pr ready-check, then tell the user" if w["kind"] == "ready"
+                   else "may take it: " + (", ".join(w["may"]) or "nobody free"))
+            out.append(f"  {w['kind']:<7} T{w['task']} {where}  {who}")
+        return out if data["waits"] else out + ["  nothing"]
+    zedlib.emit(data, args.json, render)
+    return 1 if args.brief and data["waits"] else 0
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="zed-employee", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -188,6 +248,26 @@ def build_parser():
     s.add_argument("--memory-words", type=int)
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--print", action="store_true")
+    s = add("suggest", cmd_suggest)
+    s.add_argument("task")
+    s.add_argument("--hat", required=True)
+    s.add_argument("--repo")
+    s.add_argument("--branch")
+    s.add_argument("--tags")
+    s.add_argument("--ambiguous", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s = add("board", cmd_board)
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--brief", action="store_true", help="exit 1 when something waits (what `bin/zed start` shows)")
+    s = add("finish", cmd_finish)
+    emp_arg(s)
+    s.add_argument("--verdict", choices=emp.VERDICTS)
+    s.add_argument("--draft")
+    s.add_argument("--lesson", action="append", default=[])
+    s.add_argument("--none")
+    s.add_argument("--idea", action="append", default=[])
+    s.add_argument("--note")
+    s.add_argument("--session")
     return p
 
 
@@ -198,7 +278,7 @@ def main(argv=None):
     except zedmem.MemoryRefused as e:
         print(f"zed-employee: refused: {e}", file=sys.stderr)
         return 1
-    except emp.EmployeeError as e:
+    except (emp.EmployeeError, zedassign.Refused) as e:
         print(f"zed-employee: {e}", file=sys.stderr)
         return 2
 
