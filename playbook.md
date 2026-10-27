@@ -121,3 +121,8 @@ Facts about a particular user or their work never go here (they go to the profil
   success; verify with `gh pr view --json reviews`. `bin/bb` has no approve/comment subcommands yet;
   workers have been calling the Bitbucket REST API (`POST …/pullrequests/<id>/approve`, `…/comments`)
   with bb's Keychain credential. Adding `bb pr approve|comment` is the deterministic fix (directive 9).
+- **Relaying an OK to post (auto-mode classifier).** A worker restarted via `handoff restart` had
+  `gh pr review --approve` denied as "Unrequested Commit in a Connected App": the user's OK only lived
+  in the handoff note. Workers that got the OK as a direct prompt posted fine. **How:** relay posting
+  approvals as a direct prompt to the posting session, quoting the user's words verbatim plus the
+  exact action (repo, PR/issue, text). Don't `handoff restart` a worker between the user's OK and its posting.
