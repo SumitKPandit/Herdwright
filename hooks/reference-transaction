@@ -1,0 +1,23 @@
+#!/bin/sh
+# Zed merge gate (installed with the other hooks by bin/zed-setup). A merge commit written to `main` or a profile branch
+# needs a clean review and a clean qa verdict (by employees who did not write the work) at the merged head:
+# `bin/zed gate check`. (pre-merge-commit cannot do this: git has not written MERGE_HEAD when it runs.)
+# Override: ZED_GATE_OVERRIDE="<reason>" (logged), or `bin/zed merge <branch> --override "<reason>"`.
+[ "$1" = prepared ] || exit 0
+[ -n "$ZED_MERGE_GATE_DONE" ] && exit 0
+while read -r old new ref; do
+  case "$ref" in refs/heads/main|refs/heads/profile/*) ;; *) continue ;; esac
+  case "$new" in *[!0]*) ;; *) continue ;; esac   # a deletion
+  parents=$(git rev-list --no-walk --parents -n 1 "$new" 2>/dev/null | cut -s -d' ' -f3-)
+  for head in $parents; do   # parents after the first: what was merged in
+    # what main already holds was gated when it got there (e.g. `git merge main` into the profile branch)
+    [ "$ref" != refs/heads/main ] && git merge-base --is-ancestor "$head" main 2>/dev/null && continue
+    top=$(git rev-parse --show-toplevel 2>/dev/null) || continue
+    [ -x "$top/bin/zed" ] || continue
+    "$top/bin/zed" gate check "$head" || {
+      echo "zed guard: merge into ${ref#refs/heads/} refused (needs clean review+qa by non-authors). Override: ZED_GATE_OVERRIDE=\"<reason>\" or bin/zed merge --override. Undo the half-done merge: git reset --hard HEAD" >&2
+      exit 1
+    }
+  done
+done
+exit 0

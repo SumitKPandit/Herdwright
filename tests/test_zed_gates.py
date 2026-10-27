@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import _load
+import zedassign
 import zedgates
 import zedlib
 from test_zed_assign import AssignCase
@@ -139,6 +140,107 @@ class MergeGateTests(GateCase):
             self.z.cmd_merge([self.branch, str(self.repo), "--override", "user said so"])
         self.assertEqual(e.exception.code, 0)
         self.assertIn("gate overridden: user said so", self.conn.execute("SELECT text FROM events WHERE kind='merge'").fetchone()[0])
+
+
+    def test_gate_check_env_override_is_logged(self):
+        self.row("build", "juno")
+        with patch.dict(os.environ, {"ZED_GATE_OVERRIDE": "user said so"}), self.assertRaises(SystemExit) as e:
+            self.z.cmd_gate(["check", self.branch, str(self.repo)])
+        self.assertEqual(e.exception.code, 0)
+        self.assertIn("user said so", self.conn.execute("SELECT text FROM events WHERE kind='merge'").fetchone()[0])
+
+
+class MergeHookTests(unittest.TestCase):
+    """hooks/reference-transaction in a real throwaway repo; `bin/zed gate check` is a stub that exits with $GATE."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Path(tmp.name).resolve()
+        (self.repo / "bin").mkdir()
+        (self.repo / "bin" / "zed").write_text('#!/bin/sh\n[ "$1 $2" = "gate check" ] && exit "${GATE:-1}"\nexit 0\n')
+        (self.repo / "bin" / "zed").chmod(0o755)
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "t@t")
+        self.git("config", "user.name", "t")
+        self.git("config", "core.hooksPath", str(Path(__file__).resolve().parents[1] / "hooks"))
+        self.commit("a.txt", "init")
+        self.git("checkout", "-q", "-b", "profile/me")
+        self.git("checkout", "-q", "-b", "feature/x", "main")
+        self.commit("b.txt", "feature")
+        self.git("checkout", "-q", "profile/me")
+        self.commit("c.txt", "profile work")  # diverged, so merges make a merge commit
+
+    def git(self, *a, env=None):
+        return subprocess.run(["git", "-C", str(self.repo), *a], capture_output=True, text=True,
+                              env={**os.environ, **(env or {})})
+
+    def commit(self, name, msg):
+        (self.repo / name).write_text(msg)
+        self.git("add", ".")
+        self.git("commit", "-qm", msg)
+
+    def test_merge_into_a_profile_branch_is_refused_without_a_clean_gate(self):
+        r = self.git("merge", "--no-ff", "-m", "m", "feature/x")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("refused (needs clean review+qa", r.stderr)
+        self.assertIn("git reset --hard HEAD", r.stderr)
+        self.git("reset", "-q", "--hard", "HEAD")
+        self.assertFalse((self.repo / "b.txt").exists())
+
+    def test_merge_is_allowed_when_the_gate_passes(self):
+        r = self.git("merge", "--no-ff", "-m", "m", "feature/x", env={"GATE": "0"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((self.repo / "b.txt").exists())
+
+    def test_merging_main_into_the_profile_branch_is_not_gated(self):
+        self.git("checkout", "-q", "main")
+        self.commit("d.txt", "main work")
+        self.git("checkout", "-q", "profile/me")
+        self.assertEqual(self.git("merge", "--no-ff", "-m", "m", "main").returncode, 0)
+
+    def test_merge_into_main_is_gated_and_other_branches_are_not(self):
+        self.git("checkout", "-q", "main")
+        self.commit("e.txt", "main moves")
+        self.assertNotEqual(self.git("merge", "--no-ff", "-m", "m", "feature/x").returncode, 0)
+        self.git("reset", "-q", "--hard", "main")
+        self.git("checkout", "-q", "-b", "scratch", "profile/me")
+        self.assertEqual(self.git("merge", "--no-ff", "-m", "m", "feature/x").returncode, 0)
+
+    def test_merge_command_skips_the_second_check(self):
+        r = self.git("merge", "--no-ff", "-m", "m", "feature/x", env={"ZED_MERGE_GATE_DONE": "1"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+
+class HandoffEmployeeTests(GateCase):
+    def hand_off(self, *extra):
+        sid = self.row("build", None, status="running")
+        self.conn.execute("UPDATE sessions SET employee=NULL, hat=NULL, workspace_id='w', runtime='claude' WHERE id=?", (sid,))
+        self.conn.commit()
+        (self.profile / "briefs").mkdir(exist_ok=True)
+        with patch.object(self.z, "close_workspace"), patch.object(self.z, "record_credits"), \
+                patch.object(self.z, "record_spend"), patch.object(self.z, "cmd_spawn", return_value=9) as spawn:
+            self.z.cmd_handoff([f"S{sid}", "restart", f"brief={self.brief}", *extra])
+        return spawn.call_args.args[0]
+
+    def test_a_session_without_an_employee_goes_to_a_free_one(self):
+        args = self.hand_off()
+        self.assertTrue(any(a.startswith("employee=") for a in args))
+        self.assertIn("hat=build", args)
+        self.assertFalse(any(a.startswith("ephemeral=") for a in args))
+
+    def test_ephemeral_reason_is_passed_through_while_employees_are_free(self):
+        self.assertIn("ephemeral=no fit", self.hand_off("ephemeral=no fit"))
+
+    def test_no_free_employee_allows_an_ephemeral_handoff(self):
+        with patch.object(zedassign, "free_employees", return_value=[]):
+            args = self.hand_off()
+        self.assertIn("ephemeral=no employee is free", args)
+
+    def test_nothing_eligible_refuses_before_closing_anything(self):
+        with patch.object(zedassign, "suggest", return_value=[]), self.assertRaises(SystemExit):
+            self.hand_off()
+        self.assertIn("none is eligible", self.output.getvalue())
 
 
 class VerdictShaTests(GateCase):

@@ -1564,9 +1564,15 @@ def cmd_gate(args):
     if len(args) < 2 or args[0] != "check":
         die("gate check <sha|branch> [repo-dir]")
     sha = run(["git", "-C", args[2] if len(args) > 2 else ".", "rev-parse", "--verify", args[1] + "^{commit}"]).stdout.strip()
-    problems = zedgates.merge_problems(db(), sha)
+    conn = db()
+    problems = zedgates.merge_problems(conn, sha)
     for p in problems:
         print(f"merge gate: {p}", file=sys.stderr)
+    if problems and (override := os.environ.get("ZED_GATE_OVERRIDE", "").strip()):
+        log_event(conn, None, "merge", f"gate overridden for {sha[:10]} (ZED_GATE_OVERRIDE): {override}")
+        conn.commit()
+        print(f"merge gate: overridden ({override}); logged", file=sys.stderr)
+        problems = []
     sys.exit(1 if problems else 0)
 
 
@@ -1590,8 +1596,11 @@ def cmd_merge(args):
               f"{args[0]} {sha[:10]} into {run(['git', '-C', repo_dir, 'branch', '--show-current']).stdout.strip()}"
               + (f"; gate overridden: {override}" if problems else "; gate passed"))
     conn.commit()
-    os.environ["ZED_MERGE_GATE_DONE"] = "1"  # the git hook (hooks/pre-merge-commit) must not ask the gate a second time
-    r = run(["git", "-C", repo_dir, "merge", "--no-ff", args[0]], check=False)
+    os.environ["ZED_MERGE_GATE_DONE"] = "1"  # the git hook (hooks/reference-transaction) must not ask the gate a second time
+    try:
+        r = run(["git", "-C", repo_dir, "merge", "--no-ff", args[0]], check=False)
+    finally:
+        del os.environ["ZED_MERGE_GATE_DONE"]
     print((r.stdout + r.stderr).strip())
     sys.exit(r.returncode)
 
@@ -1828,6 +1837,21 @@ def cmd_handoff(args):
     brief = kv.get("brief") or s["brief"] or str(PROFILE_DIR / "briefs" / f"T{s['task_id']}-{s['repo']}.md")
     if not Path(brief).exists():
         die(f"brief not found: {brief}; pass brief=<file>")
+    who = []  # who runs the new session: the same employee, a free one, or an ephemeral worker only with a reason
+    if s["employee"]:
+        who = [f"{k}={s[k]}" for k in ("employee", "hat", "origin") if s[k]]
+    elif zedassign.free_employees(conn):
+        if kv.get("ephemeral", "").strip():
+            who = [f"ephemeral={kv['ephemeral']}"]
+        else:
+            hat = kv.get("hat", "build")
+            pick = [r["name"] for r in zedassign.suggest(conn, s["task_id"], hat, s["repo"], s["branch"]) if r["eligible"]]
+            if not pick:
+                die(f"refused: S{s['id']} has no employee and none is eligible for the {hat} hat: pass ephemeral=\"<why>\"")
+            who = [f"employee={pick[0]}", f"hat={hat}"]
+            print(f"zed: S{s['id']} had no employee; the new session goes to {pick[0]} ({hat} hat)", file=sys.stderr)
+    else:
+        who = [f"ephemeral={kv.get('ephemeral') or 'no employee is free'}"]
     restart = "restart" in args[1:]  # same runtime, fresh session (e.g. to apply a new model/effort ceiling)
     target = s["runtime"] if restart else choose_runtime(kv.get("runtime", "auto"), exclude=(s["runtime"],))
     if target == s["runtime"] and not restart:
@@ -1875,8 +1899,7 @@ def cmd_handoff(args):
     return cmd_spawn([str(s["task_id"]), f"repo={s['repo']}", f"base={s['base']}", f"branch={s['branch']}",
                       f"brief={brief}", f"runtime={target}", f"handoff={note}", f"name={s['agent']}",
                       *[f"{k}={kv[k]}" for k in ("model", "effort") if k in kv],
-                      *[f"{k}={s[k]}" for k in ("employee", "hat", "origin") if s[k]],
-                      *([] if s["employee"] else ["ephemeral=handoff of a session that had no employee"]),
+                      *who,
                       *([f"copilot_reason=handoff approved by the user ({s['runtime']} stopped)"] if target == "copilot" else [])],
                      worktree=Path(wt))
 

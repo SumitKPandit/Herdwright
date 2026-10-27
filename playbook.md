@@ -131,5 +131,6 @@ Facts about a particular user or their work never go here (they go to the profil
   the rest of its plan. Send routine answers/info only to `idle`/`done` sessions; prompt a working one
   only when you mean to change what it's doing. Enforced: `bin/zed prompt` refuses `working` without `--redirect`.
 - **Rules that live only in prose get broken.** Enforced in code (bin/lib/zedgates.py, tests/test_zed_gates.py): `spawn` needs `employee=` or
-  `ephemeral=<why>` while one is free; `runtime=copilot` needs Claude limited or `copilot_reason=`; `bin/zed merge`/`gate check` need a clean review and
-  qa by non-authors at the head sha; `start`/watcher flag core commits unsynced over an hour; `finish --lesson` needs `--idea` or `--no-idea WHY`.
+  `ephemeral=<why>` while one is free; `runtime=copilot` needs Claude limited or `copilot_reason=`; `bin/zed merge`/`gate check` and the git hook `hooks/reference-transaction` (merge commits on `main`/`profile/*`;
+  override `ZED_GATE_OVERRIDE=<reason>` or `merge --override`, logged) need a clean review and qa by non-authors at the head sha; `handoff` of a session
+  without an employee goes to a free one (or `ephemeral=<why>`); `start`/watcher flag core commits unsynced over an hour; `finish --lesson` needs `--idea` or `--no-idea WHY`.
