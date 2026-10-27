@@ -27,7 +27,6 @@ Usage
 Exit codes: 0 ok · 1 refused (the reason is printed) · 2 usage or unknown employee/hat
 """
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
