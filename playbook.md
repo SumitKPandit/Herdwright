@@ -106,3 +106,14 @@ Facts about a particular user or their work never go here (they go to the profil
   start producing within a fixed time; scripts for mechanical steps, model calls only for judgment;
   report throughput early and progress per unit. Check the first progress report, and step in if
   the worker is still changing its setup.
+- **Claude Stop hooks: `asyncRewake` can wake the session; exit 2 only on real events.** Verified with
+  real `claude -p` runs: a `Stop` hook with `asyncRewake` that exits 2 re-enters the model with its
+  stderr, then fires again at the next Stop, so a hook that always exits 2 loops forever. A hook that
+  exits 2 within about a second of the Stop was not seen to wake an interactive session (not fully
+  verified). **How:** exit 2 only for new events, make the hook single-flight (one watcher, an `flock`),
+  and keep un-acked events in a durable queue so a lost wake costs nothing.
+- **Never run an unbounded test or experiment.** **Why:** a hung run costs minutes of a worker's time and
+  nothing is read until it returns. **How:** run one test file at a time under a time limit
+  (`perl -e 'alarm 60; exec @ARGV' python3 -m unittest …`, since `timeout` is absent), use throwaway
+  `ZED_PROFILE_DIR`s, and stop your own background runs by PID or `TaskStop`, never `pkill -f` on a
+  pattern that other sessions' processes (watchers, hooks) also match.

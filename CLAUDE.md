@@ -79,7 +79,9 @@ whose session or herdr pane is gone is cleared automatically.
 
 - `bin/zed` — task DB + herdr driver (`bin/zed help`). DB `profile/db/zed.db`; `profile/STATUS.md`
   regenerated on every write. `runtime status|limited|ok`, `models show|import` and `handoff` cover
-  the runtimes (below).
+  the runtimes (below). Also: `start` (session-start digest), `status --brief`, `brief` (scaffold a
+  brief), `ack` (retire handled watcher events), `landed` (landed-work test before `close`), `quota`
+  (plan usage estimate), `coordinator` (my own model), `doctor` (context budget), `hook` (Claude Stop hooks).
 - `bin/bb` — Bitbucket PR helper for workers (token in the macOS Keychain; settings in
   `profile/config/settings.json`).
 - `bin/zed-core-sync` — copies core-only commits from the profile branch onto `main`.
@@ -109,9 +111,10 @@ whose session or herdr pane is gone is cleared automatically.
    from the profile's model policy (`bin/zed runtime status` shows both). Override them only when
    the user asks.
 3. **Watch**: keep exactly one watcher running while any session is running/waiting_user (how
-   depends on your runtime, below). Each event = a worker's turn ended or it's blocked; an event
-   may say `possible <runtime> usage limit: …` (see `switch-runtime`).
-4. **Check** (`check-workers`): read the worker's output; record and surface questions, results, blockers.
+   depends on your runtime, below). The watcher does the routine work in code (records ZED blocks and
+   status-file lines, nudges protocol lapses, marks usage limits, polls PRs) and wakes me only for what
+   needs judgment; each event has an `[E<id>]` that I `bin/zed ack` once handled.
+4. **Check** (`check-workers`): read the event text (it already has the questions, PR and QA); relay and decide.
    Compare progress against its plan file (`bin/zed status` shows steps done); a worker that is
    off-plan, redoing work or over its estimate gets redirected at once.
 5. **Relay** (`relay`): record the user's answer, prompt the worker with it verbatim.
@@ -128,9 +131,11 @@ or both) and in what order to use them; `bin/zed runtime status` shows which are
 Claude and Copilot have separate usage limits. When one is limited, new workers go to the next one
 and paused workers can be handed over with the user's OK (`switch-runtime` skill).
 
-- **Claude Code**: run `bin/zed watch --once` with Bash `run_in_background`. It exits on the first
-  event and wakes me; handle it and start it again. Unlike the Monitor tool, it never expires, so no
-  turns are spent re-arming it.
+- **Claude Code**: the project's `Stop` hooks (`.claude/settings.json`) re-arm the watcher after every
+  turn and wake me only on an event, so no turn is spent on re-arming; they act only in the session
+  holding the lock, and a turn can't end with tracked work and no watcher. If `bin/zed start` says the
+  watcher is not running (hooks missing), run `bin/zed watch --once` with Bash `run_in_background`.
+  One watcher at a time.
 - **Copilot CLI**: there is no Monitor. Run `bin/zed watch --once` with the bash tool as a
   **detached** background shell, then end your turn. When it exits (after the first event) you're
   notified ("Detached shell … completed"): read its output, handle the events, and start it again
