@@ -126,3 +126,7 @@ Facts about a particular user or their work never go here (they go to the profil
   in the handoff note. Workers that got the OK as a direct prompt posted fine. **How:** relay posting
   approvals as a direct prompt to the posting session, quoting the user's words verbatim plus the
   exact action (repo, PR/issue, text). Don't `handoff restart` a worker between the user's OK and its posting.
+- **Don't prompt a `working` session unless redirecting it.** T21's probe (docs/runtimes/*.md) showed
+  `herdr agent prompt` to a working agent is injected at the next tool boundary and the model may drop
+  the rest of its plan. Send routine answers/info only to `idle`/`done` sessions; prompt a working one
+  only when you mean to change what it's doing.
