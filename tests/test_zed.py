@@ -1,12 +1,16 @@
 import contextlib
+import http.client
 import io
 import json
 import os
 from pathlib import Path
+import signal
+import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from unittest.mock import patch
@@ -1031,6 +1035,493 @@ class ZedTests(unittest.TestCase):
         self.assertTrue(scratch.exists())
         conn.execute("UPDATE sessions SET scratch=? WHERE id=1", (str(self.root),))
         self.assertIsNone(self.z.own_scratch(conn.execute("SELECT * FROM sessions").fetchone()))
+
+    def feedback(self, conn, kind="comment", **fields):
+        """Insert an inbox row the way the dashboard would; returns its id."""
+        row = {"kind": kind, "task_id": 1, "text": "text", "created_at": "2026-10-26 12:00"} | fields
+        cur = conn.execute(f"INSERT INTO inbox({','.join(row)}) VALUES ({','.join('?' * len(row))})", list(row.values()))
+        conn.commit()
+        return cur.lastrowid
+
+    def test_inbox_table_is_added_to_old_databases(self):
+        self.z.DB_PATH.parent.mkdir()
+        conn = sqlite3.connect(self.z.DB_PATH)
+        conn.execute("CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT)")
+        conn.close()
+        conn = self.z.db()
+        self.addCleanup(conn.close)
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(inbox)")}
+        self.assertTrue({"kind", "task_id", "question_id", "rating", "title", "jira", "repo", "text", "status",
+                         "response", "created_at", "handled_at"} <= columns)
+
+    def test_inbox_items_are_described_on_one_line(self):
+        item = lambda **f: {"id": 3, "task_id": None, "question_id": None, "rating": None, "title": None,
+                            "jira": None, "repo": None, "text": None} | f
+        self.assertEqual(self.z.inbox_summary(item(kind="answer", question_id=12, task_id=14, text="Approve —\ngo ahead")),
+                         '#3 answer to Q12 (T14): "Approve — go ahead"')
+        self.assertEqual(self.z.inbox_summary(item(kind="comment", task_id=14, text="x" * 200), 20),
+                         f'#3 comment on T14: "{"x" * 19}…"')
+        self.assertEqual(self.z.inbox_summary(item(kind="rating", task_id=2, rating="good")), "#3 rating of T2: good")
+        self.assertEqual(self.z.inbox_summary(item(kind="rating", task_id=2, rating="not_good", text="thin PR")),
+                         '#3 rating of T2: not good: "thin PR"')
+        self.assertEqual(self.z.inbox_summary(item(kind="task", title="Add retries", jira="MENT-1", repo="api")),
+                         '#3 new task: "Add retries" (ticket MENT-1, repo api)')
+
+    def test_status_lists_only_feedback_still_to_handle(self):
+        conn = self.session()
+        first = self.feedback(conn, text="Please also cover dark mode")
+        self.feedback(conn, text="old", status="handled")
+        status = self.z.render_status(conn, live={})
+        self.assertIn("Dashboard feedback to handle", status)
+        self.assertIn(f'#{first} comment on T1: "Please also cover dark mode"', status)
+        self.assertNotIn('"old"', status)
+        conn.execute("UPDATE inbox SET status='handled'")
+        self.assertNotIn("Dashboard feedback", self.z.render_status(conn, live={}))
+
+    def test_answering_a_question_closes_the_dashboard_answers_to_it(self):
+        conn = self.session()
+        conn.execute("INSERT INTO questions(id,task_id,session_id,question,asked_at) VALUES (5,1,1,'Ship it?','now')")
+        mine = self.feedback(conn, "answer", question_id=5, text="yes")
+        other = self.feedback(conn, "answer", question_id=6, text="unrelated")
+        with patch.object(self.z, "db", return_value=conn), patch.object(self.z, "require_lock"):
+            self.z.cmd_q(["answer", "5", "yes,", "ship", "it"])
+        rows = {r["id"]: r for r in conn.execute("SELECT * FROM inbox")}
+        self.assertEqual((rows[mine]["status"], rows[mine]["response"]), ("handled", "Recorded as the answer to Q5"))
+        self.assertEqual(rows[other]["status"], "new")
+
+    def test_inbox_lists_new_items_in_full_and_handled_ones_on_request(self):
+        conn = self.session()
+        self.feedback(conn, text="line one\nline two")
+        self.feedback(conn, "task", task_id=None, title="Add retries", jira="MENT-1", text="Details")
+        done = self.feedback(conn, text="settled")
+        conn.execute("UPDATE inbox SET status='handled', handled_at='2026-10-26 13:00', response='Passed to S1' WHERE id=?", (done,))
+        conn.commit()
+        with patch.object(self.z, "db", return_value=conn):
+            self.z.cmd_inbox([])
+        listing = self.output.getvalue()
+        self.assertIn("#1 [new] comment on T1 · 2026-10-26 12:00\n    line one\n    line two", listing)
+        self.assertIn("#2 [new] new task · 2026-10-26 12:00\n    title: Add retries\n    ticket: MENT-1\n    Details", listing)
+        self.assertNotIn("settled", listing)
+        self.output.truncate(0)
+        with patch.object(self.z, "db", return_value=conn):
+            self.z.cmd_inbox(["list", "--all"])
+        self.assertIn("→ handled 2026-10-26 13:00: Passed to S1", self.output.getvalue())
+
+    def test_inbox_done_records_the_outcome_once_and_needs_the_lock(self):
+        conn = self.session()
+        item = self.feedback(conn, "rating", rating="not_good", text="PR description was thin")
+        with patch.object(self.z, "db", return_value=conn):
+            with self.assertRaises(SystemExit):
+                self.z.cmd_inbox(["done", str(item)])
+        self.assertEqual(conn.execute("SELECT status FROM inbox").fetchone()[0], "new")
+        with patch.object(self.z, "db", return_value=conn), patch.object(self.z, "require_lock"):
+            self.z.cmd_inbox(["done", str(item), "Recorded", "in", "lessons"])
+            self.z.cmd_inbox(["done", str(item), "again"])
+            for bad in (["done"], ["done", "x"], ["done", "99"], ["undo", "1"]):
+                with self.assertRaises(SystemExit):
+                    self.z.cmd_inbox(bad)
+        row = conn.execute("SELECT * FROM inbox").fetchone()
+        self.assertEqual((row["status"], row["response"]), ("handled", "Recorded in lessons"))
+        self.assertTrue(row["handled_at"])
+        events = conn.execute("SELECT kind, text FROM events WHERE task_id=1").fetchall()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["kind"], "feedback")
+        self.assertIn('rating of T1: not good: "PR description was thin" → Recorded in lessons', events[0]["text"])
+        self.assertIn("already handled", self.output.getvalue())
+
+    def watch_once(self, *args):
+        with patch.object(self.z, "require_lock"), patch.object(self.z, "holds_lock", return_value=True), \
+                patch.object(self.z, "live_agents", return_value={}):
+            self.z.cmd_watch(["--once", *args])
+
+    def test_watch_reports_each_inbox_item_once(self):
+        conn = self.z.db()
+        self.addCleanup(conn.close)
+        conn.execute("INSERT INTO tasks(title,created_at,updated_at) VALUES ('QA','now','now')")
+        self.feedback(conn, text="Please also cover dark mode")
+        self.feedback(conn, text="settled", status="handled")
+        self.watch_once("0.01")
+        self.assertIn('INBOX #1 comment on T1: "Please also cover dark mode" — handle it with the inbox skill',
+                      self.output.getvalue())
+        self.assertNotIn("settled", self.output.getvalue())
+        with patch.object(self.z, "require_lock"):
+            self.z.cmd_ack(["--all"])
+        self.output.truncate(0)
+        self.output.seek(0)
+        with patch.object(self.z.time, "sleep", side_effect=InterruptedError):  # re-armed: nothing new, no repeat
+            with self.assertRaises(InterruptedError):
+                self.watch_once("0.01")
+        self.assertEqual(self.output.getvalue(), "")
+        self.feedback(conn, text="second")
+        self.watch_once()
+        self.assertIn("INBOX #3 comment on T1", self.output.getvalue())
+        self.assertNotIn("INBOX #1 ", self.output.getvalue())
+
+    def test_a_new_watch_reports_items_nobody_handled_yet(self):
+        conn = self.z.db()
+        self.addCleanup(conn.close)
+        self.feedback(conn, text="still waiting")
+        with patch.object(self.z, "require_lock"), patch.object(self.z, "holds_lock", return_value=True), \
+                patch.object(self.z, "live_agents", return_value={}), \
+                patch.object(self.z.time, "sleep", side_effect=InterruptedError):
+            with self.assertRaises(InterruptedError):
+                self.z.cmd_watch(["0.01"])
+        self.assertIn('INBOX #1 comment on T1: "still waiting"', self.output.getvalue())
+
+    def test_watch_state_written_before_the_inbox_existed_still_loads(self):
+        self.session()
+        self.z.WATCH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.z.WATCH_STATE_PATH.write_text(json.dumps({"1": {"state": "idle", "sequence": 10}}))
+        agent = {"agent_status": "idle", "state_change_seq": 10}
+        with patch.object(self.z, "require_lock"), patch.object(self.z, "holds_lock", return_value=True), \
+                patch.object(self.z, "live_agents", return_value={"qa:p1": agent}), \
+                patch.object(self.z.time, "sleep", side_effect=InterruptedError):
+            with self.assertRaises(InterruptedError):
+                self.z.cmd_watch(["--once", "0.01"])
+        self.assertEqual(self.output.getvalue(), "")  # same snapshot as before: not a first run, nothing new
+        self.assertEqual(json.loads(self.z.WATCH_STATE_PATH.with_name("watch-inbox.json").read_text()), [])
+
+
+    def task(self, conn, status="active", title="QA"):
+        cur = conn.execute("INSERT INTO tasks(title,status,created_at,updated_at) VALUES (?,?,'2026-10-26 12:00','2026-10-26 12:00')",
+                           (title, status))
+        conn.commit()
+        return cur.lastrowid
+
+    def question(self, conn, task_id=1, status="open"):
+        cur = conn.execute("INSERT INTO questions(task_id,question,status,asked_at) VALUES (?,'Ship it?',?,'2026-10-26 12:00')",
+                           (task_id, status))
+        conn.commit()
+        return cur.lastrowid
+
+    def projects(self, *repos):
+        self.z.PROJECTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.z.PROJECTS_PATH.write_text(json.dumps({"repos": {r: {} for r in repos}}))
+
+    def inbox(self, conn):
+        return [dict(r) for r in conn.execute("SELECT * FROM inbox ORDER BY id")]
+
+    def test_dashboard_feedback_is_stored_in_the_inbox(self):
+        conn = self.z.db()
+        self.addCleanup(conn.close)
+        self.projects("api", "web")
+        task, delivered = self.task(conn), self.task(conn, "pr_open")
+        question = self.question(conn, task)
+        for data in [
+            {"kind": "answer", "question_id": question, "text": "  Approve —\r\ngo ahead  "},
+            {"kind": "comment", "task_id": task, "text": "Please also cover dark mode"},
+            {"kind": "rating", "task_id": delivered, "rating": "good"},
+            {"kind": "rating", "task_id": delivered, "rating": "not_good", "text": "The PR description was thin"},
+            {"kind": "task", "title": " Add retries ", "jira": "MENT-1", "repo": "api", "text": "To the sync job"},
+            {"kind": "task", "title": "Just a title", "jira": "", "repo": "", "text": ""},
+        ]:
+            self.z.add_feedback(conn, data)
+        rows = self.inbox(conn)
+        self.assertEqual([r["kind"] for r in rows], ["answer", "comment", "rating", "rating", "task", "task"])
+        self.assertEqual((rows[0]["question_id"], rows[0]["task_id"], rows[0]["text"]), (question, task, "Approve —\ngo ahead"))
+        self.assertEqual((rows[1]["task_id"], rows[1]["text"]), (task, "Please also cover dark mode"))
+        self.assertEqual((rows[2]["rating"], rows[2]["text"]), ("good", None))
+        self.assertEqual((rows[3]["rating"], rows[3]["text"]), ("not_good", "The PR description was thin"))
+        self.assertEqual((rows[4]["title"], rows[4]["jira"], rows[4]["repo"], rows[4]["text"]),
+                         ("Add retries", "MENT-1", "api", "To the sync job"))
+        self.assertEqual((rows[5]["jira"], rows[5]["repo"], rows[5]["text"]), (None, None, None))
+        self.assertTrue(all(r["status"] == "new" and r["created_at"] for r in rows))
+
+    def test_dashboard_feedback_is_validated(self):
+        conn = self.z.db()
+        self.addCleanup(conn.close)
+        self.projects("api")
+        active, delivered = self.task(conn), self.task(conn, "done")
+        open_q, answered_q = self.question(conn, active), self.question(conn, active, "answered")
+        big = "x" * (self.z.FEEDBACK_TEXT_MAX + 1)
+        for message, data in [
+            ("unknown kind", {"kind": "delete"}),
+            ("unknown kind", {}),
+            ("The answer is required", {"kind": "answer", "question_id": open_q, "text": "  "}),
+            ("already been answered", {"kind": "answer", "question_id": answered_q, "text": "yes"}),
+            ("there is no question 99", {"kind": "answer", "question_id": 99, "text": "yes"}),
+            ("there is no question '1'", {"kind": "answer", "question_id": str(open_q), "text": "yes"}),
+            ("there is no task True", {"kind": "comment", "task_id": True, "text": "yes"}),
+            (f"there is no task {10 ** 20}", {"kind": "comment", "task_id": 10 ** 20, "text": "yes"}),
+            ("there is no task None", {"kind": "comment", "text": "yes"}),
+            ("The comment must be text", {"kind": "comment", "task_id": active, "text": ["a"]}),
+            ("The comment is required", {"kind": "comment", "task_id": active}),
+            ("too long", {"kind": "comment", "task_id": active, "text": big}),
+            ("only delivered work", {"kind": "rating", "task_id": active, "rating": "good"}),
+            ("must be good or not_good", {"kind": "rating", "task_id": delivered, "rating": "great"}),
+            ("must be good or not_good", {"kind": "rating", "task_id": delivered}),
+            ("The reason is required", {"kind": "rating", "task_id": delivered, "rating": "not_good", "text": " "}),
+            ("The title is required", {"kind": "task", "title": " ", "text": "details"}),
+            ("The title is too long", {"kind": "task", "title": "t" * (self.z.FEEDBACK_TITLE_MAX + 1)}),
+            ("unknown repo 'other'", {"kind": "task", "title": "T", "repo": "other"}),
+            ("The ticket ID is too long", {"kind": "task", "title": "T", "jira": "J" * 41}),
+        ]:
+            with self.subTest(data=data):
+                with self.assertRaisesRegex(self.z.FeedbackError, message):
+                    self.z.add_feedback(conn, data)
+        self.assertEqual(self.inbox(conn), [])
+
+    def test_repos_for_the_new_task_form_tolerate_a_missing_or_broken_projects_file(self):
+        self.assertEqual(self.z.dashboard_repos(), [])
+        self.projects("web", "api")
+        self.assertEqual(self.z.dashboard_repos(), ["api", "web"])
+        self.z.PROJECTS_PATH.write_text("[1, 2]")
+        self.assertEqual(self.z.dashboard_repos(), [])
+        self.z.PROJECTS_PATH.write_text("{broken")
+        self.assertEqual(self.z.dashboard_repos(), [])
+
+    def test_herdr_agents_tell_unreachable_from_none_running(self):
+        listing = lambda agents: subprocess.CompletedProcess([], 0, json.dumps({"result": {"agents": agents}}), "")
+        with patch.object(self.z, "run", return_value=listing([{"pane_id": "w1:p1", "agent_status": "idle"}])):
+            self.assertEqual(self.z.herdr_agents(), {"w1:p1": {"pane_id": "w1:p1", "agent_status": "idle"}})
+        with patch.object(self.z, "run", return_value=listing([])):
+            self.assertEqual(self.z.herdr_agents(), {})
+        for unreachable in (subprocess.CompletedProcess([], 1, "", "server_unavailable"),
+                            subprocess.CompletedProcess([], 0, "not json", ""),
+                            subprocess.CompletedProcess([], 0, "{}", ""), FileNotFoundError("herdr")):
+            with self.subTest(unreachable=unreachable):
+                effect = {"side_effect": unreachable} if isinstance(unreachable, Exception) else {"return_value": unreachable}
+                with patch.object(self.z, "run", **effect):
+                    self.assertIsNone(self.z.herdr_agents())
+                    self.assertEqual(self.z.live_agents(), {})
+
+    def test_dashboard_state_groups_tasks_and_shows_live_workers(self):
+        conn = self.z.db()
+        self.addCleanup(conn.close)
+        self.projects("api")
+        working, parked, delivered = self.task(conn, "active", "Working"), self.task(conn, "parked", "Parked"), self.task(conn, "pr_open", "Delivered")
+        stale = self.task(conn, "waiting_user", "Stale")
+        for task, pane, status, pr in [(working, "w1:p1", "running", None), (stale, "w9:p1", "waiting_user", None),
+                                       (delivered, "w2:p1", "closed", "https://example.test/pr/1")]:
+            conn.execute("INSERT INTO sessions(task_id,repo,base,branch,worktree,agent,pane_id,status,runtime,model,effort,pr_url,"
+                         "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'now','now')",
+                         (task, "api", "main", f"feature/t{task}", "/tmp/wt", f"t{task}-api", pane, status, "claude", "opus", "high", pr))
+        conn.execute("INSERT INTO events(task_id,ts,kind,text) VALUES (?, '2026-10-26 12:01', 'milestone', 'Half way')", (working,))
+        question = self.question(conn, working)
+        conn.execute("INSERT INTO inbox(kind,task_id,question_id,text,created_at) VALUES ('answer',?,?,'yes','now')", (working, question))
+        conn.commit()
+        agents = {"w1:p1": {"agent_status": "blocked"}, "w2:p1": {"agent_status": "idle"}}
+        with patch.object(self.z, "dashboard_zed", return_value={"active": True}):
+            state = self.z.dashboard_state(conn, agents)
+        json.dumps(state)  # everything the page gets must be plain JSON
+        by_title = {g["title"]: g for g in state["groups"]}
+        self.assertEqual(list(by_title), ["In progress", "PR open", "Not started / parked", "Recently finished"])
+        self.assertEqual([t["title"] for t in by_title["In progress"]["tasks"]], ["Working", "Stale"])
+        self.assertEqual([t["title"] for t in by_title["Not started / parked"]["tasks"]], ["Parked"])
+        live = {s["id"]: s["live"] for g in state["groups"] for t in g["tasks"] for s in t["sessions"]}
+        self.assertEqual(live, {1: "blocked", 2: "gone", 3: None})  # a closed session has no live state
+        task = by_title["In progress"]["tasks"][0]
+        self.assertEqual((task["sessions"][0]["runtime"], task["sessions"][0]["model"], task["sessions"][0]["effort"]),
+                         ("claude", "opus", "high"))
+        self.assertEqual([e["text"] for e in task["events"]], ["Half way"])
+        self.assertEqual(by_title["PR open"]["tasks"][0]["sessions"][0]["pr_url"], "https://example.test/pr/1")
+        self.assertTrue(by_title["PR open"]["tasks"][0]["can_rate"])
+        self.assertFalse(task["can_rate"])
+        self.assertEqual([(q["id"], q["task_title"], q["sent"]["text"]) for q in state["questions"]], [(question, "Working", "yes")])
+        self.assertEqual((state["repos"], state["herdr"], state["pending_feedback"]), (["api"], True, 1))
+        unreachable = self.z.dashboard_state(conn, None)
+        self.assertFalse(unreachable["herdr"])
+        self.assertEqual({s["live"] for g in unreachable["groups"] for t in g["tasks"] for s in t["sessions"]}, {"unavailable", None})
+
+    def test_dashboard_state_limits_finished_tasks_and_reports_ratings(self):
+        conn = self.z.db()
+        self.addCleanup(conn.close)
+        for n in range(25):
+            self.task(conn, "done", f"Done {n}")
+        conn.execute("INSERT INTO inbox(kind,task_id,rating,text,created_at) VALUES ('rating',25,'not_good','first','now')")
+        conn.execute("INSERT INTO inbox(kind,task_id,rating,text,created_at) VALUES ('rating',25,'good','changed my mind','now')")
+        conn.execute("UPDATE tasks SET updated_at='2026-10-27 09:00' WHERE id=25")
+        conn.commit()
+        finished = self.z.dashboard_state(conn, {})["groups"][-1]
+        self.assertEqual((len(finished["tasks"]), finished["total"]), (20, 25))
+        self.assertEqual(finished["tasks"][0]["title"], "Done 24")  # most recently updated first
+        self.assertEqual(finished["tasks"][0]["rating"]["text"], "changed my mind")
+        self.assertEqual(len(finished["tasks"][0]["feedback"]), 2)
+
+    def test_dashboard_says_whether_a_zed_session_is_listening(self):
+        self.assertEqual(self.z.dashboard_zed(), {"active": False, "runtime": None, "since": None, "limited": {}})
+        lock = {"pid": 1, "runtime": "copilot", "acquired_at": "2026-10-26 08:00"}
+        self.z.RUNTIME_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.z.RUNTIME_STATE_PATH.write_text(json.dumps({"claude": {"until": "3pm", "note": "limit"}, "junk": 3}))
+        with patch.object(self.z, "read_lock", return_value=lock), patch.object(self.z, "holder_alive", return_value=True):
+            zed = self.z.dashboard_zed()
+        self.assertEqual((zed["active"], zed["runtime"], zed["since"]), (True, "copilot", "2026-10-26 08:00"))
+        self.assertEqual(zed["limited"], {"claude": {"until": "3pm", "note": "limit"}})
+        with patch.object(self.z, "read_lock", return_value=lock), patch.object(self.z, "holder_alive", return_value=False):
+            self.assertFalse(self.z.dashboard_zed()["active"])  # the holder is gone: a stale lock
+        self.z.RUNTIME_STATE_PATH.write_text("{broken")
+        self.assertEqual(self.z.dashboard_zed()["limited"], {})
+
+    def serve(self, token="secret"):
+        server = self.z.dashboard_server(0, token)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
+
+    def fetch(self, server, method, path, body=None, headers=None, token="secret"):
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+        conn.request(method, path, body=body, headers=({"X-Zed-Token": token} if token else {}) | (headers or {}))
+        res = conn.getresponse()
+        data = res.read()
+        conn.close()
+        return res, data
+
+    def post(self, server, payload, **kw):
+        res, data = self.fetch(server, "POST", "/api/feedback", json.dumps(payload), {"Content-Type": "application/json"}, **kw)
+        return res.status, (json.loads(data) if res.getheader("Content-Type", "").startswith("application/json") else data.decode())
+
+    def test_dashboard_listens_on_localhost_only(self):
+        server = self.serve()
+        self.assertEqual(server.server_address[0], "127.0.0.1")
+
+    def test_dashboard_needs_the_token_and_a_local_host_header(self):
+        server = self.serve()
+        port = server.server_address[1]
+        for path, token in [("/", None), ("/", "wrong"), ("/api/state", None), ("/api/state", "wrong"), ("/nothing", None)]:
+            with self.subTest(path=path, token=token):
+                self.assertEqual(self.fetch(server, "GET", path, token=token)[0].status, 403)
+        for host in ("evil.example", f"evil.example:{port}", f"127.0.0.1.evil.example:{port}", "127.0.0.1"):
+            with self.subTest(host=host):
+                self.assertEqual(self.fetch(server, "GET", "/api/state", headers={"Host": host})[0].status, 403)
+                self.assertEqual(self.fetch(server, "GET", "/?token=secret", headers={"Host": host}, token=None)[0].status, 403)
+        for host in (f"127.0.0.1:{port}", f"localhost:{port}"):
+            self.assertEqual(self.fetch(server, "GET", "/api/state", headers={"Host": host})[0].status, 200)
+        self.assertEqual(self.fetch(server, "GET", "/?token=secret", token=None)[0].status, 200)  # how the page is opened
+        self.assertEqual(self.post(server, {"kind": "comment", "task_id": 1, "text": "x"}, token=None)[0], 403)
+        self.assertEqual(self.post(server, {"kind": "comment", "task_id": 1, "text": "x"}, token="wrong")[0], 403)
+        self.assertEqual(self.fetch(server, "GET", "/api/state", token="tökén")[0].status, 403)
+
+    def test_dashboard_serves_the_page_with_a_strict_policy(self):
+        server = self.serve()
+        res, body = self.fetch(server, "GET", "/?token=secret", token=None)
+        csp = res.getheader("Content-Security-Policy")
+        nonce = csp.split("script-src 'nonce-")[1].split("'")[0]
+        self.assertEqual(len(nonce), 24)
+        self.assertIn(f"style-src 'nonce-{nonce}'", csp)
+        self.assertIn("connect-src 'self'", csp)
+        self.assertIn("default-src 'none'", csp)
+        page = body.decode()
+        self.assertIn(f'nonce="{nonce}"', page)
+        self.assertNotIn("{{NONCE}}", page)
+        self.assertEqual(res.getheader("Content-Type"), "text/html; charset=utf-8")
+        for header, value in [("Cache-Control", "no-store"), ("X-Frame-Options", "DENY"), ("Referrer-Policy", "no-referrer"),
+                              ("X-Content-Type-Options", "nosniff")]:
+            self.assertEqual(res.getheader(header), value)
+        again = self.fetch(server, "GET", "/?token=secret", token=None)[0].getheader("Content-Security-Policy")
+        self.assertNotEqual(again, csp)  # a fresh nonce every time
+
+    def test_dashboard_api_returns_the_state(self):
+        conn = self.z.db()
+        self.addCleanup(conn.close)
+        self.task(conn, "active", "Working")
+        server = self.serve()
+        with patch.object(self.z, "herdr_agents", return_value={}):
+            res, body = self.fetch(server, "GET", "/api/state")
+        self.assertEqual((res.status, res.getheader("Content-Type")), (200, "application/json; charset=utf-8"))
+        self.assertEqual(json.loads(body)["groups"][0]["tasks"][0]["title"], "Working")
+
+    def test_dashboard_feedback_endpoint_writes_the_inbox_and_nothing_else(self):
+        conn = self.z.db()
+        self.addCleanup(conn.close)
+        self.projects("api")
+        task = self.task(conn, "active")
+        question = self.question(conn, task)
+        before = {t: [tuple(r) for r in conn.execute(f"SELECT * FROM {t}")] for t in ("tasks", "sessions", "questions", "events")}
+        server = self.serve()
+        status, body = self.post(server, {"kind": "answer", "question_id": question, "text": "Approve"})
+        self.assertEqual((status, body), (200, {"id": 1}))
+        self.assertEqual(self.post(server, {"kind": "comment", "task_id": task, "text": "Hello"}), (200, {"id": 2}))
+        self.assertEqual(self.post(server, {"kind": "task", "title": "New", "repo": "api"}), (200, {"id": 3}))
+        status, body = self.post(server, {"kind": "comment", "task_id": 99, "text": "Hello"})
+        self.assertEqual((status, body), (400, {"error": "there is no task 99"}))
+        self.assertEqual([r["kind"] for r in self.inbox(conn)], ["answer", "comment", "task"])
+        after = {t: [tuple(r) for r in conn.execute(f"SELECT * FROM {t}")] for t in before}
+        self.assertEqual(after, before)  # the question is still open: only Zed answers it, via `q answer`
+
+    def test_dashboard_feedback_endpoint_rejects_bad_requests(self):
+        conn = self.z.db()
+        self.addCleanup(conn.close)
+        self.task(conn)
+        server = self.serve()
+        json_type = {"Content-Type": "application/json"}
+        for label, body, headers, expected in [
+            ("form post", "kind=comment&task_id=1&text=x", {"Content-Type": "application/x-www-form-urlencoded"}, 415),
+            ("no content type", '{"kind": "comment"}', {}, 415),
+            ("not json", "{broken", json_type, 400),
+            ("a list", "[1]", json_type, 400),
+            ("a bare string", '"hi"', json_type, 400),
+        ]:
+            with self.subTest(label):
+                self.assertEqual(self.fetch(server, "POST", "/api/feedback", body, headers)[0].status, expected)
+        # Declared sizes are checked before anything is read.
+        for length, expected in [("0", 413), ("-5", 413), (str(self.z.DASHBOARD_BODY_MAX + 1), 413), ("lots", 411)]:
+            with self.subTest(length=length):
+                res, _ = self.fetch(server, "POST", "/api/feedback", None, json_type | {"Content-Length": length})
+                self.assertEqual(res.status, expected)
+        self.assertEqual(self.fetch(server, "POST", "/api/state", "{}", json_type)[0].status, 404)
+        self.assertEqual(self.fetch(server, "GET", "/api/feedback")[0].status, 404)
+        self.assertEqual(self.fetch(server, "PUT", "/api/feedback", "{}", json_type)[0].status, 501)
+        res, _ = self.fetch(server, "OPTIONS", "/api/feedback", headers={"Origin": "https://evil.example"})
+        self.assertEqual((res.status, res.getheader("Access-Control-Allow-Origin")), (501, None))  # no CORS: other sites can't call it
+        self.assertEqual(self.inbox(conn), [])
+
+    def test_dashboard_reports_a_busy_database_and_unexpected_errors(self):
+        server = self.serve()
+        with patch.object(self.z, "dashboard_state", side_effect=sqlite3.OperationalError("database is locked")):
+            res, body = self.fetch(server, "GET", "/api/state")
+        self.assertEqual(res.status, 503)
+        self.assertIn("database is locked", json.loads(body)["error"])
+        with patch.object(self.z, "dashboard_state", side_effect=RuntimeError("boom")), \
+                patch("traceback.print_exc"):
+            res, body = self.fetch(server, "GET", "/api/state")
+        self.assertEqual((res.status, json.loads(body)["error"]), (500, "RuntimeError: boom"))
+
+    def dashboard_process(self, *args):
+        env = {**os.environ, "ZED_PROFILE_DIR": str(self.root)}
+        proc = subprocess.Popen([sys.executable, "-B", str(HOME / "bin/zed"), "dashboard", *args], env=env, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        self.addCleanup(proc.stdout.close)
+        self.addCleanup(proc.stderr.close)
+        return proc
+
+    def test_dashboard_command_serves_records_itself_and_cleans_up(self):
+        proc = self.dashboard_process("--port", "0")
+        url = proc.stdout.readline().split("Zed dashboard: ")[1].strip()
+        self.assertRegex(url, r"^http://127\.0\.0\.1:\d+/\?token=[0-9a-f]{36}$")
+        state = json.loads(self.z.DASHBOARD_STATE_PATH.read_text())
+        self.assertEqual((state["url"], state["pid"]), (url, proc.pid))
+        conn = http.client.HTTPConnection("127.0.0.1", state["port"], timeout=5)
+        conn.request("GET", url.split(str(state["port"]))[1])
+        self.assertEqual(conn.getresponse().status, 200)
+        conn.close()
+        # Started again, it points at the running one instead of starting a second.
+        again = self.dashboard_process("--port", "0")
+        self.assertEqual(again.wait(timeout=10), 0)
+        self.assertIn(f"already running (pid {proc.pid}): {url}", again.stdout.read())
+        proc.send_signal(signal.SIGTERM)
+        self.assertEqual(proc.wait(timeout=10), 0)
+        self.assertFalse(self.z.DASHBOARD_STATE_PATH.exists())
+
+    def test_dashboard_command_ignores_a_stale_record_and_reports_a_busy_port(self):
+        self.z.DASHBOARD_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        for stale in ("{broken", json.dumps({"url": "u", "pid": 2 ** 22 + 12345, "port": 1}), "[]", "null"):
+            with self.subTest(stale=stale):
+                self.z.DASHBOARD_STATE_PATH.write_text(stale)
+                self.assertIsNone(self.z.running_dashboard())
+        busy = socket.socket()
+        self.addCleanup(busy.close)
+        busy.bind(("127.0.0.1", 0))
+        busy.listen()
+        proc = self.dashboard_process("--port", str(busy.getsockname()[1]))
+        self.assertEqual(proc.wait(timeout=10), 1)
+        self.assertIn("can't listen on 127.0.0.1", proc.stderr.read())
+        for bad in ("70000", "-1", "abc"):
+            self.assertEqual(self.dashboard_process("--port", bad).wait(timeout=10), 2)
 
 
 if __name__ == "__main__":

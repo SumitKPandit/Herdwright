@@ -14,13 +14,19 @@ Concepts
            <profile>/config/runtimes.json
   question something a worker (or Zed) needs the user to decide
   event    timestamped log line attached to a task (or global if no task)
+  inbox    feedback the user left on the dashboard (an answer, a comment, a rating, a new-task
+           request), waiting for Zed to act on it
 
 One active Zed per profile: the agent session (either runtime) that holds the profile's lock
 (<profile>/.cache/zed.lock) is Zed. Other sessions get read-only access (status, list, show);
 mutating commands and `watch` refuse. See `zed lock`.
 
+`zed dashboard` serves a local web page (127.0.0.1 only) to see everything and leave feedback. It
+holds no lock and changes nothing but the inbox; Zed, the lock holder, acts on the inbox.
+
 Run `zed help` for commands.
 """
+import argparse
 import atexit
 import contextlib
 import fcntl
@@ -29,13 +35,17 @@ import math
 import os
 import re
 import shutil
+import signal
+import socket
 import sqlite3
 import statistics
 import subprocess
 import sys
 import time
+import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 import zedassign  # noqa: E402
@@ -63,6 +73,8 @@ WATCHER_PID_PATH = PROFILE_DIR / ".cache" / "watch.pid"
 WATCHER_LOCK_PATH = PROFILE_DIR / ".cache" / "watch.lock"
 ARM_STAMP_PATH = PROFILE_DIR / ".cache" / "hook-arm.stamp"  # touched by the Stop hook's arm step on every firing
 COPILOT_INSTRUCTIONS_DIR = PROFILE_DIR / ".cache" / "copilot-instructions"
+DASHBOARD_PAGE = ZED_HOME / "templates" / "dashboard.html"
+DASHBOARD_STATE_PATH = PROFILE_DIR / ".cache" / "dashboard.json"
 
 # What Zed needs to know about each agent CLI it can run on. Everything user-specific (which ones
 # they have, preference order, model policy, permission mode) is in <profile>/config/runtimes.json.
@@ -96,6 +108,21 @@ TASK_STATES = ["intake", "active", "waiting_user", "in_review", "pr_open", "park
 SESSION_STATES = ["running", "waiting_user", "finished", "closed"]
 ASSIGN_ORIGINS = ["zed", "user", "schedule"]
 OPEN_TASK_STATES = ["intake", "active", "waiting_user", "in_review", "pr_open", "parked"]
+# How STATUS.md and the dashboard group the open tasks; finished ones (done, cancelled) follow separately.
+TASK_GROUPS = [("In progress", ["active", "waiting_user", "in_review"]),
+               ("PR open", ["pr_open"]),
+               ("Not started / parked", ["intake", "parked"])]
+INBOX_KINDS = ["answer", "comment", "rating", "task"]
+RATINGS = ["good", "not_good"]
+RATABLE_STATES = ["pr_open", "done"]  # the worker's output has been delivered, so it can be judged
+FEEDBACK_TEXT_MAX = 10000  # characters, per field of a piece of dashboard feedback
+FEEDBACK_TITLE_MAX = 200
+DASHBOARD_PORT = 8765
+DASHBOARD_BODY_MAX = 64 * 1024  # bytes of JSON the dashboard accepts in one request
+# The page may run only its own inline script and style (matched by a per-response nonce), and talk only to
+# its own server: whatever it shows can't be sent anywhere else.
+DASHBOARD_CSP = ("default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; connect-src 'self'; "
+                 "img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -148,6 +175,21 @@ CREATE TABLE IF NOT EXISTS events (
   ts TEXT NOT NULL,
   kind TEXT NOT NULL,
   text TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS inbox (  -- feedback from the dashboard, the only table it writes
+  id INTEGER PRIMARY KEY,
+  kind TEXT NOT NULL,  -- answer | comment | rating | task (INBOX_KINDS)
+  task_id INTEGER REFERENCES tasks(id),
+  question_id INTEGER REFERENCES questions(id),  -- answer: the question it answers
+  rating TEXT,  -- rating: good | not_good
+  title TEXT,  -- task: what the new task is called
+  jira TEXT,  -- task: the ticket id, if the user gave one
+  repo TEXT,  -- task: the repo (a key of projects.json), if the user picked one
+  text TEXT,  -- the answer, the comment, the reason for a rating, or the new task's details
+  status TEXT NOT NULL DEFAULT 'new',  -- new | handled
+  response TEXT,  -- what Zed did with it, shown back to the user on the dashboard
+  created_at TEXT NOT NULL,
+  handled_at TEXT
 );
 """
 
@@ -669,16 +711,61 @@ def resolve_session(conn, ref):
     return s
 
 
+# ---------------------------------------------------------------- inbox
+
+def one_line(text, width):
+    text = " ".join((text or "").split())
+    return text if len(text) <= width else text[:width - 1].rstrip() + "…"
+
+
+def inbox_what(item):
+    """What an inbox item is, in a few words: 'comment on T14'."""
+    if item["kind"] == "answer":
+        return f"answer to Q{item['question_id']}" + (f" (T{item['task_id']})" if item["task_id"] else "")
+    if item["kind"] == "comment":
+        return f"comment on T{item['task_id']}"
+    if item["kind"] == "rating":
+        return f"rating of T{item['task_id']}: {item['rating'].replace('_', ' ')}"
+    return "new task"
+
+
+def inbox_summary(item, width=100):
+    """One line for STATUS.md and watcher events: '#7 comment on T14: "Please also …"'."""
+    is_task = item["kind"] == "task"
+    detail = one_line(item["title"] if is_task else item["text"], width)
+    line = f"#{item['id']} {inbox_what(item)}" + (f': "{detail}"' if detail else "")
+    extras = [f"{label} {item[key]}" for label, key in (("ticket", "jira"), ("repo", "repo")) if is_task and item[key]]
+    return line + (f" ({', '.join(extras)})" if extras else "")
+
+
+def inbox_detail(item):
+    """An inbox item in full, for `zed inbox`."""
+    out = [f"#{item['id']} [{item['status']}] {inbox_what(item)} · {item['created_at']}"]
+    if item["kind"] == "task":
+        out.append(f"    title: {item['title']}")
+        meta = [f"{label}: {item[key]}" for label, key in (("ticket", "jira"), ("repo", "repo")) if item[key]]
+        if meta:
+            out.append("    " + " · ".join(meta))
+    out.extend("    " + line for line in (item["text"] or "").splitlines())
+    if item["status"] == "handled":
+        out.append(f"    → handled {item['handled_at']}" + (f": {item['response']}" if item["response"] else ""))
+    return "\n".join(out)
+
+
 # ---------------------------------------------------------------- status
 
-def live_agents():
-    r = run(["herdr", "agent", "list"], check=False)
+def herdr_agents():
+    """{pane_id: agent} for every agent herdr knows, or None when herdr can't be reached."""
+    try:
+        r = run(["herdr", "agent", "list"], check=False)
+    except OSError:  # herdr isn't installed
+        return None
     if r.returncode != 0:
-        return {}
+        return None
     try:
         agents = json.loads(r.stdout)["result"]["agents"]
     except (ValueError, KeyError):
-        return {}
+        return None
     return {a["pane_id"]: a for a in agents}
 
 
@@ -914,6 +1001,10 @@ def plan_files(task_id):
     return sorted((PROFILE_DIR / "briefs").glob(f"T{task_id}-*-plan.md"))
 
 
+def live_agents():
+    return herdr_agents() or {}
+
+
 def render_status(conn, live=None):
     live = live if live is not None else live_agents()
     ledger = spend_rows()
@@ -931,6 +1022,13 @@ def render_status(conn, live=None):
     else:
         lines.append("- Nothing.")
     lines.append("")
+
+    pending = conn.execute("SELECT * FROM inbox WHERE status='new' ORDER BY id").fetchall()
+    if pending:
+        lines.append("## Dashboard feedback to handle (`bin/zed inbox`, `inbox` skill)")
+        lines.append("")
+        lines.extend(f"- {inbox_summary(i, 160)} (sent {i['created_at']})" for i in pending)
+        lines.append("")
 
     def task_block(t):
         out = [f"### T{t['id']} · {t['jira'] or 'no-jira'} · {t['title']}",
@@ -964,9 +1062,7 @@ def render_status(conn, live=None):
         out.append("")
         return out
 
-    for header, states in [("In progress", ["active", "waiting_user", "in_review"]),
-                           ("PR open", ["pr_open"]),
-                           ("Not started / parked", ["intake", "parked"])]:
+    for header, states in TASK_GROUPS:
         rows = conn.execute(
             f"SELECT * FROM tasks WHERE status IN ({','.join('?'*len(states))}) ORDER BY id", states).fetchall()
         lines.append(f"## {header}")
@@ -1109,6 +1205,8 @@ def cmd_q(args):
         if not q:
             die(f"no question {qid}")
         conn.execute("UPDATE questions SET answer=?, status='answered', answered_at=? WHERE id=?", (ans, now(), qid))
+        conn.execute("UPDATE inbox SET status='handled', response=?, handled_at=? WHERE kind='answer' AND question_id=? "
+                     "AND status='new'", (f"Recorded as the answer to Q{qid}", now(), qid))  # answered, whichever way it came
         if q["task_id"]:
             log_event(conn, q["task_id"], "answer", f"Q{qid}: {ans}")
             touch_task(conn, q["task_id"])
@@ -1126,6 +1224,35 @@ def cmd_q(args):
         die(f"unknown q subcommand {sub}")
     conn.commit()
     write_status(conn)
+
+
+def cmd_inbox(args):
+    """inbox [list [--all]] | inbox done <id> [what Zed did...] — the user's feedback from the dashboard."""
+    sub = args[0] if args and not args[0].startswith("-") else "list"
+    conn = db()
+    if sub == "list":
+        rows = conn.execute("SELECT * FROM inbox" + ("" if "--all" in args else " WHERE status='new'") + " ORDER BY id").fetchall()
+        print("\n".join(inbox_detail(i) for i in rows) if rows else "the inbox is empty")
+        return
+    if sub != "done":
+        die("inbox [list [--all]] | inbox done <id> [what Zed did...]")
+    require_lock()
+    if len(args) < 2 or not args[1].isdigit():
+        die("inbox done <id> [what Zed did...] (the note is shown to the user on the dashboard)")
+    item = conn.execute("SELECT * FROM inbox WHERE id=?", (int(args[1]),)).fetchone()
+    if not item:
+        die(f"no inbox item {args[1]}")
+    if item["status"] == "handled":
+        print(f"#{item['id']} was already handled")
+        return
+    response = " ".join(args[2:]) or None
+    conn.execute("UPDATE inbox SET status='handled', response=?, handled_at=? WHERE id=?", (response, now(), item["id"]))
+    if item["kind"] in ("comment", "rating"):  # answers are logged by `q answer`, new tasks by `task add`
+        log_event(conn, item["task_id"], "feedback", f"dashboard {inbox_summary(item, 300)}" + (f" → {response}" if response else ""))
+        touch_task(conn, item["task_id"])
+    conn.commit()
+    write_status(conn)
+    print(f"handled #{item['id']}")
 
 
 def slugify(s, n=40):
@@ -2287,7 +2414,8 @@ def claim_watcher():
 
 
 def cmd_watch(args):
-    """Emit one line whenever a managed worker changes to a state that needs Zed's attention.
+    """Emit one line whenever a managed worker changes to a state that needs Zed's attention, or the user
+    leaves feedback on the dashboard (`INBOX #<id> ...`; every unhandled item is reported once per watch).
     Claude Code: run it under the Monitor tool. Copilot CLI: run `watch --once` as a detached shell; it
     exits after the first event(s), which wakes Zed, and remembers what it has reported so a re-armed
     watch only reports new changes. Exits (3) when this session loses the Zed lock."""
@@ -2308,6 +2436,8 @@ def cmd_watch(args):
         return True
     saved = read_json(WATCH_STATE_PATH, None)
     prev = {int(k): v for k, v in saved.items()} if saved is not None else {}
+    inbox_path = WATCH_STATE_PATH.with_name("watch-inbox.json")
+    announced = set(read_json(inbox_path, []))  # inbox items already reported, kept across runs
     first = saved is None
     alerts_path = WATCH_STATE_PATH.with_name("watch-alerts.json")
     alerts = {int(k) if k.isdigit() else k: v for k, v in read_json(alerts_path, {}).items()}  # health alerts already reported, kept across runs
@@ -2379,6 +2509,10 @@ def cmd_watch(args):
             events += delivery_events(alerts)
             events += core_sync_events(alerts)
             first = False
+            for item in conn.execute("SELECT * FROM inbox WHERE status='new' ORDER BY id"):
+                if item["id"] not in announced:
+                    events.append(f"INBOX {inbox_summary(item)} — handle it with the inbox skill (bin/zed inbox)")
+                    announced.add(item["id"])
             conn.commit()
             conn.close()
         except Exception as e:  # keep the watch alive through transient failures
@@ -2387,6 +2521,7 @@ def cmd_watch(args):
             print(line, flush=True)
         WATCH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         WATCH_STATE_PATH.write_text(json.dumps(prev))
+        inbox_path.write_text(json.dumps(sorted(announced)))
         alerts_path.write_text(json.dumps(alerts))
         if once and events:
             return True
@@ -2648,6 +2783,287 @@ def cmd_doctor(args):
     sys.exit(1 if over else 0)
 
 
+# ---------------------------------------------------------------- dashboard
+# A local web page for seeing everything Zed tracks and leaving feedback. It is not Zed: it holds no lock,
+# never talks to workers and writes nothing but inbox rows. Zed (the lock holder) acts on them: see `cmd_inbox`.
+
+class FeedbackError(ValueError):
+    """Feedback Zed can't use. The message says why and is shown to the user on the dashboard."""
+
+
+def feedback_text(data, key, label, required=True, limit=FEEDBACK_TEXT_MAX):
+    value = data.get(key)
+    if value is not None and not isinstance(value, str):
+        raise FeedbackError(f"{label} must be text")
+    value = (value or "").replace("\r\n", "\n").strip()
+    if required and not value:
+        raise FeedbackError(f"{label} is required")
+    if len(value) > limit:
+        raise FeedbackError(f"{label} is too long ({len(value)} characters, at most {limit})")
+    return value or None
+
+
+def feedback_target(conn, data, key, table, label):
+    """The task or question row a piece of feedback is about."""
+    ref = data.get(key)
+    row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (ref,)).fetchone() if type(ref) is int and 0 < ref < 2**31 else None
+    if row is None:
+        raise FeedbackError(f"there is no {label} {ref!r}")
+    return row
+
+
+def dashboard_repos():
+    """The repo names in the profile's projects.json, for the new-task form ([] if it can't be read)."""
+    try:
+        return sorted(json.loads(PROJECTS_PATH.read_text()).get("repos", {}))
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def add_feedback(conn, data):
+    """Validate one piece of feedback from the dashboard, store it in the inbox and return its id."""
+    kind = data.get("kind")
+    item = {"task_id": None, "question_id": None, "rating": None, "title": None, "jira": None, "repo": None}
+    if kind == "answer":
+        question = feedback_target(conn, data, "question_id", "questions", "question")
+        if question["status"] != "open":
+            raise FeedbackError(f"Q{question['id']} has already been answered")
+        item |= {"question_id": question["id"], "task_id": question["task_id"]}
+        item["text"] = feedback_text(data, "text", "The answer")
+    elif kind == "comment":
+        item["task_id"] = feedback_target(conn, data, "task_id", "tasks", "task")["id"]
+        item["text"] = feedback_text(data, "text", "The comment")
+    elif kind == "rating":
+        task = feedback_target(conn, data, "task_id", "tasks", "task")
+        if task["status"] not in RATABLE_STATES:
+            raise FeedbackError(f"T{task['id']} is {task['status']}: only delivered work (PR open or done) can be rated")
+        if data.get("rating") not in RATINGS:
+            raise FeedbackError("the rating must be good or not_good")
+        item |= {"task_id": task["id"], "rating": data["rating"]}
+        item["text"] = feedback_text(data, "text", "The reason", required=data["rating"] == "not_good")
+    elif kind == "task":
+        item["title"] = feedback_text(data, "title", "The title", limit=FEEDBACK_TITLE_MAX)
+        item["jira"] = feedback_text(data, "jira", "The ticket ID", required=False, limit=40)
+        item["repo"] = feedback_text(data, "repo", "The repo", required=False, limit=100)
+        if item["repo"] and item["repo"] not in dashboard_repos():
+            raise FeedbackError(f"unknown repo '{item['repo']}'")
+        item["text"] = feedback_text(data, "text", "The details", required=False)
+    else:
+        raise FeedbackError(f"unknown kind of feedback (expected {', '.join(INBOX_KINDS)})")
+    row = {"kind": kind, **item, "created_at": now()}
+    cur = conn.execute(f"INSERT INTO inbox({','.join(row)}) VALUES ({','.join('?' * len(row))})", list(row.values()))
+    conn.commit()
+    return cur.lastrowid
+
+
+def dashboard_task(conn, t, agents):
+    sessions = []
+    for s in conn.execute("SELECT * FROM sessions WHERE task_id=? ORDER BY id", (t["id"],)):
+        live = None  # herdr's state for a worker that should be running; None for finished/closed sessions
+        if s["status"] in ("running", "waiting_user") and s["pane_id"]:
+            if agents is None:
+                live = "unavailable"
+            else:
+                live = agents[s["pane_id"]]["agent_status"] if s["pane_id"] in agents else "gone"
+        sessions.append({k: s[k] for k in ("id", "agent", "repo", "branch", "base", "status", "runtime", "model",
+                                           "effort", "credits", "pr_url", "external")} | {"live": live})
+    rating = conn.execute("SELECT * FROM inbox WHERE task_id=? AND kind='rating' ORDER BY id DESC LIMIT 1", (t["id"],)).fetchone()
+    return {k: t[k] for k in ("id", "title", "jira", "worktype", "description", "status", "created_at", "updated_at")} | {
+        "sessions": sessions,
+        "events": [dict(e) for e in conn.execute(
+            "SELECT ts, kind, text FROM events WHERE task_id=? ORDER BY id DESC LIMIT 10", (t["id"],))],
+        "feedback": [dict(i) for i in conn.execute("SELECT * FROM inbox WHERE task_id=? ORDER BY id DESC LIMIT 5", (t["id"],))],
+        "rating": dict(rating) if rating else None,
+        "can_rate": t["status"] in RATABLE_STATES}
+
+
+def dashboard_zed():
+    """Whether a Zed session is listening for feedback, and which runtimes are marked limited."""
+    holder = read_lock()
+    try:
+        active = bool(holder) and holder_alive(holder)
+    except OSError:  # herdr isn't installed, so the holder's pane can't be checked
+        active = bool(holder)
+    try:
+        limited = {name: s for name, s in json.loads(RUNTIME_STATE_PATH.read_text()).items() if isinstance(s, dict)}
+    except (OSError, ValueError, AttributeError):
+        limited = {}
+    zed = {"active": active, "runtime": None, "since": None, "limited": limited}
+    if active:
+        zed |= {"runtime": holder.get("runtime") or "claude", "since": holder.get("acquired_at")}
+    return zed
+
+
+def dashboard_state(conn, agents):
+    """Everything the dashboard shows, as JSON-ready data. `agents` is herdr's live agents by pane
+    (see herdr_agents), or None when herdr can't be reached."""
+    groups = []
+    for title, states in TASK_GROUPS:
+        rows = conn.execute(f"SELECT * FROM tasks WHERE status IN ({','.join('?' * len(states))}) ORDER BY id", states).fetchall()
+        groups.append({"title": title, "tasks": [dashboard_task(conn, t, agents) for t in rows]})
+    finished = conn.execute("SELECT * FROM tasks WHERE status IN ('done','cancelled') "
+                            "ORDER BY updated_at DESC, id DESC LIMIT 20").fetchall()
+    groups.append({"title": "Recently finished", "tasks": [dashboard_task(conn, t, agents) for t in finished],
+                   "total": conn.execute("SELECT COUNT(*) FROM tasks WHERE status IN ('done','cancelled')").fetchone()[0]})
+    questions = []
+    for q in conn.execute("SELECT q.*, t.jira, t.title AS task_title FROM questions q LEFT JOIN tasks t ON t.id=q.task_id "
+                          "WHERE q.status='open' ORDER BY q.id").fetchall():
+        sent = conn.execute("SELECT * FROM inbox WHERE kind='answer' AND question_id=? AND status='new' ORDER BY id DESC LIMIT 1",
+                            (q["id"],)).fetchone()  # an answer from the dashboard that Zed hasn't picked up yet
+        questions.append({k: q[k] for k in ("id", "task_id", "session_id", "question", "asked_at", "jira", "task_title")}
+                         | {"sent": dict(sent) if sent else None})
+    return {"groups": groups, "questions": questions, "repos": dashboard_repos(), "herdr": agents is not None,
+            "inbox": [dict(i) for i in conn.execute("SELECT * FROM inbox ORDER BY id DESC LIMIT 20")],
+            "pending_feedback": conn.execute("SELECT COUNT(*) FROM inbox WHERE status='new'").fetchone()[0],
+            "zed": dashboard_zed()}
+
+
+def dashboard_server(port, token):
+    """The dashboard's HTTP server, bound to 127.0.0.1 only. Every request needs the per-run token and a
+    local Host header (so a web page the user happens to visit can't reach it through DNS rebinding)."""
+    import hmac  # imported here, like http.server (~15 ms): only the dashboard needs them
+    import traceback
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "ZedDashboard"
+        sys_version = ""
+
+        def log_message(self, *args):
+            pass  # the page's URL carries the token: no access log
+
+        def reply(self, status, body, content_type, headers=None):
+            data = body.encode()
+            self.send_response(status)
+            for name, value in {"Content-Type": content_type, "Content-Length": len(data), "Cache-Control": "no-store",
+                                "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY",
+                                "Referrer-Policy": "no-referrer", **(headers or {})}.items():
+                self.send_header(name, str(value))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def reply_json(self, status, payload):
+            self.reply(status, json.dumps(payload), "application/json; charset=utf-8")
+
+        def authorized(self, query):
+            if self.headers.get("Host") not in self.server.hosts:
+                return False
+            supplied = self.headers.get("X-Zed-Token") or query.get("token", [""])[0]
+            return hmac.compare_digest(supplied.encode(), token.encode())
+
+        def post_feedback(self):
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                return self.reply_json(415, {"error": "expected a JSON body"})
+            try:
+                length = int(self.headers.get("Content-Length", ""))
+            except ValueError:
+                return self.reply_json(411, {"error": "Content-Length is required"})
+            if not 0 < length <= DASHBOARD_BODY_MAX:
+                return self.reply_json(413, {"error": f"the body must be 1 to {DASHBOARD_BODY_MAX} bytes"})
+            try:
+                data = json.loads(self.rfile.read(length))
+            except ValueError:
+                data = None
+            if not isinstance(data, dict):
+                return self.reply_json(400, {"error": "expected a JSON object"})
+            conn = db()
+            try:
+                self.reply_json(200, {"id": add_feedback(conn, data)})
+            except FeedbackError as e:
+                self.reply_json(400, {"error": str(e)})
+            finally:
+                conn.close()
+
+        def route(self):
+            url = urlsplit(self.path)
+            if not self.authorized(parse_qs(url.query)):
+                return self.reply(403, "Forbidden. Open the URL that `zed dashboard` printed: it carries the access token.\n",
+                                  "text/plain; charset=utf-8")
+            if (self.command, url.path) == ("GET", "/"):
+                nonce = os.urandom(12).hex()
+                return self.reply(200, DASHBOARD_PAGE.read_text().replace("{{NONCE}}", nonce), "text/html; charset=utf-8",
+                                  {"Content-Security-Policy": DASHBOARD_CSP.format(nonce=nonce)})
+            if (self.command, url.path) == ("GET", "/api/state"):
+                conn = db()
+                try:
+                    return self.reply_json(200, dashboard_state(conn, herdr_agents()))
+                finally:
+                    conn.close()
+            if (self.command, url.path) == ("POST", "/api/feedback"):
+                return self.post_feedback()
+            self.reply_json(404, {"error": "not found"})
+
+        def handle_request(self):
+            try:
+                self.route()
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # the browser went away mid-response
+            except sqlite3.Error as e:
+                self.reply_json(503, {"error": f"the task database is busy or unreadable: {e}"})
+            except Exception as e:  # never leave the browser waiting on a request that blew up
+                traceback.print_exc()
+                self.reply_json(500, {"error": f"{type(e).__name__}: {e}"})
+
+        do_GET = do_POST = handle_request
+
+    class Server(ThreadingHTTPServer):
+        daemon_threads = True
+
+    server = Server(("127.0.0.1", port), Handler)
+    server.hosts = {f"{name}:{server.server_address[1]}" for name in ("127.0.0.1", "localhost")}
+    return server
+
+
+def running_dashboard():
+    """The dashboard of this profile that is still up (its URL, pid and port), else None."""
+    try:
+        info = json.loads(DASHBOARD_STATE_PATH.read_text())
+        os.kill(info["pid"], 0)
+        socket.create_connection(("127.0.0.1", info["port"]), timeout=1).close()
+    except (OSError, ValueError, KeyError, TypeError):  # no record, a stale one, or an unreadable one
+        return None
+    return info
+
+
+def cmd_dashboard(args):
+    """dashboard [--port N] [--open] — serve the local dashboard on 127.0.0.1 until interrupted."""
+    ap = argparse.ArgumentParser(prog="zed dashboard", description=cmd_dashboard.__doc__)
+    ap.add_argument("--port", type=int, default=DASHBOARD_PORT, help=f"port to listen on (default {DASHBOARD_PORT}; 0 = any free one)")
+    ap.add_argument("--open", action="store_true", help="open the dashboard in the default browser")
+    opts = ap.parse_args(args)
+    if not 0 <= opts.port <= 65535:
+        ap.error("--port must be between 0 and 65535")
+    db().close()  # require the profile and create/upgrade the schema now rather than in the first request
+    info = running_dashboard()
+    if info:
+        print(f"the dashboard is already running (pid {info['pid']}): {info['url']}")
+        if opts.open:
+            webbrowser.open(info["url"])
+        return
+    token = os.urandom(18).hex()
+    try:
+        server = dashboard_server(opts.port, token)
+    except OSError as e:
+        die(f"can't listen on 127.0.0.1:{opts.port} ({e.strerror}). Pick another port with --port (0 = any free one).")
+    port = server.server_address[1]
+    info = {"url": f"http://127.0.0.1:{port}/?token={token}", "port": port, "pid": os.getpid(), "started_at": now()}
+    DASHBOARD_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DASHBOARD_STATE_PATH.write_text(json.dumps(info))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # so the cleanup below also runs when it is stopped with kill
+    print(f"Zed dashboard: {info['url']}", flush=True)
+    print("Open that URL in a browser on this Mac. It carries the access token, so keep it to yourself. "
+          "Ctrl-C stops the dashboard.", flush=True)
+    if opts.open:
+        webbrowser.open(info["url"])
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("dashboard stopped")
+    finally:
+        server.server_close()
+        DASHBOARD_STATE_PATH.unlink(missing_ok=True)
+
+
 def cmd_paths(args):
     """Print where Zed's files are, for skills and scripts."""
     print(json.dumps({"home": str(ZED_HOME), "profile": str(PROFILE_DIR),
@@ -2805,7 +3221,15 @@ def cmd_help(args):
   models show | models import <ranking.json>
                                      the model ranking and what the policy picks per runtime
   watch [interval-seconds] [--once]  Claude: run under Monitor. Copilot: run `watch --once` as a
-                                     detached shell; it exits after the first event(s)
+                                     detached shell; it exits after the first event(s).
+                                     Also reports `INBOX #<id> ...` for each unhandled dashboard item
+  dashboard [--port N] [--open]      local web dashboard on 127.0.0.1 (default port 8765; 0 = any free one).
+                                     Prints a URL carrying this run's access token. See everything, answer
+                                     questions, comment, rate finished work, request tasks: it only writes
+                                     the inbox. Already running? Prints its URL. Needs no lock
+  inbox [list [--all]]               feedback from the dashboard still to handle (--all: handled too)
+  inbox done <id> [what Zed did...]  mark an item handled; the note is shown to the user on the dashboard
+                                     (needs the lock; see the `inbox` skill)
   status [--brief]                   (regenerate + print STATUS.md; --brief: only what needs attention)
   start [--take-over]                (session start: claim the lock, print one bounded digest)
   paths                              (Zed home, profile dir, DB/STATUS/config/briefs locations)
@@ -2818,7 +3242,7 @@ Session states: """ + ", ".join(SESSION_STATES))
 
 COMMANDS = {"task": cmd_task, "log": cmd_log, "q": cmd_q, "spawn": cmd_spawn, "assign": cmd_assign, "session": cmd_session,
             "prompt": cmd_prompt, "relay-post": cmd_relay_post, "gate": cmd_gate, "merge": cmd_merge, "close": cmd_close, "adopt": cmd_adopt, "handoff": cmd_handoff, "watch": cmd_watch, "status": cmd_status,
-            "brief": cmd_brief, "coordinator": cmd_coordinator, "quota": cmd_quota, "landed": cmd_landed, "doctor": cmd_doctor, "ack": cmd_ack, "hook": cmd_hook, "paths": cmd_paths, "start": cmd_start, "lock": cmd_lock, "runtime": cmd_runtime, "models": cmd_models, "help": cmd_help}
+            "brief": cmd_brief, "coordinator": cmd_coordinator, "quota": cmd_quota, "landed": cmd_landed, "doctor": cmd_doctor, "ack": cmd_ack, "hook": cmd_hook, "paths": cmd_paths, "start": cmd_start, "lock": cmd_lock, "runtime": cmd_runtime, "models": cmd_models, "inbox": cmd_inbox, "dashboard": cmd_dashboard, "help": cmd_help}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
