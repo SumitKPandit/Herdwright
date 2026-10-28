@@ -110,8 +110,16 @@ RUNTIMES = {
                            r"out of (ai )?credits", r"no (remaining )?(premium requests|ai credits)"],
         "credits_pattern": r"Session: ([\d.]+) AIC used",
     },
+    "opencode": {
+        "cli": "opencode",
+        "session_env": "OPENCODE_SESSION_ID",
+        "pid_env": "OPENCODE_PID",
+        "efforts": ["minimal", "low", "medium", "high", "max"],
+        "trust_prompt": "",
+        "trust_keys": [],
+        "limit_patterns": [r"rate.limited", r"rate limit", r"quota exceeded", r"429\b", r"out of credits"],
+    },
 }
-PERMISSION_MODE_MENU = {"manual": "1", "assisted": "2", "allow-all": "3"}  # Copilot's /permissions dialog
 
 TASK_STATES = ["intake", "active", "waiting_user", "in_review", "pr_open", "parked", "done", "cancelled"]
 SESSION_STATES = ["running", "waiting_user", "finished", "closed"]
@@ -1334,6 +1342,10 @@ def runtime_launch(runtime, agent, model, effort, kit=None):
         return [], ["--permission-mode", "auto", "-n", agent, "--append-system-prompt-file", str((kit or {}).get("rules", rules)),
                     "--add-dir", str(PROFILE_DIR), *model_args, *(["--effort", effort] if effort else []),
                     *(["--settings", str(kit["claude_settings"])] if kit else [])]
+    if runtime == "opencode":
+        rs = runtime_settings("opencode")
+        args = ["-n", agent, *model_args, *(["--variant", effort] if effort else []), "--auto"]
+        return [], args
     rs = runtime_settings("copilot")
     # Interactive mode, never autopilot: in autopilot Copilot answers its own questions with a guess.
     # --experimental: needed for Assisted Permissions (selected after start, see set_copilot_permissions).
@@ -1358,13 +1370,14 @@ def employee_kit(name, hat, repo, tags, sid, agent, worktree):
     rules = worker_rules_text() + "\n\n" + emp.employee_rules(name, hat, pack)
     kit = {"pack": pack, "rules": out / f"{agent}-rules.md", "instructions": out / f"{agent}-instructions",
            "claude_settings": out / f"{agent}-settings.json", "copilot_plugin": out / f"{agent}-plugin",
-           "pi_extension": out / f"{agent}-extension.ts"}
+           "pi_extension": out / f"{agent}-extension.ts", "opencode_plugin": out / f"{agent}-opencode-plugin.js"}
     kit["instructions"].mkdir(parents=True, exist_ok=True)
     kit["rules"].write_text(rules)
     (kit["instructions"] / "zed-worker.instructions.md").write_text(rules)
     kit["claude_settings"].write_text(json.dumps(zeddeny.claude_settings(ZED_HOME), indent=2) + "\n")
     zeddeny.copilot_plugin(kit["copilot_plugin"], ZED_HOME)
     zeddeny.pi_extension(kit["pi_extension"], ZED_HOME)
+    zeddeny.opencode_plugin(kit["opencode_plugin"], ZED_HOME)
     kit["deny_tools"] = zeddeny.copilot_deny_tools(emp.load_manifest(hat))
     env = [f"ZED_EMPLOYEE={name}", f"ZED_HAT={hat}", f"ZED_SESSION=S{sid}", f"ZED_WORKTREE={worktree}",
            f"ZED_PROFILE_DIR={PROFILE_DIR}"]  # so zed-employee and zed-deny find this profile, wherever it is
@@ -1603,13 +1616,14 @@ def cmd_spawn(args, worktree=None):
                      *[a for e in env for a in ("--env", e)]])["result"]
     ws_id, pane_id = ws["workspace"]["workspace_id"], ws["root_pane"]["pane_id"]
     time.sleep(1.5)  # let the shell reach its prompt
-    r = run(["herdr", "agent", "start", agent, "--kind", runtime, "--pane", pane_id, "--timeout", "60000",
+    r = run(["herdr", "agent", "start", agent, "--kind", runtime, "--pane", pane_id, "--timeout", "120000",
              "--", *cli_args], check=False)
     if r.returncode != 0 and "agent_not_ready" in r.stderr:
         # A fresh worktree triggers the CLI's folder-trust dialog. Zed created this worktree
         # from a configured repo, so accept it; anything else stays blocked for Zed to inspect.
         screen = run(["herdr", "agent", "read", agent, "--source", "visible"], check=False).stdout
-        if RUNTIMES[runtime]["trust_prompt"] in screen:  # the pane was opened with cwd=worktree
+        tp = RUNTIMES[runtime].get("trust_prompt", "")
+        if tp and tp in screen:  # the pane was opened with cwd=worktree
             run(["herdr", "agent", "send-keys", agent, *RUNTIMES[runtime]["trust_keys"]], check=False)
             r = run(["herdr", "agent", "wait", agent, "--until", "idle", "--timeout", "60000"], check=False)
     perm_error = set_copilot_permissions(agent) if runtime == "copilot" and r.returncode == 0 else None
