@@ -1616,7 +1616,7 @@ def cmd_spawn(args, worktree=None):
                      *[a for e in env for a in ("--env", e)]])["result"]
     ws_id, pane_id = ws["workspace"]["workspace_id"], ws["root_pane"]["pane_id"]
     time.sleep(1.5)  # let the shell reach its prompt
-    r = run(["herdr", "agent", "start", agent, "--kind", runtime, "--pane", pane_id, "--timeout", "120000",
+    r = run(["herdr", "agent", "start", agent, "--kind", runtime, "--pane", pane_id, "--timeout", "180000",
              "--", *cli_args], check=False)
     if r.returncode != 0 and "agent_not_ready" in r.stderr:
         # A fresh worktree triggers the CLI's folder-trust dialog. Zed created this worktree
