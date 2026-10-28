@@ -1141,6 +1141,14 @@ def cmd_task(args):
     elif sub == "set":
         tid, kv = int(rest[0].lstrip("T")), parse_kv(rest[1:])
         get_task(conn, tid)
+        if kv.get("status") == "done":
+            # Gate: a task is only done when both review and QA have clean verdicts
+            # recorded by employees who did not author the work.
+            rev = conn.execute("SELECT COUNT(*) FROM sessions WHERE task_id=? AND hat='review' AND verdict='clean'", (tid,)).fetchone()[0]
+            qa = conn.execute("SELECT COUNT(*) FROM sessions WHERE task_id=? AND hat='qa' AND verdict='clean'", (tid,)).fetchone()[0]
+            if rev == 0 or qa == 0:
+                die(f"refused: T{tid} cannot be marked done without clean review and QA verdicts "
+                    f"(review={rev}, qa={qa}). Get the review and QA done first.")
         for k, v in kv.items():
             if k not in ("title", "jira", "worktype", "description", "status"):
                 die(f"cannot set '{k}' on a task")
@@ -3208,6 +3216,14 @@ def cmd_start(args):
                for n, r in ((n, runtime_report(n)) for n in runtime_config().get("order", [])))]
     watcher = watcher_alive()
     running = conn.execute("SELECT COUNT(*) FROM sessions WHERE status IN ('running','waiting_user')").fetchone()[0]
+    if not watcher and running and holds_lock():
+        # Auto-arm the watcher in the background so we get notified when workers finish.
+        # Pi has no Stop hooks, so we must ensure the watcher is running.
+        subprocess.Popen(["nohup", str(ZED_HOME / "bin" / "zed"), "watch", "--once"],
+                         stdout=open("/tmp/zed-watcher.log", "w"), stderr=subprocess.STDOUT,
+                         start_new_session=True)
+        time.sleep(1)
+        watcher = watcher_alive()
     out.append(f"watcher: {'alive, pid ' + str(watcher) if watcher else 'NOT RUNNING' + (' — arm it: bin/zed watch --once (background)' if running else '')}")
     out.append(context_line())
     if quota_settings().get("threshold_tokens"):
