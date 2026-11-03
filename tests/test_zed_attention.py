@@ -396,11 +396,49 @@ class RunAndCliTests(unittest.TestCase):
     def test_confluence_is_a_note_not_an_error(self):
         out = io.StringIO()
         self.assertEqual(cli.main(["--source", "confluence"], {"github": {}}, {}, out), 0)
-        self.assertIn("via MCP, not scripted", out.getvalue())
+        self.assertIn("pass --confluence-json", out.getvalue())
         out = io.StringIO()
         cli.main(["--json", "--source", "github,confluence"], {"github": {}}, {"github": lambda c, s: []}, out)
         res = json.loads(out.getvalue())
         self.assertEqual((res["errors"], len(res["notes"])), ([], 1))
+
+    def feed_file(self, rows):
+        import tempfile, pathlib
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        path = pathlib.Path(d.name) / "feed.json"
+        path.write_text(rows if isinstance(rows, str) else json.dumps(rows))
+        return str(path)
+
+    def test_confluence_feed_keeps_fresh_unresolved_rows_and_renders_a_section(self):
+        row = {"url": "https://c/1", "title": "Page", "who": "Ann", "ask": "mentioned you: can you check?\nmore",
+               "updated": "2026-10-27T10:00:00Z"}
+        feed = self.feed_file([row, {**row, "url": "https://c/old", "updated": "2026-10-01T00:00:00Z"},
+                               {**row, "url": "https://c/done", "resolved": True}])
+        out = io.StringIO()
+        self.assertEqual(cli.main(["--confluence-json", feed, "--since", "2026-10-26", "--source", "confluence"],
+                                  {"github": {}}, {}, out), 0)
+        self.assertIn("Confluence\n- https://c/1 | Ann | mentioned you: can you check? | since 2026-10-27T10:00", out.getvalue())
+        self.assertNotIn("c/old", out.getvalue())
+        self.assertNotIn("c/done", out.getvalue())
+
+    def test_confluence_feed_problems_are_errors_and_do_not_block_other_sources(self):
+        item = {"source": "github", "kind": "review-queue", "category": "never", "url": "https://x/1", "who": "a",
+                "ask": "open, no approval", "since": "2026-10-27T00:00:00Z", "title": "T"}
+        for bad in ("not json", [{"url": "u"}], {"a": 1}, [{"url": "u", "title": "t", "who": "w", "ask": "a", "updated": "yesterday"}]):
+            out = io.StringIO()
+            code = cli.main(["--json", "--since", "2026-10-26", "--source", "github,confluence", "--confluence-json",
+                             self.feed_file(bad)], {"github": {}}, {"github": lambda c, s: [item]}, out)
+            res = json.loads(out.getvalue())
+            self.assertEqual((code, [e["source"] for e in res["errors"]], len(res["items"])), (1, ["confluence"], 1), bad)
+        out = io.StringIO()
+        self.assertEqual(cli.main(["--source", "confluence", "--confluence-json", "/nonexistent/feed.json"], {"github": {}}, {}, out), 1)
+        self.assertIn("! confluence: confluence feed /nonexistent/feed.json unreadable", out.getvalue())
+
+    def test_confluence_feed_from_stdin(self):
+        rows = json.dumps([{"url": "https://c/2", "title": "P", "who": "Bo", "ask": "commented", "updated": "2026-10-27T10:00:00Z"}])
+        got = cli.confluence_fetcher("-", io.StringIO(rows))({}, SINCE)
+        self.assertEqual([i["url"] for i in got], ["https://c/2"])
 
     def test_jira_settings_merge_top_level_block(self):
         import tempfile, pathlib

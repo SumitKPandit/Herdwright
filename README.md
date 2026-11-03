@@ -34,7 +34,7 @@ about you lives in **`profile/`**, which exists only on your profile branch.
 |---|---|
 | `CLAUDE.md` | Zed's operating manual (loaded automatically by Claude Code) |
 | `playbook.md` | Lessons about tools and workflow that help every Zed |
-| `.claude/skills/` | Zed's workflows: onboarding, new-task, check-workers, relay, wrap-up, learn |
+| `.claude/skills/` | Zed's workflows: onboarding, new-task, check-workers, relay, wrap-up, learn, attention |
 | `templates/` | Core worker rules (system prompt) and the brief skeleton |
 | `bin/zed` | Task DB and herdr session driver (`bin/zed help`) |
 | `bin/bb` | Bitbucket PR helper for workers |
@@ -89,7 +89,7 @@ any merge.
   from a process in the pane of the session that holds the profile lock, with the lock's pid among its ancestors; a shell
   with no identity is never Zed. `zed-deny` also refuses a hat session `--as-zed` and setting or unsetting the identity
   variables (also through a name the shell expands, `env`, `export`, `unset`, wrappers, `bash -c`, `sudo`, `xargs`). Out of
-  scope: a worker that edits the herdr or DB files directly, or runs its own script detached from its pane's process tree.
+  scope: a worker that edits the herdr or DB files directly, or runs its own script (it can also put its own `herdr`/`ps` first on `PATH`).
   OpenCode has no stop-guard; its workers run in herdr panes like any other, so the same identity applies.
 - **Verdicts** given before the upgrade match no code (they now attach to the non-`profile/` tree), so redo review
   and QA for work still open.

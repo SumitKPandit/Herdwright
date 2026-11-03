@@ -92,6 +92,17 @@ class ProcessTreeTests(unittest.TestCase):
         for hint in (None, "w1:p1", "w1:p3", "w1:p2"):  # a forged hint changes nothing
             self.assertEqual(emp.process_pane(hint), "w1:p2", hint)
 
+    def test_a_fake_ps_first_on_path_does_not_change_the_ancestors(self):
+        real = emp.ancestors()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        fake = Path(tmp.name) / "ps"
+        fake.write_text("#!/bin/sh\necho 4242\n")  # every pid's parent is the lock's pid
+        fake.chmod(0o755)
+        with patch.dict(os.environ, {"PATH": f"{tmp.name}:{os.environ['PATH']}"}):
+            self.assertEqual(emp.ancestors(), real)
+            self.assertNotIn(4242, emp.ancestors())
+
     def test_a_process_in_no_pane_or_without_herdr_has_none(self):
         self.fake_herdr({"w1:p1": 999999})
         self.assertIsNone(emp.process_pane("w1:p1"))
@@ -270,6 +281,14 @@ class FinishTests(AssignDb):
         author, review, _ = self.reviewed_by_author_setup()
         with self.in_pane(author, "p1", ZED_SESSION=f"S{review}"):
             self.assertIn("runs in the pane of S1 but ZED_SESSION says S2", run("finish", "--verdict", "clean")[2])
+        self.assertNothingRecorded()
+
+    def test_a_hat_claim_that_disagrees_with_the_panes_session_is_refused(self):
+        sid = self.seed("build")
+        with self.in_pane(sid, "p1", ZED_HAT="review", ZED_SESSION=f"S{sid}"):
+            code, _, err = run("finish")
+        self.assertEqual(code, 1)
+        self.assertIn(f"runs in the pane of S{sid} (build) but ZED_HAT says review", err)
         self.assertNothingRecorded()
 
     def test_a_hat_shell_that_lost_its_identity_or_claims_to_be_zed_is_refused(self):

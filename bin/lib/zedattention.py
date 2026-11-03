@@ -1,4 +1,4 @@
-"""zedattention — what needs the user's attention across GitHub, Bitbucket and Jira.
+"""zedattention — what needs the user's attention across GitHub, Bitbucket, Jira and Confluence.
 
 Pure logic plus collectors that take their network access as arguments, so tests pass fakes. Nothing here
 posts, approves or comments; every call is a read. Nothing user-specific lives in code: accounts, repos and
@@ -17,7 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-KINDS = ("review-requested", "review-queue", "own-pr-activity", "jira")
+KINDS = ("review-requested", "review-queue", "own-pr-activity", "jira", "confluence")
 
 NETWORK_TIMEOUT = 30        # seconds per request
 CLI_TIMEOUT = 60            # seconds per gh / security call
@@ -327,13 +327,44 @@ def jira_items(cfg, since, get):
     return items
 
 
+# ---------------------------------------------------------------- Confluence (a feed: no read token can search or read comments)
+
+CONFLUENCE_FIELDS = ("url", "title", "who", "ask", "updated")
+
+
+def confluence_items(rows, since):
+    """Items from a feed of rows `{url, title, who, ask, updated, created?, resolved?}` (comments and mentions on pages the
+    user owns or is named on), produced where the Atlassian connector is available. Resolved rows and rows older than `since`
+    are dropped; a row that lacks a field is a SourceError, not a silent skip."""
+    if not isinstance(rows, list):
+        raise SourceError("confluence feed must be a JSON list of rows")
+    items = []
+    for row in rows:
+        missing = [f for f in CONFLUENCE_FIELDS if not isinstance(row, dict) or not row.get(f)]
+        if missing:
+            raise SourceError(f"confluence feed row lacks {', '.join(missing)}: {str(row)[:80]}")
+        try:
+            fresh = _after(row["updated"], since)
+        except ValueError as e:
+            raise SourceError(f"confluence feed row has an unreadable time {row['updated']!r}") from e
+        if row.get("resolved") or not fresh:
+            continue
+        items.append({"source": "confluence", "kind": "confluence", "url": row["url"], "who": row["who"],
+                      "ask": _first_line(row["ask"]), "since": row.get("created") or row["updated"],
+                      "updated": row["updated"], "title": row["title"]})
+    return items
+
+
 # ---------------------------------------------------------------- run + render
+
+FEEDS = ("confluence",)
+
 
 def run(settings, since, sources, fetchers):
     """Collect from each named source; a failing source is reported in `errors`, never fatal to the others."""
     items, errors, notes = [], [], []
     for name in sources:
-        cfg = settings.get(name)
+        cfg = settings.get(name, {} if name in FEEDS else None)   # a feed needs no settings block
         if cfg is None:
             errors.append({"source": name, "message": "no settings block", "needs": []})
             continue
@@ -363,6 +394,7 @@ SECTIONS = [
     ("Stale open PRs (no recent activity), no approval — never reviewed by you", "review-queue", "never", True),
     ("Your PRs with new review activity", "own-pr-activity", None, False),
     ("Jira", "jira", None, False),
+    ("Confluence", "confluence", None, False),
 ]
 
 

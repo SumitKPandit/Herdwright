@@ -48,7 +48,7 @@ the user who took over.
   Hats (build, review, QA) for workers: `zed-employee` (skills, `finish`), `zed-deny`.
 - `herdr` CLI: `herdr --skill` prints its guide. `templates/worker-rules.md` plus the profile's `rules.md` go to every
   worker; briefs are `profile/briefs/T<id>-<repo>.md` from `templates/brief.md`.
-- Skills in `.claude/skills/`: `onboarding`, `new-task`, `check-workers`, `relay`, `wrap-up`, `learn`. Use them.
+- Skills in `.claude/skills/`: `onboarding`, `new-task`, `check-workers`, `relay`, `wrap-up`, `learn`, `attention`. Use them.
 
 ## Lifecycle
 

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""zed-attention — what needs the user's attention on GitHub, Bitbucket and Jira (Confluence is noted, not scripted), no model.
+"""zed-attention — what needs the user's attention on GitHub, Bitbucket, Jira and Confluence (Confluence from a feed), no model.
 
 Read-only: it never posts, comments or approves. Settings live in the profile's config/settings.json under
 `attention` (accounts, repos, excluded authors); nothing user-specific is in code.
 
 Usage
-  zed-attention [--since ISO|YYYY-MM-DD] [--source github,bitbucket,jira,confluence] [--json]
+  zed-attention [--since ISO|YYYY-MM-DD] [--source github,bitbucket,jira,confluence] [--confluence-json FILE|-] [--json]
       --since   own-PR activity and Jira are looked at from this time (default: `since_hours` ago,
                 `attention.since_hours` in settings, else 24)
       Review queues (GitHub/Bitbucket) list open PRs with no active approval, split into "reviewed by the user
@@ -23,7 +23,11 @@ Settings (`attention` in config/settings.json)
   jira:       optional {"account_id", "site"} overrides; by default both come from the token (/myself, /serverInfo)
 Jira connection comes from the top-level `jira` block ({"keychain_service", "keychain_account", "api_base"}): a
 read-only token over REST; if it lacks scopes the source reports them, it is not worked around.
-Confluence has no read token: it is reported as a note ("via MCP, not scripted"), never an error.
+Confluence: the `zed-confluence` token reads pages but not comments or search (401 "scope does not match": it would need
+`read:comment:confluence` and `search:confluence`), so Confluence comes from a feed: `--confluence-json FILE` (or `-` for
+stdin) holds a JSON list of rows `{"url","title","who","ask","updated"(ISO),"created"?,"resolved"?}` for comments and
+mentions on pages the user owns or is named on, collected with the Atlassian connector (the `attention` skill step, which a
+script cannot call). Resolved rows and rows older than --since are dropped. Without the flag Confluence is a note, never an error.
 """
 import argparse
 import datetime
@@ -39,7 +43,7 @@ import zedattention as za  # noqa: E402
 ZED_HOME = Path(__file__).resolve().parent.parent
 PROFILE_DIR = Path(os.environ.get("ZED_PROFILE_DIR") or ZED_HOME / "profile").expanduser().resolve()
 SOURCES = ("github", "bitbucket", "jira")
-CONFLUENCE_NOTE = "Confluence: via MCP, not scripted (no read token)"
+CONFLUENCE_NOTE = "Confluence: not read (no feed; pass --confluence-json, collected with the Atlassian connector)"
 
 
 def load_settings(profile=None):
@@ -108,10 +112,21 @@ def build_fetchers():
     }
 
 
+def confluence_fetcher(path, stdin=None):
+    def fetch(_cfg, since):
+        try:
+            text = (stdin or sys.stdin).read() if path == "-" else Path(path).read_text()
+            return za.confluence_items(json.loads(text), since)
+        except (OSError, ValueError) as e:
+            raise za.SourceError(f"confluence feed {path} unreadable: {type(e).__name__}") from e
+    return fetch
+
+
 def main(argv=None, settings=None, fetchers=None, out=sys.stdout):
     ap = argparse.ArgumentParser(prog="zed-attention", description="What needs the user's attention (read-only).")
     ap.add_argument("--since")
     ap.add_argument("--source", default=",".join((*SOURCES, "confluence")))
+    ap.add_argument("--confluence-json", metavar="FILE", help="feed of Confluence comments/mentions (`-` = stdin)")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
     settings = load_settings() if settings is None else settings
@@ -128,8 +143,12 @@ def main(argv=None, settings=None, fetchers=None, out=sys.stdout):
     except ValueError:
         print(f"zed-attention: cannot parse --since {args.since!r} (use ISO time or YYYY-MM-DD)", file=sys.stderr)
         return 2
-    result = za.run(settings, since, [s for s in sources if s in SOURCES], fetchers or build_fetchers())
-    if "confluence" in sources:
+    fetchers = dict(fetchers or build_fetchers())
+    feed = "confluence" in sources and bool(args.confluence_json)
+    if feed:
+        fetchers["confluence"] = confluence_fetcher(args.confluence_json)
+    result = za.run(settings, since, [s for s in sources if s in SOURCES or (s == "confluence" and feed)], fetchers)
+    if "confluence" in sources and not feed:
         result["notes"].append(CONFLUENCE_NOTE)
     print(json.dumps(result, indent=2) if args.json else za.render_text(result), file=out)
     return 1 if result["errors"] else 0

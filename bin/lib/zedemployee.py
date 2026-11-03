@@ -183,12 +183,15 @@ def session_number(text):
     return int(m.group(1))
 
 
+PS = "/bin/ps"  # by absolute path: a `ps` first on $PATH must not be able to report a different parent chain
+
+
 def ancestors(pid=None):
     """The pids from `pid` (default: this process) up to the root, read from the kernel's parent links, which a process cannot rewrite."""
     chain, pid = [], os.getpid() if pid is None else pid
     while pid > 1 and pid not in chain:
         chain.append(pid)
-        r = zedlib.run_bounded(["ps", "-o", "ppid=", "-p", str(pid)], timeout=10)
+        r = zedlib.run_bounded([PS, "-o", "ppid=", "-p", str(pid)], timeout=10)
         pid = int(r.stdout.strip()) if r.ok and r.stdout.strip().isdigit() else 0
     return chain
 
@@ -219,14 +222,13 @@ def caller_session(conn, env=None, pane=None):
     claim that disagrees with the pane, or a shell in no known pane that makes one, is refused. `zed-deny` also keeps a hat
     session from setting or unsetting them; a worker's own detached script is out of scope (README)."""
     env = os.environ if env is None else env
-    claims = [k for k in ("ZED_SESSION", "ZED_HAT", "HERDR_PANE_ID") if env.get(k)]
     pane = process_pane(env.get("HERDR_PANE_ID")) if pane is None else pane
     if env.get("HERDR_PANE_ID") and env["HERDR_PANE_ID"] != pane:
         raise FinishRefused(f"HERDR_PANE_ID says {env['HERDR_PANE_ID']} but this process runs in "
                             f"{pane or 'no herdr pane'}: the identity is taken from the process, not the variable")
     row = conn.execute("SELECT id, hat FROM sessions WHERE pane_id=? ORDER BY id DESC LIMIT 1", (pane,)).fetchone() if pane else None
     if not row:
-        if claims and (env.get("ZED_HAT") or env.get("ZED_SESSION")):
+        if env.get("ZED_HAT") or env.get("ZED_SESSION"):
             raise FinishRefused("this is a hat session whose own session cannot be read (its process is in no pane of a session)")
         return None
     if env.get("ZED_SESSION") and session_number(env["ZED_SESSION"]) != row["id"]:
@@ -262,7 +264,7 @@ def target_session(conn, session=None, as_zed=False, env=None):
     pane = process_pane(env.get("HERDR_PANE_ID"))
     caller = caller_session(conn, env, pane)
     if as_zed:
-        if caller or env.get("ZED_HAT") or not caller_is_zed(pane):
+        if caller or not caller_is_zed(pane):
             raise FinishRefused("--as-zed is for Zed's own process (in the pane of the session holding the profile lock): "
                                 "a hat session finishes only itself")
         if not session:
