@@ -816,20 +816,36 @@ def hat_kit(hat, sid, agent, worktree, runtime="claude"):
     return kit, env
 
 
+def started_since(agent, before, seconds):
+    """True once the agent has worked, is blocked on a dialog, or changed state since sequence `before`."""
+    for _ in range(int(seconds / 0.25)):
+        a = herdr_json(["agent", "get", agent])["result"]["agent"]
+        if a["agent_status"] in ("working", "blocked") or (a.get("state_change_seq") or 0) > (before or 0):
+            return True
+        time.sleep(0.25)
+    return False
+
+
 def prompt_worker(agent, text):
+    """Submit `text` to the agent and confirm it started. Herdr's five-second activity gate can expire before a slow
+    CLI starts its turn, so activity is also watched for 10 s. If none shows, the text may be sitting unsent in the
+    input box (seen: a pasted brief whose Enter was swallowed, the agent idle for 31 minutes): Enter is pressed once,
+    which submits it, and does nothing on an empty box, so the text is never sent twice. Still idle: a wake event is
+    queued and (False, reason) returned."""
     before = herdr_json(["agent", "get", agent])["result"]["agent"].get("state_change_seq", 0)
     r = run(["herdr", "agent", "prompt", agent, text,
              "--wait", "--until", "working", "--until", "blocked", "--timeout", "30000"], check=False)
     if r.returncode == 0:
         return True, ""
-    if "agent_prompt_stalled" in r.stderr:
-        # Herdr's five-second activity gate can expire before the CLI starts its first turn.
-        # Observe activity/completion without ever submitting the same brief a second time.
-        for _ in range(40):
-            a = herdr_json(["agent", "get", agent])["result"]["agent"]
-            if a["agent_status"] in ("working", "blocked") or (a.get("state_change_seq") or 0) > (before or 0):
-                return True, ""
-            time.sleep(0.25)
+    if "agent_prompt_stalled" not in r.stderr:
+        return False, r.stderr or r.stdout
+    if started_since(agent, before, 10):
+        return True, ""
+    run(["herdr", "agent", "send-keys", agent, "enter"], check=False)
+    if started_since(agent, before, 10):
+        return True, ""
+    queue_add([f"{agent} · prompt not picked up: still idle 20 s after submitting it and pressing Enter once "
+               f"(read its screen: `herdr agent read {agent}`); it will not be retried"])
     return False, r.stderr or r.stdout
 
 

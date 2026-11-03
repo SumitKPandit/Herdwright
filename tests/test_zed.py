@@ -191,6 +191,41 @@ class ZedTests(unittest.TestCase):
                     self.assertEqual(self.z.prompt_worker("qa", "brief"), (True, ""))
                     run.assert_called_once()
 
+    def fake_prompt(self, states, stalled=True):
+        """prompt_worker against a fake herdr: `agent prompt` stalls (or succeeds), each later `agent get` returns the
+        next of `states`, and Enter presses are counted. Returns (result, enter presses, queued wake events)."""
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[2] == "prompt":
+                return subprocess.CompletedProcess(cmd, 1 if stalled else 0, "", "agent_prompt_stalled" if stalled else "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        gets = iter([{"state_change_seq": 10}, *states])
+        get = lambda args: {"result": {"agent": next(gets, states[-1] if states else None)}}
+        with patch.object(self.z, "run", side_effect=run), patch.object(self.z, "herdr_json", side_effect=get), \
+                patch.object(self.z.time, "sleep"):
+            result = self.z.prompt_worker("qa", "brief")
+        enters = [c for c in calls if c[2:] == ["send-keys", "qa", "enter"]]
+        return result, len(enters), [e["text"] for e in self.z.queue_pending()]
+
+    def test_prompt_picked_up_needs_no_action(self):
+        result, enters, queued = self.fake_prompt([], stalled=False)
+        self.assertEqual((result, enters, queued), ((True, ""), 0, []))
+
+    def test_unsent_prompt_gets_one_enter(self):
+        idle = {"agent_status": "idle", "state_change_seq": 10}
+        result, enters, queued = self.fake_prompt([*[idle] * 40, {"agent_status": "working", "state_change_seq": 11}])
+        self.assertEqual((result, enters, queued), ((True, ""), 1, []))
+
+    def test_prompt_still_idle_after_enter_wakes_zed_without_retrying(self):
+        idle = {"agent_status": "idle", "state_change_seq": 10}
+        result, enters, queued = self.fake_prompt([idle])
+        self.assertEqual((result[0], enters), (False, 1))
+        self.assertEqual(len(queued), 1)
+        self.assertIn("qa · prompt not picked up", queued[0])
+
     def test_prompt_failure_is_reported(self):
         with patch.object(self.z, "herdr_json", return_value={"result": {"agent": {}}}), \
                 patch.object(self.z, "run", return_value=subprocess.CompletedProcess([], 1, "", "agent_blocked")):
