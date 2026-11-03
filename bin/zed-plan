@@ -8,9 +8,9 @@ firstmate's fm-brief-heading-lib / fm-dod-lib. Read-only.
 Usage
   zed-plan lint <plan-file|T<id>> [--json]
       structure problems: no steps, a step without a 'done when', a step without a time estimate (~40 min, ~2 h),
-      duplicate or out-of-order numbers. exit 0 clean, 1 problems, 2 no such plan
+      duplicate or out-of-order numbers, a catch-all tick that covers several steps ('1-5 done'). exit 0 clean, 1 problems, 2 no such plan
   zed-plan progress <plan-file|T<id>> [--json]
-      steps done/total, the next step, estimated minutes remaining, and whether the current step has run past
+      steps done/total (open merge/push/raise-PR steps are counted apart as 'awaiting'), the next step, estimated minutes remaining, and whether the current step has run past
       twice its estimate since the plan was last updated (the rule that says stop and tell Zed). exit 0 on track, 1 overrun
   zed-plan split <design.md> [--out DIR] [--json]
       turn a design assignment's plan into one brief skeleton per build unit. A unit is a heading
@@ -23,6 +23,7 @@ Usage
 """
 import argparse
 import re
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -36,6 +37,12 @@ ESTIMATE = re.compile(r"~\s*(\d+(?:\.\d+)?)\s*(min|m|h|hr|hrs|hour|hours)\b", re
 
 def find_plan(ref):
     if re.fullmatch(r"T\d+", ref):
+        conn = zedlib.db_readonly()
+        try:  # the task's build plan: that of its latest build or fix session
+            if conn and (plan := zedlib.gate_plan(conn, int(ref[1:]))):
+                return plan
+        except sqlite3.Error:  # a DB from before sessions.plan
+            pass
         found = sorted(zedlib.BRIEFS_DIR.glob(f"{ref}-*-plan.md"))
         return found[0] if found else None
     p = Path(ref)
@@ -75,6 +82,8 @@ def lint(steps):
             problems.append(f"step {st['n']}: out of order (expected {i})")
         if not DONE_WHEN.search(st["full"]):
             problems.append(f"step {st['n']}: no 'Done when'")
+        if zedlib.step_catch_all(st):
+            problems.append(f"step {st['n']}: a catch-all tick ('1-5 done'): one checklist line per step, each with its own 'Done when'")
         if st["est_min"] is None:
             problems.append(f"step {st['n']}: no time estimate (like '~40 min')")
     return problems
@@ -82,10 +91,11 @@ def lint(steps):
 
 def progress(steps, plan_mtime, now=None):
     now = now or time.time()
-    todo = [s for s in steps if not s["done"]]
+    todo = [s for s in steps if not s["done"] and not zedlib.step_exempt(s)]
+    awaiting = sum(not s["done"] and zedlib.step_exempt(s) for s in steps)
     cur = todo[0] if todo else None
     age = int((now - plan_mtime) // 60)
-    out = {"done": len(steps) - len(todo), "total": len(steps), "next": cur["text"][:120] if cur else None,
+    out = {"done": sum(s["done"] for s in steps), "total": len(steps) - awaiting, "awaiting": awaiting, "next": cur["text"][:120] if cur else None,
            "remaining_est_min": sum(s["est_min"] or 0 for s in todo), "minutes_since_update": age, "overrun": False}
     if cur and cur["est_min"] and age > 2 * cur["est_min"]:
         out["overrun"] = f"step {cur['n']} estimated {cur['est_min']} min, {age} min since the plan last changed"
@@ -269,7 +279,7 @@ def main(argv=None):
                     lambda d: [f"{path.name}: " + ("ok" if not problems else f"{len(problems)} problem(s)")] + ["  - " + p for p in zedlib.cap_lines(problems, 20)])
         return 1 if problems else 0
     pr = progress(steps, path.stat().st_mtime)
-    zedlib.emit(pr, a.json, lambda d: [f"{path.name}: {d['done']}/{d['total']} done, ~{d['remaining_est_min']} min estimated left"
+    zedlib.emit(pr, a.json, lambda d: [f"{path.name}: {d['done']}/{d['total']} done{f" (+{d['awaiting']} awaiting merge/PR)" if d["awaiting"] else ""}, ~{d['remaining_est_min']} min estimated left"
                                        + (f"; next: {d['next']}" if d["next"] else "; complete")]
                 + ([f"  ! OVERRUN: {d['overrun']}"] if d["overrun"] else []))
     return 1 if pr["overrun"] else 0

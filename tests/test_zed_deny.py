@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import shutil
 import sys
 import subprocess
 import tempfile
@@ -15,6 +16,7 @@ import _load
 import zeddeny
 import zedemployee as emp
 
+HOME = Path(__file__).resolve().parents[1]
 deny = _load.load("zed-deny")
 
 
@@ -24,7 +26,7 @@ class DecideTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name).resolve()
         self.wt, self.profile, self.evidence = root / "wt", root / "profile", root / "evidence"
-        for d in (self.wt / "src", self.profile / "employees" / "quill", self.evidence):
+        for d in (self.wt / "src", self.profile / "briefs" / "sub", self.evidence):
             d.mkdir(parents=True)
         self.manifests = {h: emp.load_manifest(h) for h in emp.hat_names()}
 
@@ -44,14 +46,13 @@ class DecideTests(unittest.TestCase):
         self.assertIn("denied", self.bash("review", f"rm {self.wt}/src/a.py"))
         self.assertIn("denied", self.bash("review", "sed -i s/a/b/ src/a.py"))
 
-    def test_build_edits_the_worktree_but_never_the_employee_records(self):
+    def test_only_build_edits_the_worktree_and_the_profile_config(self):
         self.assertIsNone(self.call("build", "Edit", file_path=str(self.wt / "src" / "a.py")))
-        for hat in self.manifests:
-            record = str(self.profile / "employees" / "quill" / "memory" / "repos" / "api.md")
-            self.assertIn("zed-employee remember", self.call(hat, "Edit", file_path=record), hat)
-            self.assertIn("denied", self.bash(hat, f"echo x >> {record}"), hat)
-            config = self.call(hat, "Edit", file_path=str(self.profile / "config" / "projects.json"))
-            self.assertEqual(config is None, hat == "build", hat)  # only the hats that may edit reach profile config
+        config = str(self.profile / "config" / "projects.json")
+        self.assertIsNone(self.call("build", "Edit", file_path=config))
+        for hat in ("review", "qa"):
+            self.assertIn("denied", self.call(hat, "Edit", file_path=config), hat)
+            self.assertIn("denied", self.bash(hat, f"echo x >> {config}"), hat)
 
     def test_outward_commands_are_denied_by_prefix_whatever_the_program_path_or_env(self):
         for hat in self.manifests:
@@ -62,20 +63,19 @@ class DecideTests(unittest.TestCase):
             self.assertIsNone(self.bash(hat, "echo gh pr comment"), hat)
 
     def test_cd_in_the_command_line_moves_where_relative_targets_resolve(self):
-        emp_dir = self.profile / "employees"
-        for command in (f"cd {emp_dir}/quill && touch x", f"cd {emp_dir} && touch quill/x", f"cd {emp_dir}; echo y > quill/x"):
-            for hat in ("build", "review"):
-                self.assertIn("denied", self.bash(hat, command), (hat, command))
+        emp_dir = self.profile / "briefs"
+        for command in (f"cd {emp_dir}/sub && touch x", f"cd {emp_dir} && touch sub/x", f"cd {emp_dir}; echo y > sub/x"):
+            self.assertIn("denied", self.bash("review", command), command)
         self.assertIsNone(self.bash("review", f"cd {self.evidence} && touch x"))  # was a false deny
         self.assertIn("denied", self.bash("review", f"cd {self.evidence} && cd {self.wt}/src && touch x"))
         self.assertIsNone(self.bash("build", "cd src && touch x"))
 
     def test_a_cd_the_shell_expands_leaves_relative_targets_unchecked(self):
-        emp_dir = self.profile / "employees"
-        for command in (f"cd $D && touch x", f"D={emp_dir}/quill; cd $D && touch x", f'cd "$E" && touch x',
-                        f"cd -- {emp_dir} && touch quill/x", f"pushd {emp_dir} && touch quill/x", "cd - && touch x"):
-            self.assertIn("denied" if "--" in command or "pushd" in command else "cannot be checked", self.bash("build", command), command)
-        self.assertIsNone(self.bash("build", f"cd $D && touch {self.wt}/src/x"))  # absolute targets stay checkable
+        emp_dir = self.profile / "briefs"
+        for command in (f"cd $D && touch x", f"D={emp_dir}/sub; cd $D && touch x", f'cd "$E" && touch x',
+                        f"cd -- {emp_dir} && touch sub/x", f"pushd {emp_dir} && touch sub/x", "cd - && touch x"):
+            self.assertIn("denied" if "--" in command or "pushd" in command else "cannot be checked", self.bash("review", command), command)
+        self.assertIsNone(self.bash("review", f"cd $D && touch {self.evidence}/x"))  # absolute targets stay checkable
 
     def test_git_writes_after_an_unknown_cd_are_denied_for_a_read_only_hat(self):
         for hat in ("review", "qa"):
@@ -93,8 +93,7 @@ class DecideTests(unittest.TestCase):
                 for allowed in (briefs / "T28-plan.md", briefs / "T24-rereview3-findings.md", status / "S76.log"):
                     self.assertIsNone(self.call(hat, "Write", file_path=str(allowed)), (hat, allowed))
                     self.assertIsNone(self.bash(hat, f"echo x >> {allowed}"), (hat, allowed))
-                for refused in (briefs / "T28-zed.md", status / "S1.log", self.profile / "lessons.md",
-                                self.profile / "employees" / "quill" / "employee-plan.md"):
+                for refused in (briefs / "T28-zed.md", status / "S1.log", self.profile / "lessons.md"):
                     self.assertIn("denied", self.call(hat, "Edit", file_path=str(refused)), (hat, refused))
                     self.assertIn("denied", self.bash(hat, f"echo x > {refused}"), (hat, refused))
             self.assertIsNone(self.call("build", "Edit", file_path=str(briefs / "T28-zed.md")))  # build is not limited
@@ -146,18 +145,74 @@ class DecideTests(unittest.TestCase):
         self.assertIsNone(self.bash("build", "git -C $E commit -m x"))
 
     def test_a_compound_opener_or_bare_cd_does_not_hide_the_cd(self):
-        emp_dir = self.profile / "employees"
-        for command in (f"{{ cd {emp_dir}; touch quill/x; }}", f"if true; then cd {emp_dir}; touch quill/x; fi"):
-            self.assertIn("denied", self.bash("build", command), command)
-        self.assertIn("cannot be checked", self.bash("build", "cd && touch x"))
+        emp_dir = self.profile / "briefs"
+        for command in (f"{{ cd {emp_dir}; touch sub/x; }}", f"if true; then cd {emp_dir}; touch sub/x; fi"):
+            self.assertIn("denied", self.bash("review", command), command)
+        self.assertIn("cannot be checked", self.bash("review", "cd && touch x"))
+
+    def test_a_command_ending_in_a_shell_keyword_or_a_semicolon_is_checked_not_crashed(self):
+        for command in ("for c in a b; do", "while true; do", "if true; then", "echo x;", "echo x; do", "ls ; ; then"):
+            for hat in ("build", "review"):
+                self.assertIsNone(self.bash(hat, command), command)
+
+    def test_a_hat_session_may_not_set_or_unset_the_variables_that_say_which_session_it_is(self):
+        spoofs = ("ZED_SESSION=S3 zed-employee finish --verdict clean", "FOO=1 ZED_HAT=review ls",
+                  "env -u ZED_SESSION zed-employee finish --session S3", "env ZED_PROFILE_DIR=/tmp/p ls",
+                  "unset ZED_SESSION; zed-employee finish", "export ZED_SESSION=S3", "export -n HERDR_PANE_ID",
+                  "declare -x ZED_HAT=review", "readonly ZED_SESSION=S3", "bash -c 'ZED_SESSION=S3 zed-employee finish'",
+                  'sh -c "unset HERDR_PANE_ID; zed-employee finish"', "bash -lc 'env -u ZED_HAT ls'",
+                  "eval 'export ZED_SESSION=S3'", "command env -u ZED_SESSION ls", "nohup env ZED_HAT=qa ls",
+                  "cd /tmp && ZED_SESSION=S3 ls", "if true; then unset ZED_SESSION; fi")
+        clears = ("env -i zed-employee finish --session S3", "env - ls", "env -iu X ls")
+        for hat in ("build", "review", "qa"):
+            for command in spoofs:
+                self.assertIn("tell Zed which session", self.bash(hat, command) or "", f"{hat}: {command}")
+            for command in clears:
+                self.assertIn("clears the variables", self.bash(hat, command) or "", f"{hat}: {command}")
+
+    def test_the_compact_and_wrapped_spellings_of_stripping_an_identity_are_refused(self):
+        strip = ("env -uZED_SESSION -uZED_HAT -uHERDR_PANE_ID bin/zed-employee finish --as-zed --session S2 --verdict clean",
+                 "env -uZED_SESSION ls", "env --unset=ZED_SESSION ls", "env -u $V ls", "unset $V", "V=ZED_SESSION; unset $V",
+                 "xargs env -u ZED_SESSION ls", "xargs -I{} env -uZED_SESSION {}", "find . -exec env -u ZED_SESSION {} \\;",
+                 "sudo env -u ZED_SESSION ls", "timeout 5 env -uHERDR_PANE_ID ls", "sudo bash -c 'unset ZED_HAT'",
+                 "find . -exec sh -c 'unset ZED_HAT' \\;", "env -iuX ls", "ZED_SESSION=S3 sudo ls")
+        as_zed = ("bin/zed-employee finish --verdict clean --session S3 --as-zed", "zed-employee finish --as-zed --session S3",
+                  "zed-employee finish --as=1 --session S3", "zed-employee finish --as --session S3", "xargs zed-employee finish --as-zed",
+                  "bash -c 'zed-employee finish --as-zed --session S3'", "env X=1 python3 bin/zed-employee finish --as-zed --session S3")
+        for hat in ("build", "review", "qa"):
+            for command in strip + as_zed:
+                self.assertTrue(self.bash(hat, command), f"{hat}: {command}")
+
+    def test_a_name_the_shell_expands_and_a_wrapper_with_its_own_flags_cannot_hide_a_strip(self):
+        indirect = ("V=HERDR_PANE_ID; A=ZED_SESSION; B=ZED_HAT; export $V=w3:p1 $A=S3 $B=qa; zed-employee finish --verdict clean",
+                    "export $V=x", "declare $V=x", "typeset -x $V=x", "readonly ${V}=1", "local $V=1", "export `echo ZED_HAT`=x",
+                    "unset ZED_{SESSION,HAT}", "export {ZED_SESSION,ZED_HAT}=x", "env $V=x ls", "env -S 'zed-employee finish --as-zed'")
+        wrapped = ("nice -n 5 env -u ZED_SESSION ls", "time -p env -uZED_SESSION ls", "command -p env -uZED_SESSION ls",
+                   "exec -a x env -u ZED_SESSION ls", "busybox env -u ZED_SESSION ls", "script -q /dev/null env -u ZED_SESSION ls",
+                   "nice -n 5 bash -c 'unset ZED_HAT'", "fish -c 'set -e ZED_SESSION'", "set -e ZED_HAT", "nice -n 5 zed-employee finish --as-zed")
+        for hat in ("build", "review", "qa"):
+            for command in indirect + wrapped:
+                self.assertTrue(self.bash(hat, command), f"{hat}: {command}")
+
+    def test_valid_commands_near_the_identity_rules_still_pass(self):
+        for command in ("zed-employee finish --verdict clean", "zed-employee finish --draft f.md --verdict blockers", "env FOO=1 ls",
+                        "env -u FOO ls", "unset FOO", "export PATH=$PATH:/x", "xargs ls", "sudo ls", "find . -name x -exec ls {} \\;",
+                        "grep -r ZED_SESSION bin", "env | grep ZED", "for c in a b; do", "echo x;", "env FOO=1 ls $X", "env FOO=$X ls",
+                        "export A=1 B=$(pwd)", "export FOO=\"$HOME/x\"", "set -euo pipefail", "nice -n 5 ls", "time -p ls", "command -p ls"):
+            self.assertIsNone(self.bash("build", command), command)
+
+    def test_reading_the_identity_variables_is_not_tampering(self):
+        for command in ("git grep -n 'ZED_SESSION=' bin", "grep ZED_HAT bin/zed", "echo $ZED_SESSION", "printenv ZED_SESSION",
+                        "FOO=1 ls", "bash -c 'ls'", "env FOO=1 ls", "bash script.sh"):
+            self.assertIsNone(self.bash("review", command), command)
 
     def test_more_cd_spellings_move_the_cwd(self):
-        emp_dir = self.profile / "employees"
-        for command in (f"cd -P {emp_dir} && touch quill/x", f"builtin cd {emp_dir} && touch quill/x",
-                        f"command cd {emp_dir} && touch quill/x", f"cd -L -- {emp_dir} && touch quill/x"):
-            self.assertIn("denied", self.bash("build", command), command)
-        for command in ("popd && touch x", f"CDPATH={emp_dir} cd quill && touch x"):
-            self.assertIn("cannot be checked", self.bash("build", command), command)
+        emp_dir = self.profile / "briefs"
+        for command in (f"cd -P {emp_dir} && touch sub/x", f"builtin cd {emp_dir} && touch sub/x",
+                        f"command cd {emp_dir} && touch sub/x", f"cd -L -- {emp_dir} && touch sub/x"):
+            self.assertIn("denied", self.bash("review", command), command)
+        for command in ("popd && touch x", f"CDPATH={emp_dir} cd sub && touch x"):
+            self.assertIn("cannot be checked", self.bash("review", command), command)
 
     def test_an_internal_error_denies(self):
         with mock.patch.object(zeddeny, "shell_problem", side_effect=TypeError("boom")):
@@ -182,24 +237,48 @@ class DecideTests(unittest.TestCase):
         self.manifests["review"] = {**self.manifests["review"], "subagents": "read-only"}
         self.assertIsNone(self.call("review", "Agent", prompt="x"))
 
-    def test_copilot_edits_arrive_as_an_apply_patch_text(self):
-        patch_text = "*** Begin Patch\n*** Add File: src/b.py\n+x\n*** End Patch\n"
-        payload = {"tool_name": "Edit", "tool_input": patch_text, "cwd": str(self.wt)}
-        self.assertIn("denied", zeddeny.decide(payload, self.manifests["review"], self.wt, self.profile))
-        self.assertIsNone(zeddeny.decide(payload, self.manifests["build"], self.wt, self.profile))
-        record = f"*** Begin Patch\n*** Update File: {self.profile}/employees/quill/employee.md\n@@\n-a\n+b\n*** End Patch\n"
-        payload["tool_input"] = record
-        self.assertIn("zed-employee", zeddeny.decide(payload, self.manifests["build"], self.wt, self.profile))
-        payload["tool_input"] = "not a patch"
-        self.assertIn("names no file", zeddeny.decide(payload, self.manifests["qa"], self.wt, self.profile))
-        self.assertIsNone(zeddeny.decide(payload, self.manifests["build"], self.wt, self.profile))
+    def test_opencode_tool_names_and_apply_patch_text_are_checked(self):
+        src = str(self.wt / "src" / "a.py")
+        self.assertIn("denied", self.call("review", "edit", filePath=src))  # OpenCode names its tools in lower case
+        self.assertIn("denied", self.call("review", "apply_patch", patchText=f"*** Begin Patch\n*** Update File: {src}\n@@\n-a\n+b\n*** End Patch"))
+        self.assertIn("denied", self.call("qa", "apply_patch", patchText=f"*** Add File: {self.wt}/new.py\n+x\n"))
+        self.assertIn("denied", self.call("review", "apply_patch", patchText=f"*** Add File: {self.evidence}/ok.md\n+x\n*** Delete File: {src}\n"))
+        self.assertIsNone(self.call("review", "apply_patch", patchText=f"*** Add File: {self.evidence}/ok.md\n+x\n"))
+        self.assertIsNone(self.call("build", "apply_patch", patchText=f"*** Update File: {src}\n"))
+        self.assertIn("denied", self.call("review", "bash", command="gh pr comment 1"))
 
     def test_glob_regex(self):
         self.assertTrue(zeddeny.glob_regex("**").match("a/b/c.py"))
-        self.assertTrue(zeddeny.glob_regex("employees/**").match("employees/quill/x.md"))
-        self.assertFalse(zeddeny.glob_regex("employees/**").match("config/x.md"))
+        self.assertTrue(zeddeny.glob_regex("briefs/**").match("briefs/sub/x.md"))
+        self.assertFalse(zeddeny.glob_regex("briefs/**").match("config/x.md"))
         self.assertFalse(zeddeny.glob_regex("*.py").match("a/b.py"))
         self.assertTrue(zeddeny.glob_regex("*.py").match("b.py"))
+
+
+@unittest.skipUnless(shutil.which("node"), "node is needed to run the OpenCode plugin")
+class OpenCodePluginTests(unittest.TestCase):
+    """The generated plugin, run for real under node with the hook object OpenCode would call it with."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        (self.root / "wt").mkdir()
+        self.plugin = zeddeny.opencode_plugin(self.root / "cfg", HOME) / "plugins" / "zed-deny.js"
+
+    def before(self, tool, args, hat="review"):
+        script = (f'import {{ ZedDeny }} from {json.dumps(self.plugin.as_uri())};\n'
+                  f'const h = await ZedDeny({{ directory: {json.dumps(str(self.root / "wt"))} }});\n'
+                  f'try {{ await h["tool.execute.before"]({{ tool: {json.dumps(tool)} }}, {{ args: {json.dumps(args)} }}); console.log("allowed"); }}\n'
+                  f'catch (e) {{ console.log("blocked: " + e.message); }}\n')
+        env = {**os.environ, "ZED_HAT": hat, "ZED_WORKTREE": str(self.root / "wt"), "ZED_PROFILE_DIR": str(self.root / "profile")}
+        return subprocess.run(["node", "--input-type=module", "-e", script], env=env, capture_output=True, text=True).stdout.strip()
+
+    def test_a_denied_call_throws_the_reason_and_an_allowed_one_passes(self):
+        self.assertIn("blocked: zed-deny: editing", self.before("edit", {"filePath": str(self.root / "wt" / "a.py")}))
+        self.assertIn("blocked: zed-deny: `gh pr comment` is denied", self.before("bash", {"command": "gh pr comment 1"}))
+        self.assertEqual(self.before("bash", {"command": "ls"}), "allowed")
+        self.assertEqual(self.before("edit", {"filePath": str(self.root / "wt" / "a.py")}, hat="build"), "allowed")
 
 
 class HookScriptTests(unittest.TestCase):
@@ -209,28 +288,27 @@ class HookScriptTests(unittest.TestCase):
             return deny.main(list(argv)), err.getvalue()
 
     def test_exit_2_with_the_reason_on_stderr_for_a_denied_call(self):
-        env = {"ZED_EMPLOYEE": "quill", "ZED_HAT": "review", "ZED_WORKTREE": "/nonexistent-wt"}
+        env = {"ZED_HAT": "review", "ZED_WORKTREE": "/nonexistent-wt"}
         code, err = self.run_hook({"tool_name": "Bash", "tool_input": {"command": "gh pr comment 1"}}, env)
         self.assertEqual(code, 2)
         self.assertIn("zed-deny: `gh pr comment` is denied", err)
 
-    def test_allowed_calls_and_non_employee_sessions_pass(self):
-        env = {"ZED_EMPLOYEE": "quill", "ZED_HAT": "review", "ZED_WORKTREE": "/nonexistent-wt"}
+    def test_allowed_calls_and_sessions_without_a_hat_pass(self):
+        env = {"ZED_HAT": "review", "ZED_WORKTREE": "/nonexistent-wt"}
         self.assertEqual(self.run_hook({"tool_name": "Bash", "tool_input": {"command": "git log"}}, env)[0], 0)
         plain = {"tool_name": "Bash", "tool_input": {"command": "gh pr comment 1"}}
         with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("ZED_EMPLOYEE", None)
             os.environ.pop("ZED_HAT", None)
             self.assertEqual(self.run_hook(plain, {})[0], 0)
 
     def test_unknown_hat_allows_but_garbage_input_denies(self):
-        env = {"ZED_EMPLOYEE": "quill", "ZED_HAT": "juggle"}
+        env = {"ZED_HAT": "juggle"}
         self.assertEqual(self.run_hook({"tool_name": "Bash", "tool_input": {"command": "gh pr comment 1"}}, env)[0], 0)
-        with patch.dict(os.environ, {"ZED_EMPLOYEE": "quill", "ZED_HAT": "review"}), patch.object(sys, "stdin", io.StringIO("{oops")), redirect_stderr(io.StringIO()):
+        with patch.dict(os.environ, {"ZED_HAT": "review"}), patch.object(sys, "stdin", io.StringIO("{oops")), redirect_stderr(io.StringIO()):
             self.assertEqual(deny.main([]), 2)
 
     def test_explain_prints_the_decision(self):
-        env = {"ZED_EMPLOYEE": "quill", "ZED_HAT": "review", "ZED_WORKTREE": "/nonexistent-wt"}
+        env = {"ZED_HAT": "review", "ZED_WORKTREE": "/nonexistent-wt"}
         out = io.StringIO()
         with patch("sys.stdout", out):
             code, _ = self.run_hook({"tool_name": "Bash", "tool_input": {"command": "bb pr comment 1"}}, env, "--explain")

@@ -10,7 +10,7 @@ they need is connected and verified, and all of it lives in `profile/` on branch
 The no-assumption rule applies in full: write down only what the user said or what you verified.
 
 1. **Welcome and check the machine.** Say who Zed is in two or three sentences (an assistant that
-   delegates engineering work to AI workers (Claude Code and/or GitHub Copilot CLI) in herdr,
+   delegates engineering work to AI workers (Claude Code) in herdr,
    tracks everything, asks before anything goes out). Run `bin/zed-setup` and get anything it
    reports missing fixed first (the user runs installs/logins themselves; in Claude Code with
    `! <command>`).
@@ -19,10 +19,7 @@ The no-assumption rule applies in full: write down only what the user said or wh
    - Name, role, organisation, team/product; time zone.
    - What they want Zed for, and which decisions they want to make themselves vs. leave to Zed.
    - How they like to be talked to (length, tone, what to lead with).
-   - Agent runtimes: do they have Claude Code (which plan), GitHub Copilot CLI (which plan), or
-     both? With both: which to use first. How workers' models should be chosen (`models` skill:
-     a fixed model, the CLI default, or the attractive-quadrant policy) and, for Copilot workers,
-     the permission mode (assisted / allow-all with a deny-list / manual, see `playbook.md`).
+   - Claude Code: which plan, and which model and effort ceiling workers should use (`config/claude.json`).
    - Tools and accounts: code hosts (GitHub, Bitbucket, GitLab…), ticket tracker, wiki, chat, email,
      anything else workers will touch. For each: their handle and how they use it.
    - Repos: name, local path (or where to clone), what each is, which branches are staging /
@@ -37,18 +34,15 @@ The no-assumption rule applies in full: write down only what the user said or wh
    - `git switch main && git switch -c profile/<name>` (`<name>`: short, lowercase, e.g. first name).
    - `cp -R profile.template profile`, then fill `profile/profile.md`, `rules.md`,
      `knowledge/domain.md` (rename to the product if you like), `knowledge/people.md`,
-     `config/projects.json`, `config/settings.json` and `config/runtimes.json` (`order`: only the
-     runtimes they have, preferred first) from the answers. Delete placeholder lines
+     `config/projects.json`, `config/settings.json` and `config/claude.json` from the answers. Delete placeholder lines
      you have no answer for, and the guidance comments once a file is filled. Keep
      `knowledge/README.md` matching the files that exist.
    - `bin/zed lock acquire` (this session becomes the profile's one active Zed), then `bin/zed status`
      creates the task DB and `profile/STATUS.md`.
 
 4. **Connect and verify every account** the user named. Never store a secret in the repo.
-   - Each agent runtime they have, by starting a session the way workers will run it: e.g.
-     `claude -p "Reply OK"` and `copilot -p "Reply OK" -s` (each uses a little of their plan, so
-     ask first; if login is needed they run `claude` / `copilot login` themselves). Then
-     `bin/zed runtime status` must show each one `installed` and `enabled`.
+   - Claude Code, by starting a session the way workers will run it: `claude -p "Reply OK"` (it uses a little of
+     their plan, so ask first; if login is needed they run `claude` themselves).
    - GitHub: `gh auth status` (if needed the user runs `! gh auth login`); check `gh api user` matches
      their handle.
    - Bitbucket: Atlassian API token in the macOS Keychain — give them the exact command from

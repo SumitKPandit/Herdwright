@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""zed-deny — PreToolUse hook that enforces an employee's hat policy (the `deny` block of its capabilities.json).
+"""zed-deny — PreToolUse hook that enforces a hat's policy (the `deny` block of its capabilities.json).
 
-Runs on both runtimes (Claude Code `--settings`, Copilot `--plugin-dir`; spawn writes the files). It acts only in a
-session that has ZED_EMPLOYEE and ZED_HAT in its environment; every other session passes untouched. It reads the hook
-JSON on stdin and, to deny, writes the reason to stderr and exits 2 (both runtimes block on that and show the reason
+Runs as a Claude Code hook (`--settings`; spawn writes the file). It acts only in a
+session that has ZED_HAT in its environment; every other session passes untouched. It reads the hook
+JSON on stdin and, to deny, writes the reason to stderr and exits 2 (Claude Code blocks on that and shows the reason
 to the model). An unknown hat allows the call (no policy); any other internal error denies it (fails closed).
 
 It denies, per the hat: edits matching `deny.edit` (`**` = nothing in the worktree), shell commands starting with a
 `deny.commands` prefix, shell writes (redirects, rm/mv/cp/tee..., sed -i) to a denied path, git writes in the worktree
 for a hat that may not edit (the worktree, and the checkout holding the profile), subagents when `subagents` is `none`;
-for every hat edits to profile/employees/**. `deny.except` globs stay writable inside a denied area (review/qa: their plan,
+`deny.except` globs stay writable inside a denied area (review/qa: their plan,
 findings draft and status log); a command starting with a `deny.gated` prefix (`gh pr create`) runs only once
 `bin/zed gate check HEAD` passes.
 Not caught: a script that writes files itself (python -c ...). `bin/zed-guard` still guards git.
 
-Test:  echo '{"tool_name":"Bash","tool_input":{"command":"gh pr comment 1"}}' | ZED_EMPLOYEE=quill ZED_HAT=review zed-deny --explain
+Test:  echo '{"tool_name":"Bash","tool_input":{"command":"gh pr comment 1"}}' | ZED_HAT=review zed-deny --explain
 """
 import argparse
 import json
@@ -33,11 +33,11 @@ def main(argv=None):
     ap.add_argument("--explain", action="store_true", help="print the decision in words and exit 0")
     a = ap.parse_args(argv)
     hat = os.environ.get("ZED_HAT")
-    if not (os.environ.get("ZED_EMPLOYEE") and hat):
+    if not hat:
         return 0
     try:
         manifest = emp.load_manifest(hat)
-    except emp.EmployeeError:
+    except emp.HatError:
         return 0  # an unknown hat has no policy to enforce
     try:
         payload = json.load(sys.stdin)

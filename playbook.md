@@ -1,136 +1,45 @@
 # Playbook — lessons for every Zed
 
-Core lessons about tools and workflow that make any Zed a better assistant, whoever its user is.
-Facts about a particular user or their work never go here (they go to the profile; see the
-`learn` skill). Each entry: the lesson, **Why**, **How to apply**. Newest last.
+Core lessons about tools and workflow. Facts about a user or their work go to the profile (`learn` skill).
+Anything a script or hook can enforce is code, not a line here.
 
-- **macOS Keychain: never paste a long secret at the interactive prompt.**
-  `security add-generic-password ... -w` with no value prompts, and that prompt silently truncates
-  input at 128 characters. **Why:** API tokens (e.g. Atlassian) are longer; the stored token is
-  then wrong and auth fails with 401s. **How:** copy the token and pass it inline:
-  `security add-generic-password -U -s <service> -a <account> -w "$(pbpaste)"`.
-- **Fresh worktrees trigger Claude Code's folder-trust dialog.** **Why:** a worker started in a
-  new directory waits on "Do you trust this folder?" and never reads its brief. **How:**
-  `bin/zed spawn` accepts the dialog automatically for worktrees Zed itself created from a
-  configured repo. Anything else that blocks a worker stays blocked for Zed to inspect and ask.
-- **Auto-mode may block pushing third-party or employer data to personal remotes.** **Why:** the
-  permission classifier treats it as possible data exfiltration. **How:** keep a user's work data
-  in their profile and push the profile branch only to a remote the user has confirmed is the
-  right home for it; if a push is blocked, tell the user rather than working around it.
-- **`timeout` isn't available on macOS.** **Why:** it's GNU coreutils. **How:** use the tool's
-  own timeout flag (e.g. `herdr ... --timeout <ms>`), or the Monitor tool's timeout for long waits.
-- **Keep core and profile changes in separate commits.** **Why:** `bin/zed-core-sync` can only
-  carry commits that touch nothing under `profile/` to `main`. **How:** stage by path
-  (`git add profile/` vs. everything else) and commit twice when a change spans both.
-- **Sleep (macOS):** each Claude Code session runs `caffeinate -i` while it's working, so idle
-  sleep is already prevented whenever any worker (or Zed) is mid-turn. Closing the lid, choosing
-  Sleep, or a flat battery still sleeps the machine; everything pauses and resumes on wake, but
-  in-flight API calls may fail — after a wake, run `check-workers` and nudge any worker that
-  stopped on an error. To survive lid-close, the Mac must be on power with an external display
-  (clamshell) — don't change system power settings without the user's OK.
-- **Quota limits are runtime/account-specific; connectors must follow runtime handoffs.**
-  Workers sharing an account draw on that account's limit, not every available runtime's quota.
-  **Why:** a model-client limit does not establish that an independent runtime or MCP service is
-  unavailable. **How:** use the available approved runtime and verify its own MCP configuration
-  and authenticated tools. Resolve missing supported connector setup instead of waiting for the
-  other runtime's reset; surface the exact OAuth/consent step if needed. Never transfer credentials
-  between clients or bypass authentication. Stop the old writer before resuming its replacement.
-- **Tool-call shells are not persistent coordinator identities.** **Why:** a terminal tool may
-  start a fresh shell for each call; a lock owned by that shell becomes stale when it exits.
-  **How:** `bin/zed` takes the identity from the runtime's persistent session (Claude Code:
-  `CLAUDE_CODE_SESSION_ID` / `CLAUDE_PID`; Copilot CLI: `COPILOT_AGENT_SESSION_ID` /
-  `COPILOT_LOADER_PID`), so no manual override is needed; don't set `CLAUDE_PID` by hand under
-  Copilot. Verify ownership again from a separate tool call (`bin/zed lock status`).
-- **A one-shot watcher event is work to handle, not monitoring left running.** **Why:** the
-  watcher exits after delivering a checkpoint; replying to another message without processing
-  it and re-arming leaves workers silently paused. **How:** inspect every affected worker,
-  resolve already-authorized routine requests or surface the exact decision needed, verify the
-  resulting state, then re-arm exactly one watcher while tracked work remains. Check that it
-  is waiting, not merely that it printed a startup line before exiting with another event.
-  Keep health polling inside the background process. Scheduled chat prompts are visible turns
-  in the user's conversation, not a silent watchdog; do not substitute them without explicit
-  consent. Monitoring must stop when the coordinator loses the role or tracked work ends.
-- **Use native usage reports for Copilot AI-credit totals.** **Why:** raw session telemetry
-  (`total_nano_aiu`) is not interchangeable with the CLI's displayed AI Credits. **How:** capture
-  the completed session's `/usage`, record that total and its provenance, and label any interim
-  telemetry separately instead of converting it into a claimed billed-credit figure.
-- **Usage limits are shared per runtime.** Zed and every worker (and their sub-agents) on the same
-  runtime draw on the same plan: all Claude sessions share the claude.ai plan limit, all Copilot
-  sessions share the Copilot plan's AI credits. Hitting a limit pauses everything on that runtime
-  until reset (Claude workers auto-continue after the reset; sub-agents may need a restart). Size
-  parallel waves to the plan, tell the user when a limit pauses work, and after a reset check that
-  each worker actually resumed. With both runtimes, see the `switch-runtime` skill.
-- **Copilot CLI: never autopilot.** **Why:** in autopilot, Copilot's ask-the-user tool doesn't
-  wait; it returns "Making best guess on autopilot", which breaks the no-assumption rule. **How:**
-  Zed and its workers run `--mode interactive`. Workers are told to ask only via ZED:QUESTION.
-- **Copilot CLI wakes on a detached shell's completion.** **Why:** there is no Monitor tool; a
-  background shell started detached sends a "Detached shell … completed" notification that starts
-  a new turn even when the session is idle. **How:** Zed under Copilot runs `bin/zed watch --once`
-  detached and re-arms it after each wake-up.
-- **Copilot CLI workers need their rules and paths passed explicitly.** **Why:** there's no
-  system-prompt flag, and file access is limited to the working directory. **How:** `spawn` writes
-  the worker rules to `<profile>/.cache/copilot-instructions/zed-worker.instructions.md`, passes
-  that folder in `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` (via `herdr workspace create --env`), and adds
-  `--add-dir` for the profile and Zed's home. Its folder-trust dialog ("Do you trust the files in
-  this folder?") is accepted for worktrees Zed created.
-- **Copilot's Assisted Permissions judge the conversation, not the brief.** **Why:** the reviewer
-  approves what the human asked for in the session's messages. It escalated a worker's file writes,
-  commits and even `printf` checks because the authority sat in the brief file. It also approved an
-  explicitly requested `git push --force`. **How:** it isn't a substitute for the worker rules or the
-  git guards. `--deny-tool` (`deny_tools` in `runtimes.json`) is the only hard block; expect
-  approval dialogs (herdr `blocked`) and relay them to the user. Interactive sessions can only enter
-  Assisted mode through `/permissions` (the `--assisted-approval` flag is prompt-mode only), and
-  `spawn` does that.
-- **Claude Code's auto mode may refuse to launch unrestricted agents.** **Why:** its safety check
-  treats starting another agent with all permissions (e.g. `copilot --allow-all-tools`), or wording
-  a prompt to pre-authorise another agent's permission reviewer, as unsafe. **How:** don't work
-  around it; ask the user, who can choose the permission mode in `runtimes.json` or add a
-  permission rule.
-- **Herdr can report `agent_prompt_stalled` before Copilot starts a submitted prompt.** **Why:**
-  the activity gate expires after five seconds, but the prompt may already be in the transcript
-  and start shortly afterwards. **How:** inspect the agent's state and state-change sequence;
-  `spawn` allows a short observation window. Never blindly submit the same brief again.
-- **Keep coordinator QA separate from worker fixtures.** **Why:** workers correctly refuse
-  coordinator lock and watcher duties, even in a throwaway profile. **How:** launch a separate,
-  explicitly scoped coordinator fixture with its own instructions and the throwaway profile.
-  Before any UI action, re-read the agent's current state and screen; never answer a stale dialog.
-- **A worker's permission prompts can queue, and the watcher reports a block only once.** **Why:**
-  after I approved one prompt, more followed (6 queued), `watch --once` stayed silent because the
-  session was already reported as blocked, and the worker idled unnoticed. **How:** after every
-  approval, read the screen again until the agent is `working` and no prompt is showing, before
-  re-arming. Read each prompt before answering; never send a blind "don't ask again" or Down+Enter.
-  While a worker is blocked, check `bin/zed session list` for `agent=blocked` on every turn.
-- **A replacement worker should resume the work, not rebuild the setup.** **Why:** on a long
-  multi-unit task, each new session spent its first stretch re-reading the earlier session's state
-  and rewriting the pipeline docs and tools, so a full day produced 3 of 76 units. **How:** in the
-  handoff or the first prompt, say: trust the recorded state; change tooling only when a run fails;
-  start producing within a fixed time; scripts for mechanical steps, model calls only for judgment;
-  report throughput early and progress per unit. Check the first progress report, and step in if
-  the worker is still changing its setup.
-- **Claude Stop hooks: `asyncRewake` can wake the session; exit 2 only on real events.** Verified with
-  real `claude -p` runs: a `Stop` hook with `asyncRewake` that exits 2 re-enters the model with its
-  stderr, then fires again at the next Stop, so a hook that always exits 2 loops forever. A hook that
-  exits 2 within about a second of the Stop was not seen to wake an interactive session (not fully
-  verified). **How:** exit 2 only for new events, make the hook single-flight (one watcher, an `flock`),
-  and keep un-acked events in a durable queue so a lost wake costs nothing.
-- **Never run an unbounded test or experiment.** **Why:** a hung run costs minutes of a worker's time and
-  nothing is read until it returns. **How:** run one test file at a time under a time limit
-  (`perl -e 'alarm 60; exec @ARGV' python3 -m unittest …`, since `timeout` is absent), use throwaway
-  `ZED_PROFILE_DIR`s, and stop your own background runs by PID or `TaskStop`, never `pkill -f` on a
-  pattern that other sessions' processes (watchers, hooks) also match.
-- **PR review posting.** `gh pr review <n> -R <owner>/<repo> --approve -b "<text>"` prints nothing on
-  success; verify with `gh pr view --json reviews`. Bitbucket: `bin/bb pr approve <id>` and
-  `bin/bb pr comment <id> --body-file F` (tests/test_zed_gates.py); no raw REST calls.
-- **Relaying an OK to post (auto-mode classifier).** A worker restarted via `handoff restart` had
-  `gh pr review --approve` denied as "Unrequested Commit in a Connected App": the user's OK only lived
-  in the handoff note. Workers that got the OK as a direct prompt posted fine. **How:** relay posting
-  approvals as a direct prompt to the posting session, quoting the user's words verbatim plus the
-  exact action (repo, PR/issue, text). Don't `handoff restart` a worker between the user's OK and its posting. Enforced: `bin/zed relay-post` (bin/lib/zedgates.py `relay_prompt`).
-- **Don't prompt a `working` session unless redirecting it.** The runtime probe (docs/runtimes/*.md) showed
-  `herdr agent prompt` to a working agent is injected at the next tool boundary and the model may drop
-  the rest of its plan. Send routine answers/info only to `idle`/`done` sessions; prompt a working one
-  only when you mean to change what it's doing. Enforced: `bin/zed prompt` refuses `working` without `--redirect`.
-- **Rules that live only in prose get broken.** Enforced in code (bin/lib/zedgates.py, tests/test_zed_gates.py): `spawn` needs `employee=` or
-  `ephemeral=<why>` while one is free; `runtime=copilot` needs Claude limited or `copilot_reason=`; `bin/zed merge`/`gate check` and the git hook `hooks/reference-transaction` (merge commits on `main`/`profile/*`;
-  override `ZED_GATE_OVERRIDE=<reason>` or `merge --override`, logged) need a clean review and qa by non-authors at the head sha; `handoff` of a session
-  without an employee goes to a free one (or `ephemeral=<why>`); `start`/watcher flag core commits unsynced over an hour; `finish --lesson` needs `--idea` or `--no-idea WHY`.
+- **macOS Keychain: never paste a long secret at the interactive prompt.** It truncates at 128 characters, so
+  API tokens end up wrong (401s). Pass it inline: `security add-generic-password -U -s <service> -a <account> -w "$(pbpaste)"`.
+- **Auto-mode may block pushing employer data to personal remotes.** Keep work data in the profile and push the profile
+  branch only to a remote the user confirmed; if a push is blocked, tell the user instead of working around it.
+- **`timeout` isn't available on macOS.** Use the tool's own timeout flag, Monitor's timeout, or
+  `perl -e 'alarm 60; exec @ARGV' …`.
+- **Core and profile changes go in separate commits**, so `bin/zed-core-sync` can carry core-only commits to `main`.
+  Stage by path and commit twice when a change spans both.
+- **Sleep (macOS):** a working Claude session holds `caffeinate -i`. Lid-close, Sleep or a flat battery still pauses
+  everything and in-flight API calls may fail: after a wake run `check-workers` and nudge workers that stopped on an error.
+- **Usage limits are shared.** Zed and every worker (and sub-agent) draw on the same Claude plan, so a limit pauses all of
+  them until it resets. Size parallel waves to the plan, tell the user when a limit pauses work, and after a reset check
+  that each worker actually resumed.
+- **A one-shot watcher event is work to handle, not monitoring left running.** Inspect every affected worker, resolve
+  already-authorized routine requests or surface the exact decision, verify the state, then make sure exactly one watcher
+  is armed while tracked work remains. Keep polling inside the background process; scheduled chat prompts are not a watchdog.
+- **A worker's permission prompts can queue, and the watcher reports a block only once.** After each approval read the
+  screen again until the agent is `working` with no prompt showing. Read each prompt before answering; never send a blind
+  "don't ask again". Send approvals as a single standalone `herdr agent send-keys <agent> <key>`.
+- **Do not approve regex-looking root paths.** A search pattern with a leading slash can show up as an absolute access
+  path in a permission dialog: decline it and have the worker correct the query.
+- **Native CLI commands are text, not keys.** `send-keys` rejects `/compact`; use `herdr agent prompt <agent> /compact`
+  without `--wait` at verified idle, and confirm the context fell before resuming.
+- **Herdr can report `agent_prompt_stalled` before the CLI starts a submitted prompt.** Inspect its state and
+  state-change sequence; never submit the same brief again. For a stuck startup, `bin/zed close <S> keep-worktree`
+  preserves unlanded work. Verify real tool/plan activity, not a `Working` label.
+- **A replacement worker should resume the work, not rebuild the setup.** Say so in the first prompt: trust recorded
+  state, change tooling only when a run fails, start producing quickly, scripts for mechanical steps, report throughput early.
+- **Claude Stop hooks: `asyncRewake` wakes the session only when the hook exits 2 with events on stderr.** A hook that always
+  exits 2 loops forever. Exit 2 only for new events, keep the hook single-flight (one watcher, an `flock`), and keep un-acked
+  events in a durable queue.
+- **Never run an unbounded test or experiment.** Run one test file at a time under a time limit, use throwaway
+  `ZED_PROFILE_DIR`s, and stop your own background runs by PID or `TaskStop`, never `pkill -f` on a pattern other sessions match.
+- **Keep coordinator QA separate from worker fixtures.** Workers correctly refuse coordinator lock and watcher duties:
+  launch a separate, explicitly scoped coordinator fixture with the throwaway profile, and re-read its screen before any action.
+- **PR review posting.** `gh pr review <n> -R <owner>/<repo> --approve -b "<text>"` prints nothing on success; verify with
+  `gh pr view --json reviews`. Bitbucket: `bin/bb pr approve|comment`; no raw REST calls. Relay the user's OK to post with
+  `bin/zed relay-post` (their words verbatim plus the exact action).
+- **Review and QA of gated work go to their own sessions** (`spawn … hat=review|qa`); a session that changed the code gives no
+  verdict. Verdicts are about the code outside `profile/`, so a later profile-only commit keeps them. Never turn the gate off to publish.

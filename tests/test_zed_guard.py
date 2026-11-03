@@ -186,6 +186,27 @@ class HookTests(unittest.TestCase):
         self.assertIn("already pointing", again.stderr)
         self.assertTrue(json.loads(cfg.read_text())["gate"])
 
+    def reinstall(self, *flags):
+        return subprocess.run([GUARD, "install", str(self.wt), *flags], capture_output=True, text=True,
+                              env={**os.environ, "ZED_PROFILE_DIR": str(self.r / "no-profile")})
+
+    def test_a_refused_reinstall_without_the_gate_never_turns_an_enabled_gate_off(self):
+        self.install("--jira", "MENT-9", "--gate")
+        cfg = Path(git(self.wt, "config", "--get", "core.hooksPath").stdout.strip()) / "config.json"
+        before = cfg.read_text()
+        again = self.reinstall("--jira", "MENT-9")
+        self.assertEqual(again.returncode, 2)
+        self.assertIn("already pointing", again.stderr)
+        self.assertEqual(cfg.read_text(), before)
+        self.assertTrue(json.loads(cfg.read_text())["gate"])
+
+    def test_only_remove_then_install_switches_the_gate_off(self):
+        self.install("--jira", "MENT-9", "--gate")
+        cfg = Path(git(self.wt, "config", "--get", "core.hooksPath").stdout.strip()) / "config.json"
+        self.assertEqual(subprocess.run([GUARD, "remove", str(self.wt)], capture_output=True, text=True).returncode, 0)
+        self.install("--jira", "MENT-9")
+        self.assertFalse(json.loads(cfg.read_text())["gate"])
+
     def test_a_gated_worktree_refuses_a_push_without_review_and_qa(self):
         profile = self.r / "gate-profile"
         (profile / "db").mkdir(parents=True)

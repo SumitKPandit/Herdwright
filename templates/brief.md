@@ -22,7 +22,10 @@
 ## Plan
 - Before any other work, write `{{PLAN_FILE}}`: a checklist
   (`- [ ] step — done when …`) covering the whole task, in order, with a rough time per step.
-  Steps already finished by an earlier session start as `- [x]`.
+  Steps already finished by an earlier session start as `- [x]`. One line per step (no "1-5 done" ticks); only
+  merge / push / raise-PR steps may stay open when you hand over to review and QA (start their title with the
+  action, or put `[after-review]` in it). End the plan with the fixed line
+  `- [ ] Run zed-employee finish and report (ZED:DONE)`: `zed-employee finish` ticks exactly that line itself.
 - Follow it. Tick each step as soon as it's done. Change the plan only for a concrete reason, and
   record the reason in the file. Zed tracks progress from this file.
 

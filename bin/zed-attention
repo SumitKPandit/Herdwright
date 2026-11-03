@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""zed-attention — what needs the user's attention on GitHub, Bitbucket and Jira (Confluence is noted, not scripted), no model.
+
+Read-only: it never posts, comments or approves. Settings live in the profile's config/settings.json under
+`attention` (accounts, repos, excluded authors); nothing user-specific is in code.
+
+Usage
+  zed-attention [--since ISO|YYYY-MM-DD] [--source github,bitbucket,jira,confluence] [--json]
+      --since   own-PR activity and Jira are looked at from this time (default: `since_hours` ago,
+                `attention.since_hours` in settings, else 24)
+      Review queues (GitHub/Bitbucket) list open PRs with no active approval, split into "reviewed by the user
+      at least once" and "never reviewed", for the configured repos; GitHub also adds any PR that asks the user for review (Bitbucket sees configured repos only).
+      PRs not requested of the user with no activity for `max_age_days` go in their own "stale" sections, never dropped.
+      GitHub shows the 50 most recently updated PRs per search and says so (a note) when there are more.
+      Jira lists "created and assigned to you" issues, not reassignments (the changelog is not read).
+      exit 0 all sources read · 1 a source failed (listed under errors, with the missing scopes when known) · 2 usage/config
+
+Settings (`attention` in config/settings.json)
+  since_hours: hours back for the default --since (24)
+  github:     {"login"?, "repos": ["Org/repo"], "exclude_authors": ["dependabot[bot]"], "include_drafts": false,
+               "max_age_days": 14}
+  bitbucket:  {"workspace", "repos": ["slug"], "exclude_authors": [], "include_drafts": false, "max_age_days": 14}
+  jira:       optional {"account_id", "site"} overrides; by default both come from the token (/myself, /serverInfo)
+Jira connection comes from the top-level `jira` block ({"keychain_service", "keychain_account", "api_base"}): a
+read-only token over REST; if it lacks scopes the source reports them, it is not worked around.
+Confluence has no read token: it is reported as a note ("via MCP, not scripted"), never an error.
+"""
+import argparse
+import datetime
+import json
+import os
+import socket
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import zedattention as za  # noqa: E402
+
+ZED_HOME = Path(__file__).resolve().parent.parent
+PROFILE_DIR = Path(os.environ.get("ZED_PROFILE_DIR") or ZED_HOME / "profile").expanduser().resolve()
+SOURCES = ("github", "bitbucket", "jira")
+CONFLUENCE_NOTE = "Confluence: via MCP, not scripted (no read token)"
+
+
+def load_settings(profile=None):
+    path = (profile or PROFILE_DIR) / "config" / "settings.json"
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text())
+    settings = dict(data.get("attention", {}))
+    if data.get("jira"):
+        settings["jira"] = {**data["jira"], **settings.get("jira", {})}
+    return settings
+
+
+def default_since(settings, now=None):
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    hours = settings.get("since_hours", 24)
+    return (now - datetime.timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def normalize_since(value):
+    """`--since` as a UTC `...Z` timestamp; ValueError when it does not parse."""
+    return za.parse_ts(value + "T00:00:00Z" if len(value) == 10 else value).astimezone(
+        datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def jira_getter(cfg):
+    if not cfg.get("keychain_service"):
+        raise za.SourceError("jira: no keychain_service in settings (top-level `jira` block)")
+    token = za.keychain_token(cfg["keychain_service"])
+
+    def get(path):
+        try:
+            return za.atlassian_get(cfg["keychain_account"], token, cfg["api_base"] + path)
+        except za.SourceError as e:
+            if "scope does not match" in str(e):
+                raise za.SourceError(str(e), za.JIRA_NEEDS) from e
+            raise
+    return get
+
+
+def bitbucket_getter():
+    bb = za.bb_module(Path(__file__).resolve().parent / "bb")
+
+    socket.setdefaulttimeout(za.NETWORK_TIMEOUT)     # process-wide: bb.call opens URLs without a timeout
+
+    def get(path):
+        try:
+            return bb.call("GET", path)
+        except SystemExit as e:          # bb.call dies() on HTTP errors
+            raise za.SourceError(f"bitbucket GET {path.split('?')[0]} failed") from e
+        except (OSError, ValueError) as e:
+            raise za.SourceError(f"bitbucket GET {path.split('?')[0]} failed: {type(e).__name__}") from e
+    return get
+
+
+def _github(cfg, since):
+    notes = []
+    return za.github_items(cfg, since, notes=notes), notes
+
+
+def build_fetchers():
+    return {
+        "github": _github,
+        "bitbucket": lambda cfg, since: za.bitbucket_items(cfg, since, bitbucket_getter()),
+        "jira": lambda cfg, since: za.jira_items(cfg, since, jira_getter(cfg)),
+    }
+
+
+def main(argv=None, settings=None, fetchers=None, out=sys.stdout):
+    ap = argparse.ArgumentParser(prog="zed-attention", description="What needs the user's attention (read-only).")
+    ap.add_argument("--since")
+    ap.add_argument("--source", default=",".join((*SOURCES, "confluence")))
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+    settings = load_settings() if settings is None else settings
+    if not settings:
+        print("zed-attention: no `attention` block in the profile's config/settings.json", file=sys.stderr)
+        return 2
+    sources = [s for s in args.source.split(",") if s]
+    bad = [s for s in sources if s not in (*SOURCES, "confluence")]
+    if bad:
+        print(f"zed-attention: unknown source {bad}", file=sys.stderr)
+        return 2
+    try:
+        since = normalize_since(args.since) if args.since else default_since(settings)
+    except ValueError:
+        print(f"zed-attention: cannot parse --since {args.since!r} (use ISO time or YYYY-MM-DD)", file=sys.stderr)
+        return 2
+    result = za.run(settings, since, [s for s in sources if s in SOURCES], fetchers or build_fetchers())
+    if "confluence" in sources:
+        result["notes"].append(CONFLUENCE_NOTE)
+    print(json.dumps(result, indent=2) if args.json else za.render_text(result), file=out)
+    return 1 if result["errors"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

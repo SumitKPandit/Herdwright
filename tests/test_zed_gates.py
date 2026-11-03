@@ -1,5 +1,5 @@
-"""Lessons turned into code (T25): merge gate, employees first, Claude first, prompt guard, relay-post, core-sync
-check, `bb pr approve|comment`, code-first `finish`. Each gate is tested for the refusal and the allowed case."""
+"""Lessons turned into code: the merge gate (verdicts attach to the code, not the commit), prompt guard, relay-post,
+core-sync check, `bb pr approve|comment`. Each gate is tested for the refusal and the allowed case."""
 import json
 import os
 import shutil
@@ -10,11 +10,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 import _load
-import zedassign
 import zedgates
 import zedlib
 from test_zed_assign import AssignCase
-from test_zed_employee import ProfileCase
 
 HOME = Path(__file__).resolve().parents[1]
 
@@ -25,21 +23,6 @@ class PureGateTests(unittest.TestCase):
             run.return_value = subprocess.CompletedProcess([], 1, "", "no review")
             self.assertEqual(zedgates.gate_reason(HOME), "no review")
         self.assertNotIn("ZED_GATE_OVERRIDE", run.call_args.kwargs["env"])
-
-    def test_spawn_without_employee(self):
-        self.assertIn("juno", zedgates.spawn_without_employee(["juno"], {}))
-        self.assertIsNone(zedgates.spawn_without_employee(["juno"], {"employee": "juno"}))
-        self.assertIsNone(zedgates.spawn_without_employee(["juno"], {"ephemeral": "no employee knows Figma"}))
-        self.assertIn("juno", zedgates.spawn_without_employee(["juno"], {"ephemeral": "  "}))  # a blank reason is no reason
-        self.assertIsNone(zedgates.spawn_without_employee([], {}))
-
-    def test_copilot_before_claude(self):
-        usable = {"installed": True, "enabled": True, "limited": None}
-        self.assertIn("claude is usable", zedgates.copilot_before_claude("copilot", usable, {}))
-        self.assertIsNone(zedgates.copilot_before_claude("copilot", usable, {"copilot_reason": "user asked"}))
-        self.assertIsNone(zedgates.copilot_before_claude("copilot", {**usable, "limited": {"note": "cap"}}, {}))
-        self.assertIsNone(zedgates.copilot_before_claude("copilot", {**usable, "enabled": False}, {}))
-        self.assertIsNone(zedgates.copilot_before_claude("claude", usable, {}))
 
     def test_prompt_refusal(self):
         self.assertIn("working", zedgates.prompt_refusal("working", False))
@@ -60,12 +43,6 @@ class PureGateTests(unittest.TestCase):
         text = zedgates.relay_prompt('say "go"\nthen stop', "post it")
         self.assertIn('    say "go"\n    then stop\n', text)
 
-    def test_core_sync_stale(self):
-        self.assertTrue(zedgates.core_sync_stale(1000, 1000 + 3601))
-        self.assertFalse(zedgates.core_sync_stale(1000, 1000 + 3600))
-        self.assertFalse(zedgates.core_sync_stale(None, 10 ** 9))
-
-
 class GateCase(AssignCase):
     """A branch with a commit, and session rows seeded for build/review/qa."""
 
@@ -75,100 +52,319 @@ class GateCase(AssignCase):
         for cmd in (["config", "user.email", "t@t"], ["config", "user.name", "t"], ["add", "."], ["commit", "-qm", "work"]):
             zedlib.git(self.worktree, *cmd)
         self.sha = zedlib.git(self.worktree, "rev-parse", "HEAD").stdout.strip()
+        self.tree = zedlib.core_tree(self.worktree)
 
-    def row(self, hat, employee, verdict=None, sha=None, status="finished"):
+    def row(self, hat, verdict=None, tree=None, core_start="same", status="finished"):
+        """A session row. A reviewer that left the code alone began with the tree it gave its verdict about (`core_start="same"`)."""
+        core_start = tree if core_start == "same" else core_start
         cur = self.conn.execute(
-            "INSERT INTO sessions(task_id,repo,base,branch,worktree,agent,status,employee,hat,verdict,verdict_sha,created_at,updated_at) "
+            "INSERT INTO sessions(task_id,repo,base,branch,worktree,agent,status,hat,verdict,verdict_tree,core_start,created_at,updated_at) "
             "VALUES (20,'api','main',?,?,?,?,?,?,?,?,'2026-10-27 10:00','2026-10-27 10:00')",
-            (self.branch, str(self.worktree), f"{employee}-{hat}", status, employee, hat, verdict, sha))
+            (self.branch, str(self.worktree), f"{hat}-t20", status, hat, verdict, tree, core_start))
         self.conn.commit()
         return cur.lastrowid
 
-    def problems(self, sha=None):
-        return zedgates.merge_problems(self.conn, sha or self.sha)
+    def problems(self, tree=None):
+        return zedgates.merge_problems(self.conn, tree or self.tree)
 
 
 class MergeGateTests(GateCase):
     def test_refused_without_any_verdict(self):
-        self.row("build", "juno")
+        self.row("build")
         self.assertEqual(len(self.problems()), 2)
 
-    def test_allowed_with_clean_review_and_qa_by_non_authors(self):
-        self.row("build", "juno")
-        self.row("review", "quill", "clean", self.sha)
-        self.row("qa", "pip", "clean", self.sha)
+    def test_allowed_with_clean_review_and_qa(self):
+        self.row("build")
+        self.row("review", "clean", self.tree)
+        self.row("qa", "clean", self.tree)
         self.assertEqual(self.problems(), [])
 
     def test_refused_when_one_hat_is_missing_or_has_blockers(self):
-        self.row("build", "juno")
-        self.row("review", "quill", "clean", self.sha)
+        self.row("build")
+        self.row("review", "clean", self.tree)
         self.assertIn("no qa verdict", self.problems()[0])
-        self.row("qa", "pip", "blockers", self.sha)
+        self.row("qa", "blockers", self.tree)
         self.assertIn("not clean", self.problems()[0])
 
     def test_a_later_blockers_verdict_overrides_an_earlier_clean_one(self):
-        self.row("build", "juno")
-        self.row("review", "quill", "clean", self.sha)
-        self.row("qa", "pip", "clean", self.sha)
+        self.row("build")
+        self.row("review", "clean", self.tree)
+        self.row("qa", "clean", self.tree)
         self.assertEqual(self.problems(), [])
-        self.row("review", "pip", "blockers", self.sha)  # a second reviewer, same commit
+        self.row("review", "blockers", self.tree)  # a second reviewer, same code
         self.assertIn("review of", self.problems()[0])
-        self.row("review", "quill", "clean", self.sha)  # and a later clean re-run clears it
+        self.row("review", "clean", self.tree)  # and a later clean re-run clears it
         self.assertEqual(self.problems(), [])
 
-    def test_refused_when_the_verdict_was_for_an_older_head(self):
-        self.row("build", "juno")
-        self.row("review", "quill", "clean", "0" * 40)
-        self.row("qa", "pip", "clean", "0" * 40)
+    def test_refused_when_the_verdict_was_for_other_code(self):
+        self.row("build")
+        self.row("review", "clean", "0" * 40)
+        self.row("qa", "clean", "0" * 40)
         self.assertEqual(len(self.problems()), 2)
 
-    def test_refused_when_the_reviewer_authored_the_work(self):
-        self.row("build", "juno")
-        self.row("build", "quill")  # quill fixed it, so quill is an author too
-        self.row("review", "quill", "clean", self.sha)
-        self.row("qa", "pip", "clean", self.sha)
+    def test_a_verdict_row_of_an_author_hat_never_counts(self):
+        """The author can never review or QA their own task: only a review or qa session's verdict is evidence."""
+        for hat in ("build", None):
+            self.conn.execute("DELETE FROM sessions")
+            self.row(hat, "clean", self.tree)  # forced into the DB: a build/no-hat session carrying a "review" verdict
+            self.row("qa", "clean", self.tree)
+            self.conn.execute("UPDATE sessions SET hat=? WHERE id=1", (hat,))
+            self.assertEqual(len(self.problems()), 1, hat)
+            self.assertIn("no review verdict", self.problems()[0])
+
+    def test_a_review_that_changed_the_code_is_not_independent(self):
+        self.row("build")
+        self.row("review", "clean", self.tree, core_start="1" * 40)  # it began with other code than it judged
+        self.row("qa", "clean", self.tree)
         self.assertIn("review of", self.problems()[0])
 
     def test_gate_check_command_exit_codes(self):
-        self.row("build", "juno")
+        self.row("build")
         with self.assertRaises(SystemExit) as e:
             self.z.cmd_gate(["check", self.branch, str(self.repo)])
         self.assertEqual(e.exception.code, 1)
         self.assertIn("merge gate: no review verdict", self.output.getvalue())
-        self.row("review", "quill", "clean", self.sha)
-        self.row("qa", "pip", "clean", self.sha)
+        self.row("review", "clean", self.tree)
+        self.row("qa", "clean", self.tree)
         with self.assertRaises(SystemExit) as e:
             self.z.cmd_gate(["check", self.branch, str(self.repo)])
         self.assertEqual(e.exception.code, 0)
 
     def test_merge_command_refuses_then_merges_past_the_gate(self):
-        self.row("build", "juno")
+        self.row("build")
         with self.assertRaises(SystemExit):
             self.z.cmd_merge([self.branch, str(self.repo)])
         self.assertIn("refused", self.output.getvalue())
         self.assertFalse((self.repo / "x.txt").exists())
-        self.row("review", "quill", "clean", self.sha)
-        self.row("qa", "pip", "clean", self.sha)
+        self.row("review", "clean", self.tree)
+        self.row("qa", "clean", self.tree)
         with self.assertRaises(SystemExit) as e:
             self.z.cmd_merge([self.branch, str(self.repo)])
         self.assertEqual(e.exception.code, 0)
         self.assertTrue((self.repo / "x.txt").exists())
         self.assertIn("gate passed", self.conn.execute("SELECT text FROM events WHERE kind='merge'").fetchone()[0])
 
+    def test_merge_refuses_a_conflicting_branch_and_leaves_the_checkout_untouched(self):
+        self.row("build")
+        self.row("review", "clean", self.tree)
+        self.row("qa", "clean", self.tree)
+        (self.repo / "x.txt").write_text("other\n")
+        for cmd in (["add", "."], ["commit", "-qm", "conflicting"]):
+            zedlib.git(self.repo, *cmd)
+        head = zedlib.git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        with self.assertRaises(SystemExit) as e:
+            self.z.cmd_merge([self.branch, str(self.repo), "--override", "even overridden"])
+        self.assertNotEqual(e.exception.code, 0)
+        self.assertEqual(zedlib.git(self.repo, "rev-parse", "HEAD").stdout.strip(), head)
+        self.assertEqual(zedlib.git(self.repo, "status", "--porcelain").stdout, "")
+        self.assertFalse((self.repo / ".git" / "MERGE_HEAD").exists())
+        self.assertIsNone(self.conn.execute("SELECT 1 FROM events WHERE kind='merge'").fetchone())
+
     def test_merge_override_is_logged_with_its_reason(self):
-        self.row("build", "juno")
+        self.row("build")
         with self.assertRaises(SystemExit) as e:
             self.z.cmd_merge([self.branch, str(self.repo), "--override", "user said so"])
         self.assertEqual(e.exception.code, 0)
         self.assertIn("gate overridden: user said so", self.conn.execute("SELECT text FROM events WHERE kind='merge'").fetchone()[0])
 
-
     def test_gate_check_env_override_is_logged(self):
-        self.row("build", "juno")
+        self.row("build")
         with patch.dict(os.environ, {"ZED_GATE_OVERRIDE": "user said so"}), self.assertRaises(SystemExit) as e:
             self.z.cmd_gate(["check", self.branch, str(self.repo)])
         self.assertEqual(e.exception.code, 0)
         self.assertIn("user said so", self.conn.execute("SELECT text FROM events WHERE kind='merge'").fetchone()[0])
+
+
+class CoreTreeTests(unittest.TestCase):
+    """A verdict is about the code outside profile/: a profile-only commit keeps it, any other change replaces it."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Path(tmp.name).resolve()
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "t@t")
+        self.git("config", "user.name", "t")
+        self.write("bin/zed", "core\n")
+        self.write("profile.template/profile.md", "template\n")
+        self.write("profile/profile.md", "mine\n")
+        self.commit("init")
+
+    def git(self, *a):
+        return subprocess.run(["git", "-C", str(self.repo), *a], capture_output=True, text=True, check=True).stdout.strip()
+
+    def write(self, name, text):
+        path = self.repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def commit(self, msg):
+        self.git("add", ".")
+        self.git("commit", "-qm", msg)
+
+    def tree(self, rev="HEAD"):
+        return zedlib.core_tree(self.repo, rev)
+
+    def test_a_profile_only_commit_keeps_the_hash_and_a_core_change_replaces_it(self):
+        before = self.tree()
+        self.write("profile/lessons.md", "learned\n")
+        self.write("profile/briefs/T1.md", "brief\n")
+        self.commit("profile only")
+        self.assertEqual(self.tree(), before)
+        self.write("bin/zed", "core changed\n")
+        self.commit("core change")
+        self.assertNotEqual(self.tree(), before)
+
+    def test_a_template_change_or_a_new_core_file_replaces_it(self):
+        before = self.tree()
+        self.write("profile.template/profile.md", "template v2\n")
+        self.commit("template")
+        second = self.tree()
+        self.assertNotEqual(second, before)
+        self.write("README.md", "new\n")
+        self.commit("readme")
+        self.assertNotEqual(self.tree(), second)
+
+    def test_it_is_deterministic_and_the_same_for_the_same_code_on_two_branches(self):
+        self.git("checkout", "-q", "-b", "other")
+        self.write("profile/x.md", "other branch profile\n")
+        self.commit("profile on other")
+        self.assertEqual(self.tree("other"), self.tree("main"))
+        self.assertEqual(self.tree("other"), self.tree("other"))
+
+    def test_a_repo_that_is_not_zed_keeps_its_profile_directory_in_the_hash(self):
+        other = self.repo / "other"
+        other.mkdir()
+        subprocess.run(["git", "-C", str(other), "init", "-q"], check=True)
+        (other / "profile").mkdir()
+        (other / "profile" / "page.py").write_text("one\n")
+        subprocess.run(["git", "-C", str(other), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(other), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "a"], check=True)
+        first = zedlib.core_tree(other)
+        (other / "profile" / "page.py").write_text("two\n")
+        subprocess.run(["git", "-C", str(other), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "b"], check=True)
+        self.assertNotEqual(zedlib.core_tree(other), first)  # no profile.template here: nothing is ignored
+        self.assertEqual(zedlib.core_tree(other), subprocess.run(["git", "-C", str(other), "rev-parse", "HEAD^{tree}"], capture_output=True,
+                                                                  text=True).stdout.strip())
+
+    def test_outside_git_there_is_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(zedlib.core_tree(tmp))
+
+
+class ZedCheckoutMergeTests(GateCase):
+    """`bin/zed merge` in a Zed-shaped checkout: verdicts given at one head survive a profile-only commit after them and
+    not a core change (T74: a memory-only merge commit used to force two extra review and QA rounds)."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = self.root / "zedcore"
+        self.repo.mkdir()
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "t@t")
+        self.git("config", "user.name", "t")
+        self.write("bin/zed", "core\n")
+        self.write("profile.template/profile.md", "template\n")
+        self.write("profile/profile.md", "mine\n")
+        self.commit("init")
+        self.git("checkout", "-q", "-b", self.branch)
+        self.write("bin/new.py", "feature\n")
+        self.commit("feature")
+        self.tree = zedlib.core_tree(self.repo)
+        self.row("build")
+        self.row("review", "clean", self.tree)
+        self.row("qa", "clean", self.tree)
+        self.git("checkout", "-q", "main")
+
+    def git(self, *a):
+        return subprocess.run(["git", "-C", str(self.repo), *a], capture_output=True, text=True, check=True).stdout.strip()
+
+    def write(self, name, text):
+        path = self.repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def commit(self, msg):
+        self.git("add", ".")
+        self.git("commit", "-qm", msg)
+
+    def on_branch(self, name, text, msg):
+        self.git("checkout", "-q", self.branch)
+        self.write(name, text)
+        self.commit(msg)
+        self.git("checkout", "-q", "main")
+
+    def merge(self):
+        self.output.truncate(0)
+        with self.assertRaises(SystemExit) as e:
+            self.z.cmd_merge([self.branch, str(self.repo)])
+        return e.exception.code
+
+    def test_the_verdicts_pass_at_the_head_they_were_given_at(self):
+        self.assertEqual(self.merge(), 0, self.output.getvalue())
+
+    def test_a_profile_only_commit_after_clean_verdicts_keeps_the_merge_passing(self):
+        self.on_branch("profile/briefs/T1-findings.md", "later notes\n", "profile: notes after the verdicts")
+        self.assertEqual(self.problems(zedlib.core_tree(self.repo, self.branch)), [])
+        self.assertEqual(self.merge(), 0, self.output.getvalue())
+        self.assertTrue((self.repo / "profile" / "briefs" / "T1-findings.md").exists())
+
+    def test_a_core_change_after_the_verdicts_fails_the_merge(self):
+        self.on_branch("bin/more.py", "changed after review\n", "core change after the verdicts")
+        self.assertEqual(self.merge(), 1)
+        self.assertIn("no review verdict recorded for this code", self.output.getvalue())
+        self.assertFalse((self.repo / "bin" / "new.py").exists())
+
+    def test_a_core_change_still_fails_when_a_profile_commit_follows_it(self):
+        self.on_branch("bin/more.py", "changed after review\n", "core change")
+        self.on_branch("profile/x.md", "more\n", "profile commit on top")
+        self.assertEqual(self.merge(), 1)
+
+
+class PushGateTests(GateCase):
+    def test_enabled_guard_pushes_accept_independent_evidence_and_reject_invalid_evidence(self):
+        env = {**os.environ, "ZED_PROFILE_DIR": str(self.profile)}
+        bare = self.root / "remote.git"
+        self.assertTrue(zedlib.git(self.root, "init", "-q", "--bare", str(bare)).ok)
+        install = subprocess.run([str(HOME / "bin/zed-guard"), "install", str(self.worktree),
+                                  "--base", "main", "--gate", "--jira", "MENT-20"],
+                                 capture_output=True, text=True, env=env)
+        self.assertEqual(install.returncode, 0, install.stderr)
+        config = Path(zedlib.git(self.worktree, "rev-parse", "--absolute-git-dir").stdout.strip()) / "zed-hooks/config.json"
+        scenarios = ("clean", "no-verdict", "stale", "blockers", "author-hat", "changed-code")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                self.conn.execute("DELETE FROM sessions")
+                self.conn.commit()
+                self.row("build")
+                if scenario == "no-verdict":
+                    pass
+                elif scenario == "author-hat":
+                    review = self.row("review", "clean", self.tree)
+                    self.row("qa", "clean", self.tree)
+                    self.conn.execute("UPDATE sessions SET hat='build' WHERE id=?", (review,))
+                    self.conn.commit()
+                else:
+                    tree = "0" * 40 if scenario == "stale" else self.tree
+                    self.row("review", "blockers" if scenario == "blockers" else "clean", tree,
+                             core_start="1" * 40 if scenario == "changed-code" else "same")
+                    self.row("qa", "clean", tree)
+                allowed = scenario == "clean"
+                self.assertEqual(self.problems() == [], allowed)
+                gate = subprocess.run([str(HOME / "bin/zed"), "gate", "check", self.sha, str(self.worktree)],
+                                      capture_output=True, text=True, env=env)
+                self.assertEqual(gate.returncode, 0 if allowed else 1, gate.stderr)
+                before = config.read_bytes()
+                self.assertTrue(json.loads(before)["gate"])
+                ref = f"refs/heads/{scenario}"
+                push = subprocess.run(["git", "-C", str(self.worktree), "push", str(bare), f"HEAD:{ref}"],
+                                      capture_output=True, text=True, env=env)
+                self.assertEqual(push.returncode, 0 if allowed else 1, push.stderr)
+                readback = subprocess.run(["git", f"--git-dir={bare}", "show-ref", "--hash", "--verify", ref],
+                                          capture_output=True, text=True, env=env)
+                self.assertEqual(readback.returncode, 0 if allowed else 128, readback.stderr)
+                self.assertEqual(readback.stdout.strip(), self.sha if allowed else "")
+                self.assertEqual(config.read_bytes(), before)
 
 
 class MergeHookTests(unittest.TestCase):
@@ -270,6 +466,7 @@ class MergeHookEndToEndTests(GateCase):
         self.git("checkout", "-q", "-b", self.branch)
         self.commit("b.txt", "feature")
         self.sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.tree = zedlib.core_tree(self.repo, self.sha)
         self.git("checkout", "-q", "-b", "profile/me", "main")
         self.commit("c.txt", "profile work")
 
@@ -288,14 +485,14 @@ class MergeHookEndToEndTests(GateCase):
         return [r[0] for r in self.conn.execute("SELECT text FROM events WHERE kind='merge'")]
 
     def test_refused_then_allowed_by_verdicts_then_override_is_logged(self):
-        self.row("build", "juno")
+        self.row("build")
         r = self.merge()
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("no review verdict recorded", r.stderr)
         self.git("reset", "-q", "--hard", "HEAD")
 
-        self.row("review", "quill", "clean", self.sha)
-        self.row("qa", "pip", "blockers", self.sha)
+        self.row("review", "clean", self.tree)
+        self.row("qa", "blockers", self.tree)
         self.assertNotEqual(self.merge().returncode, 0)
         self.git("reset", "-q", "--hard", "HEAD")
 
@@ -305,124 +502,18 @@ class MergeHookEndToEndTests(GateCase):
         self.assertIn("user said so", " ".join(self.events()))
         self.git("reset", "-q", "--hard", "HEAD~1")
 
-        self.row("qa", "pip", "clean", self.sha)
+        self.row("qa", "clean", self.tree)
         r = self.merge()
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue((self.repo / "b.txt").exists())
 
 
-class HandoffEmployeeTests(GateCase):
-    def hand_off(self, *extra, restart=True):
-        sid = self.row("build", None, status="running")
-        self.conn.execute("UPDATE sessions SET employee=NULL, hat=NULL, workspace_id='w', runtime='claude' WHERE id=?", (sid,))
-        self.conn.commit()
-        (self.profile / "briefs").mkdir(exist_ok=True)
-        with patch.object(self.z, "close_workspace"), patch.object(self.z, "record_credits"), \
-                patch.object(self.z, "record_spend"), patch.object(self.z, "cmd_spawn", return_value=9) as spawn:
-            self.z.cmd_handoff([f"S{sid}", *(["restart"] if restart else []), f"brief={self.brief}", *extra])
-        return spawn.call_args.args[0]
-
-    def test_a_session_without_an_employee_goes_to_a_free_one(self):
-        args = self.hand_off()
-        self.assertTrue(any(a.startswith("employee=") for a in args))
-        self.assertIn("hat=build", args)
-        self.assertFalse(any(a.startswith("ephemeral=") for a in args))
-
-    def test_ephemeral_reason_is_passed_through_while_employees_are_free(self):
-        self.assertIn("ephemeral=no fit", self.hand_off("ephemeral=no fit"))
-
-    def test_no_free_employee_allows_an_ephemeral_handoff(self):
-        with patch.object(zedassign, "free_employees", return_value=[]):
-            args = self.hand_off()
-        self.assertIn("ephemeral=no employee is free", args)
-
-    CLAUDE_USABLE = {"installed": True, "enabled": True, "limited": None}
-
-    def test_handoff_to_copilot_while_claude_is_usable_is_refused_before_closing_anything(self):
-        with patch.object(self.z, "choose_runtime", return_value="copilot"), \
-                patch.object(self.z, "runtime_report", return_value=self.CLAUDE_USABLE), self.assertRaises(SystemExit):
-            self.hand_off(restart=False)
-        self.assertIn("claude is usable", self.output.getvalue())
-        self.assertEqual(self.conn.execute("SELECT status FROM sessions").fetchone()[0], "running")
-
-    def test_handoff_to_copilot_when_claude_is_limited_gives_no_reason_of_its_own(self):
-        with patch.object(self.z, "choose_runtime", return_value="copilot"), \
-                patch.object(self.z, "runtime_report", return_value={**self.CLAUDE_USABLE, "limited": {"note": "cap"}}):
-            args = self.hand_off(restart=False)
-        self.assertFalse(any(a.startswith("copilot_reason=") for a in args))
-
-    def test_handoff_passes_the_callers_copilot_reason(self):
-        with patch.object(self.z, "choose_runtime", return_value="copilot"), \
-                patch.object(self.z, "runtime_report", return_value=self.CLAUDE_USABLE):
-            args = self.hand_off("copilot_reason=user asked for it", restart=False)
-        self.assertIn("copilot_reason=user asked for it", args)
-
-    def test_nothing_eligible_refuses_before_closing_anything(self):
-        with patch.object(zedassign, "suggest", return_value=[]), self.assertRaises(SystemExit):
-            self.hand_off()
-        self.assertIn("none is eligible", self.output.getvalue())
-
-
-class VerdictShaTests(GateCase):
-    def test_head_sha_is_the_worktree_head_and_none_outside_git(self):
-        import zedemployee as emp
-        self.assertEqual(emp.head_sha(self.worktree), self.sha)
-        with tempfile.TemporaryDirectory() as tmp:
-            self.assertIsNone(emp.head_sha(tmp))
-
-    def test_core_sync_event_is_raised_once_per_oldest_commit(self):
-        alerts = {}
-        stale = subprocess.CompletedProcess([], 1, json.dumps({"count": 2, "oldest": 1000}), "")
-        with patch.object(self.z, "run", return_value=stale):
-            self.assertIn("2 core commit(s)", self.z.core_sync_events(alerts)[0])
-            alerts["core_sync"]["checked"] = 0
-            self.assertEqual(self.z.core_sync_events(alerts), [])  # same oldest commit: not again
-        fresh = subprocess.CompletedProcess([], 1, json.dumps({"count": 1, "oldest": 2 * 10 ** 10}), "")
-        with patch.object(self.z, "run", return_value=fresh):
-            alerts["core_sync"]["checked"] = 0
-            self.assertEqual(self.z.core_sync_events(alerts), [])  # younger than an hour
-        with patch.object(self.z, "run", return_value=subprocess.CompletedProcess([], 1, "", "not a profile branch")):
-            alerts["core_sync"]["checked"] = 0
-            self.assertEqual(self.z.core_sync_events(alerts), [])
-
-
-class SpawnGateTests(GateCase):
-    def plain(self, **extra):
-        return self.z.cmd_spawn(["20", "repo=api", "base=main", f"branch={self.branch}", f"brief={self.brief}",
-                                 *[f"{k}={v}" for k, v in extra.items()]])
-
-    def test_spawn_without_employee_is_refused_while_one_is_free(self):
-        with self.assertRaises(SystemExit):
-            self.plain()
-        self.assertIn("employees are free", self.output.getvalue())
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 0)
-
-    def test_ephemeral_reason_allows_it(self):
-        self.assertTrue(self.plain(ephemeral="no employee_fits"))
-
-    def test_copilot_is_refused_while_claude_is_usable_and_allowed_with_a_reason(self):
-        usable = {"runtime": "claude", "installed": True, "enabled": True, "limited": None}
-        with patch.object(self.z, "choose_runtime", return_value="copilot"), \
-                patch.object(self.z, "runtime_report", return_value=usable):
-            with self.assertRaises(SystemExit):
-                self.plain(ephemeral="x")
-            self.assertIn("claude is usable", self.output.getvalue())
-            with patch.object(self.z, "set_copilot_permissions", return_value=None):
-                self.assertTrue(self.plain(ephemeral="x", copilot_reason="user asked for copilot"))
-
-    def test_copilot_is_allowed_when_claude_is_limited(self):
-        limited = {"runtime": "claude", "installed": True, "enabled": True, "limited": {"note": "cap"}}
-        with patch.object(self.z, "choose_runtime", return_value="copilot"), \
-                patch.object(self.z, "runtime_report", return_value=limited), \
-                patch.object(self.z, "set_copilot_permissions", return_value=None):
-            self.assertTrue(self.plain(ephemeral="x"))
-
 
 class PromptTests(GateCase):
     def setUp(self):
         super().setUp()
-        self.sid = self.row("build", "juno", status="running")
-        self.conn.execute("UPDATE sessions SET pane_id='p1', agent='juno-t20-build' WHERE id=?", (self.sid,))
+        self.sid = self.row("build", status="running")
+        self.conn.execute("UPDATE sessions SET pane_id='p1', agent='build-t20' WHERE id=?", (self.sid,))
         self.conn.commit()
 
     def state(self, value):
@@ -434,7 +525,7 @@ class PromptTests(GateCase):
                 self.z.cmd_prompt([f"S{self.sid}", "hello"])
             self.mock_prompt_worker.assert_not_called()
             self.z.cmd_prompt([f"S{self.sid}", "--redirect", "stop and do X"])
-        self.assertEqual(self.mock_prompt_worker.call_args.args, ("juno-t20-build", "stop and do X"))
+        self.assertEqual(self.mock_prompt_worker.call_args.args, ("build-t20", "stop and do X"))
 
     def test_idle_session_is_prompted_and_logged(self):
         with self.state("idle"):
@@ -460,14 +551,6 @@ class PromptTests(GateCase):
         self.z.cmd_relay_post([f"S{self.sid}", str(words), "--action", "comment", "--print"])
         self.mock_prompt_worker.assert_not_called()
         self.assertIn("ok to post", self.output.getvalue())
-
-
-class FinishGateTests(ProfileCase):
-    def test_finish_cli_needs_an_idea_or_a_reason_with_a_lesson(self):
-        env = {**os.environ, "ZED_PROFILE_DIR": str(self.profile)}
-        r = run_script("zed-employee", env, "finish", "--lesson", "x", "-e", "juno")
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn("script, hook or check", r.stderr + r.stdout)
 
 
 def run_script(name, env, *args):

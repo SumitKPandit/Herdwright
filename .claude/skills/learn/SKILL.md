@@ -19,7 +19,7 @@ Ask: *would this be true and useful for a Zed serving someone else?*
   | People, handles, reviewers | `profile/knowledge/people.md` |
   | How to set up / run / log in / QA a repo; gotchas | `profile/knowledge/repos/<repo>.md` |
   | Repo paths, base branches, worktree root | `profile/config/projects.json` |
-  | Which agent runtimes, their order, permission mode, model policy | `profile/config/runtimes.json` |
+  | Model, effort ceiling, max running sessions | `profile/config/claude.json` |
 
 - **Yes — it makes any Zed better** (a tool quirk, a workflow improvement, a missing step) → core:
   a lesson in `playbook.md`; a change to a skill, `CLAUDE.md`, `templates/`, `bin/` or
@@ -30,9 +30,9 @@ Ask: *would this be true and useful for a Zed serving someone else?*
 
 ## 1b. Can it be code?
 Before writing prose, ask: **can this be a script, hook, check or refusal?** (capability order: hooks, skills,
-agents, MCP). If yes, build it (or, if it is more than a few minutes, record it as a task/idea for an employee) and make
+agents, MCP). If yes, build it (or, if it is more than a few minutes, record it as a task) and make
 the lesson a one-line pointer to the code that enforces it, with the file and test. Prose-only is for judgment that
-code cannot decide. Employees answer the same question at `zed-employee finish` (`--idea` or `--no-idea WHY`).
+code cannot decide.
 
 ## 2. Write it well
 1. **One home per fact.** Before writing, look for an existing entry; edit it in place instead of
@@ -43,7 +43,7 @@ code cannot decide. Employees answer the same question at `zed-employee finish` 
 4. **Lessons** carry the rule, **Why**, and **How to apply**.
 5. **Mind the context budget.** `CLAUDE.md`, `profile.md`, `lessons.md`, `playbook.md` and
    `failure-modes.md` are read at every session start, so together they have a word budget
-   (`bin/zed doctor`; `bin/zed start` shows it; the pre-commit hook fails when it is passed). When a
+   (`bin/zed start` shows it; the pre-commit hook fails when it is passed). When a
    lesson would push past it, prune or merge older entries, or move the detail into a skill or a
    `knowledge/` file that is loaded only when needed, leaving a one-line pointer behind.
 6. **Prune.** If a file passes ~200 lines or mixes topics, split it and update

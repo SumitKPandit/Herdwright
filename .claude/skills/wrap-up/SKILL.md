@@ -21,17 +21,24 @@ has (`keep-scratch` keeps it regardless). Tell the user it was closed, what was 
 Mark the task: `pr_open` while PRs await review/merge; `done` only when the user says it's done
 or the PR is merged (`bin/zed-pr state <url>`: verdict `merged`). Commit the profile.
 
-Housekeeping at wrap-up: `bin/zed-hygiene report --fetch` lists orphan/prunable worktrees, merged or
-gone branches, stale clones and leftover scratch folders; tell the user what it finds. `--apply` fast-forwards clones, prunes
-and deletes scratch leftovers with no unique work, so
-run it only with the user's OK, each time. Back up the record with `bin/zed-export export profile/db/backup.json`
-(commit it with the profile).
+`bin/zed close` already removes the landed worktree and scratch folder; tell the user about any worktree it kept.
 
 Closing or untracking a session is not delivery of its task. Check the original acceptance
 criteria and record the actual output: for published documentation, its live URL and verified
 content/rendering; for an assessment, the report and its acceptance, not an implemented solution.
 Local drafts, a finished worker turn, or a handoff to another task must not be counted as a
 completed user deliverable. Record transferred work against its continuing task explicitly.
+
+For an inline GitHub review, compare the approved payload with the published review's state,
+body and commit, and every comment's body, path, original line anchor, side and original commit.
+Verify the exact count and absence of duplicate matching reviews; save a receipt with URLs.
+Use the PR-wide comments endpoint: per-review responses can omit original line anchors.
+`gh api --paginate --slurp` cannot use `--jq`; parse its collected JSON separately.
+Why: command success alone does not establish exact delivery.
+An existing review target is not a PR authored by the publisher. If `landed` blocks
+only because that target remains open, never force cleanup or claim it merged.
+Close only the session with `keep-worktree keep-scratch`, retaining the receipt and
+artifacts for resumption.
 
 Keep historical source verification, current artifact verification and user approval distinct.
 Rewritten or split pages can lose context even when their source was verified: record checks

@@ -1,28 +1,30 @@
-"""A hat's `deny` policy (templates/employees/hats/<hat>/capabilities.json), decided once and rendered per runtime
-(design R2). The decision lives here; the hook script bin/zed-deny only feeds it a tool call.
-
-  Claude Code   a PreToolUse command hook in a per-session settings file (`claude --settings`)
-  Copilot CLI   a PreToolUse hook in a per-session plugin (`--plugin-dir`) and `--deny-tool shell(<prefix>)` flags
-  both          git itself is guarded by bin/zed-guard, which spawn installs in the worktree
-
-Facts about both runtimes' hook protocols are in docs/runtimes/*.md.
+"""A hat's `deny` policy (templates/hats/<hat>/capabilities.json). The decision lives here; the hook script
+bin/zed-deny only feeds it a tool call. It runs as a PreToolUse command hook in a per-session settings file
+(`claude --settings`) or from an OpenCode plugin (`opencode_plugin`); git itself is guarded by bin/zed-guard, which spawn installs in the worktree.
 """
 import json
 import os
 import re
 import subprocess
 import sys
+from itertools import dropwhile, takewhile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import zedgates  # noqa: E402
 import zedshell  # noqa: E402
 
-EDIT_TOOLS = {"edit", "write", "notebookedit", "multiedit", "create", "str_replace", "str_replace_editor", "apply_patch"}
+EDIT_TOOLS = {"edit", "write", "notebookedit", "multiedit", "apply_patch"}
 PATH_KEYS = ("file_path", "path", "notebook_path", "filePath")
+# OpenCode's apply_patch names its files in marker lines of `patchText` (verified in opencode.ai/docs/plugins, 2026-11-03)
 PATCH_FILE = re.compile(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$", re.M)
 SUBAGENT_TOOLS = {"agent", "task"}
-EMPLOYEE_DATA = "profile/employees/**"  # every hat: employee records change only through `zed-employee`
+# What a hat session's identity rests on (`zedemployee.caller_session`): a Bash command may not set or unset them
+IDENTITY_VARS = ("ZED_SESSION", "ZED_HAT", "ZED_PROFILE_DIR", "HERDR_PANE_ID")
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
+ENV_SETTERS = {"export", "declare", "typeset", "readonly", "local", "unset", "env", "set"}
+WRAPPERS = ("builtin", "command", "exec", "nohup", "time", "nice")
+LOOK_THROUGH = WRAPPERS + ("xargs", "find", "sudo", "doas", "setsid", "timeout", "stdbuf", "ionice", "watch", "busybox", "script")  # run the command that follows
 
 
 def glob_regex(pattern):
@@ -50,12 +52,11 @@ def path_matches(p, pattern, worktree, profile):
 def denied_path(path, patterns, worktree, profile, cwd, exceptions=()):
     """The pattern that denies `path`, or None. A pattern beginning `profile/` is relative to the profile folder,
     any other to the worktree; paths outside both (scratch, evidence directories, /tmp) are never denied.
-    A path matching an exception is allowed, except under the employee records, which no exception reaches."""
+    A path matching an exception is allowed."""
     p = Path(os.path.expanduser(str(path)))
     p = Path(os.path.realpath(p if p.is_absolute() else Path(cwd) / p))
     for pattern in patterns:
-        if path_matches(p, pattern, worktree, profile) and not (
-                pattern != EMPLOYEE_DATA and any(path_matches(p, e, worktree, profile) for e in exceptions)):
+        if path_matches(p, pattern, worktree, profile) and not any(path_matches(p, e, worktree, profile) for e in exceptions):
             return pattern
     return None
 
@@ -89,15 +90,61 @@ def command_denied(words, prefixes):
     return None
 
 
+def identity_tampering(words):
+    """A reason when the simple command `words` sets or unsets one of IDENTITY_VARS (inline `VAR=x cmd`, `export`,
+    `unset`, `env`, `env -uVAR`, `--unset=VAR`, ...), clears the environment (`env -i`, which would make a hat shell look
+    like Zed's) or asks `zed-employee finish` for `--as-zed` (a hat session never needs it), else None. Programs that run
+    another (`sudo`, `xargs`, `find -exec`, ...) are looked through; `bash -c STRING` and `eval STRING` are parsed."""
+    names = "/".join(IDENTITY_VARS)
+    named = lambda w: any(w == v or w.startswith(v + "=") for v in IDENTITY_VARS)
+    mentions = lambda w: any(v in w for v in IDENTITY_VARS)
+    unnamed = lambda w: re.search(r"[$`{]", w.split("=", 1)[0])  # a variable name the shell expands: `$V=x`, `ZED_{SESSION,HAT}` (the tokenizer splits it at the comma)
+    assignment = lambda w: re.fullmatch(r"\w+=.*", w)
+    flat = [x for w in words for x in w.split()]  # `env -S 'zed-employee finish --as-zed'` is one word
+    if "finish" in flat and any(len(w) >= 3 and "--as-zed".startswith(w.split("=")[0]) for w in flat):  # argparse accepts `--as`
+        return "`zed-employee finish --as-zed` is denied to a hat session: it finishes only itself"
+    if any(named(w) for w in takewhile(assignment, words)):
+        return f"setting {names} is denied: they tell Zed which session this is"
+    words = list(dropwhile(assignment, words))
+    wrapped = False
+    while words and (Path(words[0]).name in WRAPPERS or words[0] in ("{", "then", "do", "else")):
+        wrapped, words = wrapped or Path(words[0]).name in WRAPPERS, words[1:]
+    if not words:
+        return None
+    name = Path(words[0]).name
+    args = list(takewhile(lambda w: w.startswith("-") or "=" in w, words[1:])) if name == "env" else words[1:]  # env: up to its command
+    if name in ENV_SETTERS and (any(mentions(w) or unnamed(w) for w in args) or (name == "env" and any(mentions(w) for w in words[1:]))
+                                or (name in ("unset", "env") and any(unresolved(w) and (name == "unset" or re.search(r"-u|--unset", prev))
+                                                                      for prev, w in zip(words, words[1:])))):
+        return f"`{name}` on {names} (or on a name the shell expands) is denied: they tell Zed which session this is"
+    if name == "env" and any(w in ("-", "--ignore-environment") or re.fullmatch(r"-[A-Za-z]*i[A-Za-z]*", w) for w in words[1:]):
+        return "`env -i` is denied: it clears the variables that tell Zed which session this is"
+    if name in LOOK_THROUGH or wrapped:  # a wrapper's own flags (`nice -n 5 env ...`, `time -p`, `exec -a x`) hide the command: scan for it
+        for i, w in enumerate(words[1:], 1):
+            if Path(w).name in ENV_SETTERS | SHELLS | {"eval"} and (problem := identity_tampering(words[i:])):
+                return problem
+    if name in SHELLS:
+        flag = next((i for i, w in enumerate(words) if i and re.fullmatch(r"-\w*c\w*", w)), None)
+        inner = words[flag + 1] if flag is not None and flag + 1 < len(words) else ""
+    else:
+        inner = " ".join(words[1:]) if name == "eval" else ""
+    try:
+        return next((p for sub, _ in zedshell.split_commands(zedshell.tokens(inner)) if (p := identity_tampering(sub))), None)
+    except ValueError:  # unbalanced quotes: fail open, like the rest of this hook
+        return None
+
+
 def shell_problem(cmd, manifest, worktree, profile, cwd):
     deny = manifest["deny"]
-    patterns, exceptions = [EMPLOYEE_DATA, *deny["edit"]], deny.get("except", [])
+    patterns, exceptions = deny["edit"], deny.get("except", [])
     try:
         cmds = zedshell.split_commands(zedshell.tokens(cmd))
     except ValueError:
         return None  # unbalanced quotes: fail open, like the other hooks
     read_only = "**" in deny["edit"]  # a hat that may not edit at all may not commit either
     for words, _ in cmds:
+        if problem := identity_tampering(words):
+            return problem
         words_before = [w for w in words if re.fullmatch(r"CDPATH=.*", w)] if words else []
         while words and re.fullmatch(r"\w+=.*", words[0]):
             words = words[1:]
@@ -107,7 +154,9 @@ def shell_problem(cmd, manifest, worktree, profile, cwd):
             cwd = None  # `CDPATH=x cd y` may land anywhere
         while words and (Path(words[0]).name in ("builtin", "command") or words[0] in ("{", "then", "do", "else")):
             words = words[1:]  # a compound command's opener leaves the next word the command
-        if words and Path(words[0]).name in ("cd", "pushd", "popd"):
+        if not words:
+            continue  # only an opener (`do`, `then`) before the next `;`
+        if Path(words[0]).name in ("cd", "pushd", "popd"):
             # follow `cd <dir> && ...` so later relative targets resolve where the shell will; a target the shell
             # expands (`cd $X`, `cd -`, `popd`) leaves the cwd unknown: later relative targets cannot be checked
             args = [w for w in words[1:] if w != "--" and not re.fullmatch(r"-[LPe@]+", w)]
@@ -142,16 +191,17 @@ def shell_problem(cmd, manifest, worktree, profile, cwd):
 
 
 def edit_paths(tool_input):
-    """The files an edit tool call touches. Claude passes a dict with a path; Copilot's `Edit` passes an apply_patch
-    text (verified 2026-10-27) whose `*** Add|Update|Delete File:` and `*** Move to:` lines name them."""
-    if isinstance(tool_input, str):
-        return [m.group(1).strip() for m in PATCH_FILE.finditer(tool_input)]
+    """The files an edit tool call touches: the path in its input, or the files named in an apply_patch's text."""
+    if not isinstance(tool_input, dict):
+        return []
+    if isinstance(tool_input.get("patchText"), str):
+        return [m.group(1).strip() for m in PATCH_FILE.finditer(tool_input["patchText"])]
     path = next((tool_input[k] for k in PATH_KEYS if tool_input.get(k)), None)
     return [path] if path else []
 
 
 def decide(payload, manifest, worktree, profile):
-    """Reason to deny this tool call for an employee wearing the hat `manifest` describes, or None to allow it.
+    """Reason to deny this tool call for a session wearing the hat `manifest` describes, or None to allow it.
     An internal error denies: a guard that cannot decide must not wave the call through."""
     try:
         return _decide(payload, manifest, worktree, profile)
@@ -168,10 +218,8 @@ def _decide(payload, manifest, worktree, profile):
         if not paths:
             return "an edit that names no file cannot be checked, so it is denied" if "**" in manifest["deny"]["edit"] else None
         for path in paths:
-            if pattern := denied_path(path, [EMPLOYEE_DATA, *manifest["deny"]["edit"]], worktree, profile, cwd,
-                                      manifest["deny"].get("except", [])):
-                return f"editing {path} is denied to this hat ({pattern})" + \
-                       ("; use `zed-employee remember|refresh|drop`" if pattern == EMPLOYEE_DATA else "")
+            if pattern := denied_path(path, manifest["deny"]["edit"], worktree, profile, cwd, manifest["deny"].get("except", [])):
+                return f"editing {path} is denied to this hat ({pattern})"
     elif tool == "bash":
         return shell_problem(inp.get("command", "") if isinstance(inp, dict) else "", manifest, worktree, profile, cwd)
     elif tool in SUBAGENT_TOOLS and manifest["subagents"] == "none":
@@ -196,57 +244,24 @@ def claude_settings(zed_home):
                       "Stop": [{"hooks": [{"type": "command", "command": stop_command(zed_home), "timeout": 10}]}]}}
 
 
-def copilot_plugin(directory, zed_home, name="zed-deny"):
-    """A per-session Copilot plugin carrying the hook (PascalCase event names are required; see docs/runtimes/copilot.md)."""
-    directory = Path(directory)
-    (directory / "hooks").mkdir(parents=True, exist_ok=True)
-    (directory / "plugin.json").write_text(json.dumps({"name": name, "version": "1.0.0", "description": "Zed hat deny policy"}, indent=2) + "\n")
-    hooks = {"version": 1, "hooks": {"PreToolUse": [{"type": "command", "bash": hook_command(zed_home), "timeoutSec": 10}],
-                                     "Stop": [{"type": "command", "bash": stop_command(zed_home), "timeoutSec": 10}]}}
-    (directory / "hooks" / "hooks.json").write_text(json.dumps(hooks, indent=2) + "\n")
-    return directory
+def opencode_plugin(directory, zed_home):
+    """A per-session OpenCode config directory (point OPENCODE_CONFIG_DIR at it) whose plugin runs bin/zed-deny before
+    every tool call and throws its reason when the call is denied. OpenCode has no blocking Stop hook (`session.idle`
+    cannot hold a turn open), so there is no stop-guard here; a finish that was skipped still shows up as `done:` without
+    a recorded finish."""
+    plugin = Path(directory) / "plugins" / "zed-deny.js"
+    plugin.parent.mkdir(parents=True, exist_ok=True)
+    plugin.write_text(f"""import {{ spawnSync }} from "node:child_process";
 
-
-def copilot_deny_tools(manifest):
-    return [f"shell({prefix})" for prefix in manifest["deny"]["commands"]]
-
-
-def pi_extension(path, zed_home):
-    """A per-session Pi extension that intercepts tool calls and invokes zed-deny on tool_call,
-    and runs zed-employee stop-guard on turn_end."""
-    hook = hook_command(zed_home)
-    stop = stop_command(zed_home)
-    content = f"""import {{ spawnSync }} from "node:child_process";
-import type {{ ExtensionAPI }} from "@earendil-works/pi-coding-agent";
-
-export default function (pi: ExtensionAPI) {{
-  pi.on("tool_call", async (event, ctx) => {{
-    const payload = JSON.stringify({{
-      tool_name: event.toolName,
-      tool_input: event.input,
-      cwd: process.cwd()
-    }});
-    const res = spawnSync({json.dumps(hook)}, [], {{
-      input: payload,
+export const ZedDeny = async ({{ directory }}) => ({{
+  "tool.execute.before": async (input, output) => {{
+    const res = spawnSync({json.dumps(hook_command(zed_home))}, [], {{
+      input: JSON.stringify({{ tool_name: input.tool, tool_input: output.args, cwd: directory }}),
       encoding: "utf-8",
-      env: process.env
+      env: process.env,
     }});
-    if (res.status === 2) {{
-      return {{ block: true, reason: (res.stderr || res.stdout || "Blocked by Zed policy").trim() }};
-    }}
-    return undefined;
-  }});
-
-  pi.on("turn_end", async () => {{
-    spawnSync({json.dumps(stop)}, {{
-      shell: true,
-      encoding: "utf-8",
-      env: process.env
-    }});
-  }});
-}}
-"""
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(content)
-    return Path(path)
-
+    if (res.status !== 0) throw new Error((res.stderr || res.stdout || "zed-deny could not run").trim());
+  }},
+}});
+""")
+    return Path(directory)

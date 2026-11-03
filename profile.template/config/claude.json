@@ -1,0 +1,13 @@
+{
+  "model": "claude-opus-5-5",
+  "effort": "high",
+  "max_running": 3,
+  "effort_by_kind": {
+    "story": "medium",
+    "bug": "medium",
+    "task": "medium",
+    "implementation": "medium",
+    "investigation": "high",
+    "design": "high"
+  }
+}

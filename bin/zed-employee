@@ -1,155 +1,55 @@
 #!/usr/bin/env python3
-"""zed-employee — Zed's named employees: records, memory and the memory pack (no model).
-
-An employee is files under profile/employees/<name>/, not a process. Design: docs/design/employees.md, section 5.
-Build steps 2 (record + memory) and 3 (assignment: `finish`, `suggest`, `board`); `report` and `postmortem` come later.
+"""zed-employee — what a hat session (build, review, qa) uses: its skills and `finish` (no model).
 
 Usage
-  zed-employee hire <name> [--voice TEXT] [--strengths a,b] [--senior|--no-senior]
-      from the roster card in templates/employees/roster/ (or a blank card with --voice); registers the DB row
-  zed-employee list [--json]                      hired employees, from the files
-  zed-employee show <name>                        the record and how much each memory kind holds
-  zed-employee intro <name> [--record]            the introduction card; --record stamps introduced_at
-  zed-employee skill list|show <name> [--hat H]   print a skill (the employee's own, the hat's, then the shared ones)
+  zed-employee skill list|show <name> [--hat H]   print a skill (the hat's, then the shared ones; the hat defaults to $ZED_HAT)
   zed-employee hats                               the hats and the problems, if any, in their manifests
-
-  Memory (the employee defaults to $ZED_EMPLOYEE; every write goes through these):
-  zed-employee remember --kind fact|preference|lesson|work|heard --src SRC [--repo R] [--hat H] [--tags a,b]
-                        [--anchor TEXT] [--ttl DAYS] [-e NAME] "<text>"
-      refuses: no src, a fact without an anchor that exists in the file on the repo's base branch now, over 120
-      words, a secret, a duplicate. The date is stamped here; a same-src entry with different text is flagged
-  zed-employee refresh <id> [--text T] [--src S] [--anchor A] [--repo R] [-e NAME]   re-check and re-stamp
-  zed-employee drop <id> --reason TEXT [-e NAME]  archive an entry with the reason
-  zed-employee verify --repo R [-e NAME]          anchors vs origin/<base>: marks stale, archives old work entries
-  zed-employee pack [-e NAME] --repo R --hat H [--tags a,b] [--session S] [--memory-words N] [--dry-run] [--print]
-      verify, then the deterministic memory pack, written to profile/.cache/employees/<name>/<session>-pack.md
-
-  Assignments (what bin/zed spawn employee= hat= starts; `finish` runs inside the employee's session):
-  zed-employee finish [--verdict clean|blockers] [--draft FILE] (--lesson TEXT ... | --none WHY) [--idea TEXT ... | --no-idea WHY]
-                      [--note TEXT] [--session S] [-e NAME]
-      the write-back before ZED:DONE: lessons to the hat's craft file, the work entry from the DB and the plan, the
-      verdict on the session (review/qa; `blockers` needs the findings --draft), a log.md line, ideas to ideas.md.
-      Refuses unresolved stale entries, a missing verdict or lesson, a second finish. The watcher requires it.
-  zed-employee suggest <T> --hat H [--repo R] [--branch B] [--tags a,b] [--ambiguous] [--json]
-      the hired employees, best pick first, with the numbers behind the rank (Zed confirms)
-  zed-employee board [--json]
-      who is free, and what waits (new tasks, builds lacking a review or qa verdict, fixes) with who may take each
-
+  zed-employee finish [--verdict clean|blockers] [--draft FILE] [--as-zed --session S<id>]
+      end the session before ZED:DONE: ticks the plan's last step, stores the verdict of a review/qa with the code it
+      is about (`blockers` needs the findings --draft) and records the draft for whoever fixes. Refuses an incomplete
+      plan, a missing verdict, a review/qa that changed the code, a second finish. A hat session finishes only itself (known
+      from its herdr pane); `--as-zed --session S<id>` is Zed's own shell finishing a stuck worker, refused in a hat session.
   zed-employee stop-guard
-      the worker's Stop hook (spawn renders it for both runtimes): blocks the end of a turn that reported `done:` in
+      the worker's Stop hook (spawn renders it into the session's settings): blocks the end of a turn that reported `done:` in
       its status file without having run `finish`; reads the hook JSON on stdin; prints {"decision":"block",...}
 
-Exit codes: 0 ok · 1 refused (the reason is printed) · 2 usage or unknown employee/hat
+Exit codes: 0 ok · 1 refused (the reason is printed) · 2 usage or unknown hat
 """
 import argparse
 import json
 import os
-import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-import zedassign  # noqa: E402
 import zedemployee as emp  # noqa: E402
-import zedlib  # noqa: E402
-import zedmem  # noqa: E402
-
-
-def csv(value):
-    return [v.strip() for v in value.split(",") if v.strip()] if value else []
-
-
-def employee_name(args):
-    name = args.employee or os.environ.get("ZED_EMPLOYEE")
-    if not name:
-        raise emp.EmployeeError("which employee? pass -e NAME or set ZED_EMPLOYEE")
-    emp.load_employee(name)
-    return name
-
-
-def cmd_hire(args):
-    senior = True if args.senior else False if args.no_senior else None
-    emp.hire(args.name, voice=args.voice, strengths=csv(args.strengths) if args.strengths else None, senior=senior)
-    print(f"hired {args.name}: {emp.employee_dir(args.name)}")
-
-
-def cmd_list(args):
-    rows = emp.list_employees()
-    zedlib.emit(rows, args.json, lambda r: [f"{x['name']:<8} {'senior' if x['senior'] else '      '}  hired {x['hired']}  "
-                                            f"memory {x['memory']}  {'introduced ' + x['introduced'] if x['introduced'] else 'not introduced'}"
-                                            for x in r] or ["nobody hired"])
-
-
-def cmd_show(args):
-    emp.load_employee(args.name)  # unknown name -> error
-    print((emp.employee_dir(args.name) / "employee.md").read_text().rstrip())
-    print("\nmemory: " + ", ".join(f"{k} {v}" for k, v in emp.memory_counts(args.name).items()))
-
-
-def cmd_intro(args):
-    print("\n".join(emp.intro_card(args.name)))
-    if args.record:
-        emp.record_intro(args.name)
 
 
 def cmd_skill(args):
     if args.action == "list":
-        print("\n".join(emp.skill_names(args.hat)))
+        print("\n".join(emp.skill_names(args.hat or os.environ.get("ZED_HAT"))))
         return
     if not args.name:
-        raise emp.EmployeeError("skill show needs a skill name")
-    path = emp.skill_path(args.name, os.environ.get("ZED_EMPLOYEE"), args.hat or os.environ.get("ZED_HAT"))
+        raise emp.HatError("skill show needs a skill name")
+    path = emp.skill_path(args.name, args.hat or os.environ.get("ZED_HAT"))
     if not path:
-        raise emp.EmployeeError(f"no skill {args.name!r}; try `zed-employee skill list`")
+        raise emp.HatError(f"no skill {args.name!r}; try `zed-employee skill list`")
     print(path.read_text().rstrip())
 
 
 def cmd_hats(args):
     bad = 0
     for hat in emp.hat_names():
-        problems = emp.validate_manifest(emp.load_manifest(hat), emp.TEMPLATES / "hats" / hat)
+        problems = emp.validate_manifest(emp.load_manifest(hat), emp.HATS / hat)
         print(f"{hat}: " + ("ok" if not problems else "; ".join(problems)))
         bad += bool(problems)
     return 1 if bad else 0
 
 
-def cmd_remember(args):
-    entry = zedmem.remember(emp.employee_dir(employee_name(args)), args.kind, args.text, args.src, repo=args.repo,
-                            hat=args.hat, tags=csv(args.tags), anchor=args.anchor, ttl=args.ttl)
-    print(f"remembered {entry.id}" + (f" (conflicts with {entry.get('conflicts')}: merge them)" if entry.get("conflicts") else ""))
-
-
-def cmd_refresh(args):
-    entry = zedmem.refresh(emp.employee_dir(employee_name(args)), args.id, text=args.text, src=args.src, anchor=args.anchor)
-    print(f"refreshed {entry.id} ({entry.kind})")
-
-
-def cmd_drop(args):
-    entry = zedmem.drop(emp.employee_dir(employee_name(args)), args.id, args.reason)
-    print(f"dropped {entry.id} to archive.md")
-
-
-def cmd_verify(args):
-    report = zedmem.verify(emp.employee_dir(employee_name(args)), args.repo)
-    print(", ".join(f"{k} {len(v)}" + (f" ({' '.join(v)})" if v and k != "ok" else "") for k, v in report.items()))
-    return 1 if report["stale"] else 0
-
-
-def cmd_pack(args):
-    name = employee_name(args)
-    text, path, used, archived = emp.make_pack(name, args.repo, args.hat, csv(args.tags), args.session, args.memory_words, args.dry_run)
-    if args.dry_run:
-        print(text)
-        return
-    print(text if args.print else f"{path} ({len(used)} entries" + (f", archived {' '.join(archived)}" if archived else "") + ")")
-
-
 def cmd_finish(args):
-    if args.lesson and not args.idea and not args.no_idea:
-        raise emp.EmployeeError(emp.CODE_FIRST_QUESTION)
-    print("\n".join(emp.finish(employee_name(args), verdict=args.verdict, lessons=args.lesson, none_reason=args.none,
-                               draft=args.draft, ideas=args.idea, note=args.note,
-                               session=args.session or os.environ.get("ZED_SESSION"))))
+    with emp.database() as conn:
+        session = emp.target_session(conn, args.session, args.as_zed)
+    print("\n".join(emp.finish(session, verdict=args.verdict, draft=args.draft)))
 
 
 def cmd_stop_guard(args):
@@ -157,9 +57,9 @@ def cmd_stop_guard(args):
     through, so a worker that cannot finish is never stuck: the done path still flags it to Zed."""
     try:
         payload = json.load(sys.stdin)
-        if payload.get("stop_hook_active") or not os.environ.get("ZED_EMPLOYEE"):
+        if payload.get("stop_hook_active") or not os.environ.get("ZED_HAT"):
             return 0
-        reason = emp.stop_problem(os.environ.get("ZED_SESSION"), os.environ["ZED_EMPLOYEE"])
+        reason = emp.stop_problem(os.environ.get("ZED_SESSION"))
     except Exception:  # noqa: BLE001 - fail open
         return 0
     if reason:
@@ -167,133 +67,26 @@ def cmd_stop_guard(args):
     return 0
 
 
-def task_id(text):
-    if not re.fullmatch(r"T?\d+", text):
-        raise emp.EmployeeError(f"{text!r} is not a task id (T20 or 20)")
-    return int(text.lstrip("T"))
-
-
-def cmd_suggest(args):
-    tid = task_id(args.task)
-    with emp.database() as conn:
-        last = conn.execute("SELECT repo, branch FROM sessions WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
-        repo = args.repo or (last["repo"] if last else None)
-        if not repo:
-            raise emp.EmployeeError(f"T{tid} has no session yet: say which repo with --repo")
-        branch = args.branch or (last["branch"] if last else None)
-        rows = zedassign.suggest(conn, tid, args.hat, repo, branch, csv(args.tags), args.ambiguous)
-
-    def render(rows):
-        out = [f"suggest T{tid} --hat {args.hat} (repo {repo}" + (f", branch {branch}" if branch else "") + ")"]
-        for i, r in enumerate((r for r in rows if r["eligible"]), 1):
-            p = r["parts"]
-            out.append(f"{i}. {r['name']:<8} score {r['score']} (memory {p['memory']}, task {p['task']}, hat {p['hat']})"
-                       f"{' senior-first' if r['lead'] else ''}  last assigned {r['last'] or 'never'}")
-        out += [f"-  {r['name']:<8} not eligible: {r['why']}" for r in rows if not r["eligible"]]
-        return out
-    zedlib.emit(rows, args.json, render)
-
-
-def cmd_board(args):
-    with emp.database() as conn:
-        data = zedassign.board(conn)
-
-    def render(data):
-        out = ["free: " + (", ".join(data["free"]) or "nobody"), "waiting:"]
-        for w in data["waits"]:
-            where = f"{w['repo']} {w['branch']}" if w["repo"] else "not started"
-            who = ("zed-pr ready-check, then tell the user" if w["kind"] == "ready"
-                   else "may take it: " + (", ".join(w["may"]) or "nobody free"))
-            out.append(f"  {w['kind']:<7} T{w['task']} {where}  {who}")
-        return out if data["waits"] else out + ["  nothing"]
-    zedlib.emit(data, args.json, render)
-    return 1 if args.brief and data["waits"] else 0
-
-
 def build_parser():
     p = argparse.ArgumentParser(prog="zed-employee", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    def add(name, fn, **kw):
-        s = sub.add_parser(name, **kw)
+    def add(name, fn):
+        s = sub.add_parser(name)
         s.set_defaults(fn=fn)
         return s
 
-    def emp_arg(s):
-        s.add_argument("-e", "--employee")
-
-    s = add("hire", cmd_hire)
-    s.add_argument("name")
-    s.add_argument("--voice")
-    s.add_argument("--strengths")
-    s.add_argument("--senior", action="store_true")
-    s.add_argument("--no-senior", action="store_true")
-    s = add("list", cmd_list)
-    s.add_argument("--json", action="store_true")
-    s = add("show", cmd_show)
-    s.add_argument("name")
-    s = add("intro", cmd_intro)
-    s.add_argument("name")
-    s.add_argument("--record", action="store_true")
     s = add("skill", cmd_skill)
     s.add_argument("action", choices=["list", "show"])
     s.add_argument("name", nargs="?")
     s.add_argument("--hat")
     add("hats", cmd_hats)
-    s = add("remember", cmd_remember)
-    emp_arg(s)
-    s.add_argument("--kind", required=True)
-    s.add_argument("--src", default="")
-    s.add_argument("--repo")
-    s.add_argument("--hat")
-    s.add_argument("--tags")
-    s.add_argument("--anchor")
-    s.add_argument("--ttl", type=int)
-    s.add_argument("text")
-    s = add("refresh", cmd_refresh)
-    emp_arg(s)
-    s.add_argument("id")
-    s.add_argument("--text")
-    s.add_argument("--src")
-    s.add_argument("--anchor")
-    s = add("drop", cmd_drop)
-    emp_arg(s)
-    s.add_argument("id")
-    s.add_argument("--reason", default="")
-    s = add("verify", cmd_verify)
-    emp_arg(s)
-    s.add_argument("--repo", required=True)
-    s = add("pack", cmd_pack)
-    emp_arg(s)
-    s.add_argument("--repo", required=True)
-    s.add_argument("--hat", required=True)
-    s.add_argument("--tags")
-    s.add_argument("--session")
-    s.add_argument("--memory-words", type=int)
-    s.add_argument("--dry-run", action="store_true")
-    s.add_argument("--print", action="store_true")
-    s = add("suggest", cmd_suggest)
-    s.add_argument("task")
-    s.add_argument("--hat", required=True)
-    s.add_argument("--repo")
-    s.add_argument("--branch")
-    s.add_argument("--tags")
-    s.add_argument("--ambiguous", action="store_true")
-    s.add_argument("--json", action="store_true")
-    s = add("board", cmd_board)
-    s.add_argument("--json", action="store_true")
-    s.add_argument("--brief", action="store_true", help="exit 1 when something waits (what `bin/zed start` shows)")
     add("stop-guard", cmd_stop_guard)
     s = add("finish", cmd_finish)
-    emp_arg(s)
     s.add_argument("--verdict", choices=emp.VERDICTS)
     s.add_argument("--draft")
-    s.add_argument("--lesson", action="append", default=[])
-    s.add_argument("--none")
-    s.add_argument("--idea", action="append", default=[])
-    s.add_argument("--no-idea", help="why none of the lessons can be a script, hook or check")
-    s.add_argument("--note")
     s.add_argument("--session")
+    s.add_argument("--as-zed", action="store_true")
     return p
 
 
@@ -301,10 +94,10 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
         return args.fn(args) or 0
-    except zedmem.MemoryRefused as e:
+    except emp.FinishRefused as e:
         print(f"zed-employee: refused: {e}", file=sys.stderr)
         return 1
-    except (emp.EmployeeError, zedassign.Refused) as e:
+    except emp.HatError as e:
         print(f"zed-employee: {e}", file=sys.stderr)
         return 2
 

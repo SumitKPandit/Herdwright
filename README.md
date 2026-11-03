@@ -1,7 +1,6 @@
 # Zed
 
-Zed is a personal engineering assistant that runs on [Pi](https://github.com/badlogic/pi-mono),
-[Claude Code](https://claude.com/claude-code), [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/copilot-cli), or a mix.
+Zed is a personal engineering assistant that runs on [Claude Code](https://claude.com/claude-code); workers can optionally run on [OpenCode](https://opencode.ai).
 You talk only to Zed. It takes your requests, writes a brief for each, and hands the work to
 worker sessions running in [herdr](https://herdr.dev), one git worktree per session. It relays
 their questions to you and your answers back, tracks every task, question and decision in a
@@ -14,18 +13,14 @@ What every Zed does, whoever uses it:
 - **Never assumes.** Zed and its workers ask instead of guessing.
 - **QA before every PR**, in a real browser for anything with a UI.
 - **Learns once.** Teach it something and it writes it down; you never repeat yourself.
-- **Works on either runtime.** With both, it starts workers on your preferred one and moves to the
-  other when one hits its usage limit (asking you before moving a worker mid-task).
 
 ## Get started
 
-1. Install the prerequisites: Pi (`pi`), Claude Code (`claude`), and/or GitHub Copilot CLI (`copilot`), herdr,
-   git, `gh` (logged in), python3.
+1. Install the prerequisites: Claude Code (`claude`), herdr, git, `gh` (logged in), python3.
    `bin/bb`, the Bitbucket helper, needs macOS (it keeps its token in the Keychain).
 2. Clone Zed: `git clone <this repo> ~/zed && cd ~/zed && bin/zed-setup`
    (checks the prerequisites and installs the git guard hooks).
-3. Start herdr, open a pane in the Zed folder and run `pi`, `claude` or `copilot` (Copilot: keep it in
-   interactive mode, never autopilot).
+3. Start herdr, open a pane in the Zed folder and run `claude`.
 4. Say hi. On first run Zed **onboards you**: it asks who you are, how you work, which repos and
    tools you use, connects and verifies your accounts (GitHub, Bitbucket, Jira, Slack, …), and
    creates your profile on your own branch, `profile/<name>`. From then on it's your assistant.
@@ -37,47 +32,31 @@ about you lives in **`profile/`**, which exists only on your profile branch.
 
 | Path | What |
 |---|---|
-| `CLAUDE.md` | Zed's operating manual (loaded automatically by Pi, Claude Code, and Copilot CLI) |
+| `CLAUDE.md` | Zed's operating manual (loaded automatically by Claude Code) |
 | `playbook.md` | Lessons about tools and workflow that help every Zed |
-| `.claude/skills/` | Zed's workflows: onboarding, new-task, check-workers, relay, wrap-up, learn, switch-runtime, models (both CLIs load them) |
-| `templates/` | Core worker rules (system prompt or custom instructions) and the brief skeleton |
+| `.claude/skills/` | Zed's workflows: onboarding, new-task, check-workers, relay, wrap-up, learn |
+| `templates/` | Core worker rules (system prompt) and the brief skeleton |
 | `bin/zed` | Task DB and herdr session driver (`bin/zed help`) |
 | `bin/bb` | Bitbucket PR helper for workers |
 | `bin/zed-setup` | Prerequisite check + git guard hooks (`hooks/`) |
-| `bin/zed-employee`, `bin/zed-deny` | Named, persistent employees with hats (build, review, qa): `zed spawn employee= hat=`, `zed assign`, `zed-employee board|finish` (see `docs/runtimes/employees-pilot-e2e.md`) |
+| `bin/zed-employee`, `bin/zed-deny` | Hats for workers (build, review, qa): `zed spawn hat=`, `zed-employee finish`, each hat's deny policy |
 | `bin/zed-core-sync` | Carries core improvements from your profile branch to `main` |
 | `profile.template/` | The skeleton onboarding copies to `profile/` |
-| `profile/` | Yours: `profile.md`, `rules.md` (your rules for workers), `lessons.md`, `knowledge/`, `config/` (incl. `runtimes.json`: which runtimes you have, in what order, and how models are chosen), `briefs/`, `db/`, `STATUS.md` |
+| `profile/` | Yours: `profile.md`, `rules.md` (your rules for workers), `lessons.md`, `knowledge/`, `config/` (incl. `claude.json`: model, effort ceiling, max running sessions), `briefs/`, `db/`, `STATUS.md` |
 
-Only one session per profile (Claude or Copilot) acts as Zed: it holds the profile's lock
-(`bin/zed lock`). Other sessions opened in the checkout are read-only, or can take over. That's
-also how Zed itself switches runtime: if your Claude limit is hit, open `copilot` in the Zed
-folder and let it take over (or the other way round).
+Only one Claude session per profile acts as Zed: it holds the profile's lock
+(`bin/zed lock`). Other sessions opened in the checkout are read-only, or can take over.
 
 `bin/zed` and `bin/bb` read `profile/` by default; set `ZED_PROFILE_DIR` to point them at another
 profile (handy for testing with a throwaway one).
 
-## Runtime configuration
+## Configuration
 
-Onboarding fills `profile/config/runtimes.json` from `profile.template/config/runtimes.json`.
-Set `order` to `["claude"]`, `["copilot"]`, or both in your preferred order. Profiles without this
-file retain the original Claude-only behaviour. `bin/zed runtime status` shows availability and
-the model choice. Each runtime can set a fixed `model` and `effort`; otherwise `model_policy`
-uses the CLI default (`default`) or an imported Artificial Analysis ranking (`attractive-quadrant`,
-see the `models` skill). Missing or stale rankings are reported, never presented as verified rankings.
+Onboarding copies `profile.template/config/claude.json` to `profile/config/claude.json`: the `model`, the `effort`
+ceiling, `effort_by_kind` (reasoning effort by kind of work, never above the ceiling) and `max_running` (open Claude
+sessions, Zed's and yours included; `spawn` queues the rest). Without the file Claude Code's defaults apply.
 
-Copilot workers start interactively, load the combined worker rules, and select
-`permission_mode` through `/permissions` (default `assisted`; also `manual` or `allow-all`).
-`allow_tools` and `deny_tools` use Copilot permission patterns; deny rules take precedence.
-Assisted mode can still ask for approval. No AI-credit cap is set; credits shown in the worker's
-footer are recorded per session and summed per task.
-
-Mark a confirmed limit with `bin/zed runtime limited <runtime> until="<reset time>" <message>`.
-New workers skip it. After the user's approval, `bin/zed handoff <S>` stops the old workspace and
-starts the other runtime in the **same worktree and branch**, preserving dirty files and providing
-a handoff note. Use `bin/zed runtime ok <runtime>` after its limit resets.
-
-Runtime regression tests: `python3 -B -m unittest discover -s tests -v`.
+Tests: `python3 -B -m unittest discover -s tests -v`.
 
 ## Branches
 
@@ -90,9 +69,33 @@ Runtime regression tests: `python3 -B -m unittest discover -s tests -v`.
   update `main` (`git fetch && git branch -f main origin/main`, or pull in a separate worktree),
   then `git merge main` on your profile branch.
 
+## Upgrading
+
+`git merge main` on your profile branch is safe with an older profile: files and tables of removed features are
+ignored, never read. `profile/employees/` (named employees, their memory and logs), the `employees`, `queue`, `inbox`,
+`threads` and `messages` tables, the `employee`, `origin`, `verdict_sha`, `signed_by`, `assigned_hat`, `head_start` and
+`head_end` session columns, `tasks.owner` (and others) and the `runtimes.json` config are unused now; delete them when
+you like. Merging `main` never edits your profile files; if you edited core files on your branch, those conflict as in
+any merge.
+- **Runtimes.** If you cloned `main` while it supported Pi or Copilot: both are gone, and so is runtime selection
+  (order, fallback, handoff, `runtimes.json`). Workers run on Claude Code with model and effort from
+  `config/claude.json`; `spawn runtime=opencode` (with `model=`, no effort) starts an OpenCode worker instead.
+  OpenCode has no blocking stop hook, so an OpenCode worker has no stop-guard: Zed's watcher flags a `done:` without `finish`.
+- **Hats, not names.** Workers wear a hat (`spawn hat=build|review|qa`, default build); `spawn employee=` is refused.
+  Whether a reviewer or QA authored the code is checked when the session finishes, not when it is assigned. A hat session
+  is known by the herdr pane that hosts its process (found through the process tree and `herdr pane process-info`, not from
+  `$HERDR_PANE_ID`, `$ZED_SESSION` or `$ZED_HAT`, which are only claims and are refused when they disagree), so it can
+  finish only itself (`zed-employee finish`). Zed finishes a stuck worker with `--as-zed --session S<n>`, accepted only
+  from a process in the pane of the session that holds the profile lock, with the lock's pid among its ancestors; a shell
+  with no identity is never Zed. `zed-deny` also refuses a hat session `--as-zed` and setting or unsetting the identity
+  variables (also through a name the shell expands, `env`, `export`, `unset`, wrappers, `bash -c`, `sudo`, `xargs`). Out of
+  scope: a worker that edits the herdr or DB files directly, or runs its own script detached from its pane's process tree.
+  OpenCode has no stop-guard; its workers run in herdr panes like any other, so the same identity applies.
+- **Verdicts** given before the upgrade match no code (they now attach to the non-`profile/` tree), so redo review
+  and QA for work still open.
+
 ## New machine
 
-Clone, check out your profile branch from your remote, run `bin/zed-setup`, and start `claude` or
-`copilot` in herdr. Worker sessions and worktrees from the old machine won't exist; Zed sees them as `GONE`
+Clone, check out your profile branch from your remote, run `bin/zed-setup`, and start `claude` in herdr. Worker sessions and worktrees from the old machine won't exist; Zed sees them as `GONE`
 and can respawn from their pushed branches/PRs. Re-store any Keychain tokens (see
 `profile/profile.md` and `playbook.md`).

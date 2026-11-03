@@ -145,8 +145,8 @@ def cmd_install(a):
     d = hook_dir(wt)
     if str(d) == prev:
         cfg = read_config(wt)
-        if cfg and cfg.get("gate") != a.gate:  # the hooks stay; only the gate setting changes
-            cfg["gate"] = a.gate
+        if cfg and a.gate and not cfg.get("gate"):  # the hooks stay; a refused reinstall may turn the gate on, never off
+            cfg["gate"] = True
             (d / "config.json").write_text(json.dumps(cfg))
         print("zed-guard: already pointing at its own hooks; run `remove` first", file=sys.stderr)
         return 2

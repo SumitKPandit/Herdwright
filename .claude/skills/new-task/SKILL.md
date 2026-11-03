@@ -16,8 +16,23 @@ description: Intake a new piece of work from the user, record it, write a brief 
      `profile/lessons.md` (e.g. release branches that change — check recent PRs and confirm).
    - Goal and acceptance criteria (read the ticket yourself to avoid asking what's already written;
      ask only about real gaps).
+   - For UI-specific backlog planning, have a worker inspect the relevant Figma/design source
+     and distinguish its approval state before finalizing component, variant, state and visual
+     acceptance scope. Generic component families are not design evidence. Surface missing
+     links/access first; do not ask for details the source can answer. This prevents invented
+     scope without blocking independent app bootstrap, tooling or test foundations.
    - Anything cross-repo.
-   Ask all missing items in one numbered message.
+   Batch genuine missing items in one numbered message, or use focused rounds when the user requests a dialogue.
+   **For iterative discussions:** maintain one current baseline and a separate dated history of verbatim answers.
+   After every answer, reconcile all affected requirements, dependencies, alternatives and active questions in place.
+   Retire or replace questions whose premises were resolved or superseded, including their DB entries; keep the history,
+   not contradictory current sections. Before asking again, check the full confirmed baseline. Separate decisions the
+   user must make from technical facts to verify; never ask the user to guess those facts.
+   **PRD versus implementation readiness:** draft the PRD from confirmed user needs, scope and acceptance outcomes;
+   unresolved technical verification or sizing does not block that draft. List genuine gaps explicitly.
+   Technical discovery can inform feasibility, but neither an old specification nor inspected code substitutes for
+   Product approval. Finalize the technical specification against reviewed product requirements, without treating
+   the PRD as proof of integration readiness or a delivery commitment.
 2. `bin/zed task add title="..." jira=<ticket-id> worktype=<worktype> description="..."` → T-id
    (`jira=` holds any ticket ID). Record each confirmed decision with
    `bin/zed log <T> "decision: ..." kind=decision`.
@@ -27,12 +42,8 @@ description: Intake a new piece of work from the user, record it, write a brief 
    goal, decisions (verbatim), open points, acceptance criteria, from confirmed facts only. List open
    points explicitly so the worker asks rather than guesses. `spawn` refuses a brief with any
    `<FILL …>` left.
-4. If the model policy needs a ranking and `bin/zed models show` says it is missing or stale,
-   refresh it (`models` skill) before spawning. If the source cannot be read, tell the user and
-   get their model choice; never claim a CLI default is benchmark-optimal.
-   `bin/zed spawn <T> repo=<repo> base=<base> branch=<branch per profile/rules.md> brief=profile/briefs/T<id>-<repo>.md`
+4. `bin/zed spawn <T> repo=<repo> base=<base> branch=<branch per profile/rules.md> brief=profile/briefs/T<id>-<repo>.md`
    (branch description: short kebab-case; confirm with the user if it isn't obvious). It picks the
-   runtime (first usable one in `config/runtimes.json`) and the model/effort (model policy); its
-   output says which and why. If it says no runtime is available, tell the user (`switch-runtime`).
-5. Make sure the watcher is running (see CLAUDE.md "Runtimes"). Tell the user: T-id, session(s),
-   worktree, branch, runtime and model. Commit the profile.
+   model/effort from `config/claude.json`; its output says which and why.
+5. Make sure the watcher is running (see CLAUDE.md, Lifecycle step 3). Tell the user: T-id, session(s),
+   worktree, branch and model. Commit the profile.

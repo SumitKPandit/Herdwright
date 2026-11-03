@@ -40,20 +40,33 @@ and a rough time). Work through it in order and tick steps as they finish; Zed r
 it. If you must change it, write down why. A step taking twice its estimate is a reason to stop and
 tell Zed, not to keep going.
 
+One checklist line per step, each with its own "done when" and time; never a catch-all tick like
+"- [x] 1-5 done" (`zed-plan lint` rejects it and it counts as unticked). Review and QA start only when
+every step of the build's plan is ticked, and `zed-employee finish` accepts any hat only when every step of
+its own plan is ticked; `finish` ticks the plan's last line itself when it is exactly `- [ ] Run zed-employee finish and report (ZED:DONE)` (any other wording is an ordinary step you tick). The one exception: a step
+about merging, pushing or raising a PR may stay open, because it happens after review and QA. Mark it by
+putting `[after-review]` in its title, or start the title with the action ("Merge the branch", "Push to
+origin", "Raise a draft PR against main"); a title that merely contains the word ("Push notification
+handler") is an ordinary step. Your session's plan is the file your brief's Plan section names; it is
+recorded when you are started and shown with your hat ("review 2/5").
+
+One build session writes a worktree at a time, and reviews and QA never edit or commit: a review or QA
+that changed the code is its author and `finish` refuses its verdict.
+
 ## Work efficiently
 
 Time and tokens come out of the user's plan, which you share with Zed and every other worker, so
 waste stops everyone.
 - **Produce early.** Begin the deliverable soon after reading your brief. Don't spend your first
   stretch redesigning the process, rewriting docs or building tooling the task doesn't need.
-- **Never redo finished work.** Trust recorded state (handoff notes, status files, logs, commits).
+- **Never redo finished work.** Trust recorded state (status files, logs, commits).
   Re-check something only if there's a concrete reason to doubt it.
 - **Scripts for mechanical work, the model for judgment.** Checks, comparisons, publishing,
   formatting and status go through commands or scripts; write a small script once rather than
   repeating the same steps by hand.
 - **Read narrowly.** Read only what the current step needs. Pass sub-agents file paths and a tight
   scope rather than pasting large context; start sub-agents only for independent, parallel work.
-- **Keep work resumable.** Record progress in files as you go, so a pause or handoff never repeats
+- **Keep work resumable.** Record progress in files as you go, so a pause never repeats
   work.
 - **Fan out sparingly.** Use a workflow or sub-agents only for many independent units of work, at most
   4 at once, and never for mechanical steps (a script does those). Each one resends context.
@@ -112,7 +125,6 @@ Helpers that do the mechanical part without a model (each has `--help`; use them
   without a test change, new dependencies, migrations and secret-looking lines in a diff: run it on your own diff
   before raising a PR. `zed-review check-draft <file>` checks a review draft.
 - `bin/zed-qa plan <T-id>` gives the QA case skeleton for your task; `zed-qa report-check <dir>` checks a QA report.
-- `bin/zed-xref <symbol|path>` finds every use across all the repos, so a changed contract shows its other consumers.
 
 ## Git safety
 
@@ -155,8 +167,6 @@ ZED:BLOCKED
 Ask only through these blocks. Don't use your CLI's built-in ask-the-user tool or question dialog,
 and never switch on an autonomous / autopilot mode: in those modes questions get answered with a
 guess, which breaks the no-assumption rule.
-For Copilot work, include AI credits used in the final report (read the session footer; if not
-available, say so rather than guessing). There is no credit cap unless the brief requests one.
 
 Questions must make sense to someone who has not seen your terminal: give context, quote the
 relevant code or ticket text, and keep them short. Batch questions, and keep working on parts

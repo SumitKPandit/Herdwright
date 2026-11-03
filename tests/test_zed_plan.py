@@ -35,6 +35,16 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(plan.lint(plan.parse("- [ ] 0. a. Done when: x (~5 min)\n- [ ] 1. b. Done when: x (~5 min)\n")), [])
         self.assertEqual(plan.lint([]), ["no checklist steps found ('- [ ] 1. ...')"])
 
+    def test_lint_rejects_a_catch_all_tick(self):
+        steps = plan.parse("- [x] 1-5 done. Done when: all (~5 min)\n- [x] 6. b. Done when: x (~5 min)\n")
+        self.assertIn("catch-all tick", "\n".join(plan.lint(steps)))
+        self.assertEqual(plan.lint(plan.parse("- [x] 1. one. Done when: x (~5 min)\n- [x] 2. two. Done when: y (~5 min)\n")), [])
+
+    def test_progress_counts_merge_and_pr_steps_apart(self):
+        steps = plan.parse("- [x] 1. a. Done when: x (~5 min)\n- [ ] 2. Raise PR. Done when: url (~5 min)\n")
+        p = plan.progress(steps, 1000.0, now=1000.0)
+        self.assertEqual((p["done"], p["total"], p["awaiting"], p["next"]), (1, 1, 1, None))
+
     def test_progress_and_overrun(self):
         steps = plan.parse(GOOD)
         p = plan.progress(steps, mtime := 1000.0, now=mtime + 30 * 60)

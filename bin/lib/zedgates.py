@@ -9,26 +9,63 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import zedassign  # noqa: E402
+import zedemployee as emp  # noqa: E402
+import zedlib  # noqa: E402
 
 GATE_HATS = ("review", "qa")
-CORE_SYNC_STALE_SECONDS = 3600
+WRITER_HATS = (None, "build")      # a session with no hat is from before hats existed and may have edited source
+OPEN = ("running", "waiting_user")
 
 
-def merge_problems(conn, sha):
-    """Why `sha` (a branch head) may not be merged into a working branch; empty when it may. It needs a clean review and
-    a clean qa verdict recorded for exactly this commit (the latest verdict of each hat), each by an employee who authored none of the work."""
+class Refused(Exception):
+    """A session `spawn` must not start."""
+
+
+def _marks(values):
+    return ",".join("?" * len(values))
+
+
+def check_assignment(conn, hat, tid, repo, branch, worktree=None):
+    """Raise Refused unless a session may wear `hat` on this task now: the hat exists, a review or QA starts only once
+    every plan step of the build is ticked (merge/push/raise-PR steps excepted), and the worktree has one writer (a
+    `build` needs it to itself; any other hat needs it free of writers; pass worktree=None for in-place projects).
+    Authorship has no name to check at spawn: a session is its hat's, and an author's verdict is refused when it is
+    recorded (`finish`) and when it is read (`independent`)."""
+    if hat not in emp.hat_names():
+        raise Refused(f"unknown hat {hat!r}: one of {', '.join(emp.hat_names())}")
+    if hat in GATE_HATS and (problem := zedlib.plan_gate_problem(conn, tid)):
+        raise Refused(f"{hat} waits until the build is complete: {problem}")
+    if worktree is not None:
+        others = conn.execute(f"SELECT id, agent, hat FROM sessions WHERE worktree=? AND status IN ({_marks(OPEN)}) ORDER BY id",
+                              (str(worktree), *OPEN)).fetchall()
+        if hat == "build" and others:
+            raise Refused(f"one writer per worktree: S{others[0]['id']} ({others[0]['agent']}) is open on {worktree}; "
+                          f"a build starts only when nothing else is open on it")
+        writers = [o for o in others if o["hat"] in WRITER_HATS]
+        if hat != "build" and writers:
+            raise Refused(f"one writer per worktree: S{writers[0]['id']} ({writers[0]['agent']}) is writing on {worktree}; "
+                          f"a {hat} starts after it ends")
+
+
+def independent(row):
+    """True when a verdict row is independent evidence: its session wore a review or QA hat, and (when it recorded where
+    it began) it left the code as it found it, which a session that wrote any of it did not."""
+    return row["hat"] in GATE_HATS and not (row["core_start"] and row["verdict_tree"] != row["core_start"])
+
+
+def merge_problems(conn, tree):
+    """Why the code `tree` (a core_tree hash of a branch head) may not be merged into a working branch; empty when it may. It
+    needs a clean review and a clean qa verdict recorded for exactly this tree (the latest verdict of each hat), each
+    independent evidence (see `independent`). A commit that changes only the profile has the same tree."""
     problems = []
     for hat in GATE_HATS:
-        rows = conn.execute("SELECT * FROM sessions WHERE hat=? AND verdict_sha=? ORDER BY id DESC", (hat, sha)).fetchall()
+        rows = conn.execute("SELECT * FROM sessions WHERE hat=? AND verdict_tree=? ORDER BY id DESC", (hat, tree)).fetchall()
         if not rows:
-            problems.append(f"no {hat} verdict recorded for {sha[:10]} (the branch changed after it, or none was done)")
+            problems.append(f"no {hat} verdict recorded for this code ({tree[:10]}): the code changed after it, or none was done")
             continue
         last = rows[0]  # the latest verdict of the hat decides: a later blockers verdict (re-run, second reviewer) counts
-        if not (last["verdict"] == "clean" and last["employee"]
-                and last["employee"] not in zedassign.authors(conn, last["task_id"], last["repo"], last["branch"])):
-            problems.append(f"{hat} of {sha[:10]} is not clean by a non-author (S{last['id']}: {last['employee'] or 'no employee'}, "
-                            f"verdict {last['verdict'] or 'none'})")
+        if not (last["verdict"] == "clean" and independent(last)):
+            problems.append(f"{hat} of {tree[:10]} is not clean by a non-author (S{last['id']}, verdict {last['verdict'] or 'none'})")
     return problems
 
 
@@ -40,30 +77,17 @@ def gate_reason(worktree, sha="HEAD"):
     return None if r.returncode == 0 else (r.stderr.strip() or r.stdout.strip() or "the merge gate did not pass")
 
 
-def spawn_without_employee(free, kv):
-    """`spawn` without employee= while a free employee exists needs ephemeral=<reason> (lessons: employees first)."""
-    if kv.get("employee") or kv.get("ephemeral", "").strip() or not free:
-        return None
-    return (f"employees are free ({', '.join(free)}): assign one (`bin/zed-employee suggest <T> --hat build`, then "
-            "`bin/zed assign <employee> <T> hat=...`), or pass ephemeral=\"<why no employee fits>\"")
-
-
-def copilot_before_claude(runtime, claude, kv):
-    """Copilot only when Claude is limited (lessons: Claude first); copilot_reason=<why> overrides."""
-    if runtime != "copilot" or kv.get("copilot_reason", "").strip():
-        return None
-    if claude.get("installed") and claude.get("enabled") and not claude.get("limited"):
-        return ("claude is usable (not marked limited), and Copilot is only for when it is limited: run it on claude "
-                "(it queues beyond max_running), or pass copilot_reason=\"<why>\"")
-    return None
-
-
 def prompt_refusal(agent_state, redirect):
     """Prompting a `working` session derails it (playbook); only `--redirect` may, on purpose."""
     if agent_state == "working" and not redirect:
         return ("the session is working: a prompt is injected mid-task and may drop the rest of its plan. Wait for it to "
                 "go idle/done, or pass --redirect if you mean to change what it is doing")
     return None
+
+
+def may_auto_approve(session):
+    """The watcher answers a routine permission prompt by rule only in a session Zed started."""
+    return not session["external"]
 
 
 def relay_prompt(words, action):
@@ -78,6 +102,3 @@ def relay_prompt(words, action):
             "Do it now, then confirm it landed (read it back) and report what you posted.")
 
 
-def core_sync_stale(oldest_unsynced_ts, now_ts, limit=CORE_SYNC_STALE_SECONDS):
-    """True when the oldest core commit still waiting for `main` is older than `limit` seconds."""
-    return oldest_unsynced_ts is not None and now_ts - oldest_unsynced_ts > limit

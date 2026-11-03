@@ -7,22 +7,13 @@ home, or $ZED_PROFILE_DIR if set (e.g. a throwaway profile for testing).
 
 Concepts
   task     a unit of work the user asked for (usually one Jira ticket)
-  session  one worker (Claude Code or GitHub Copilot CLI) running in herdr, in its own git
-           worktree, on one repo
-  runtime  the agent CLI a session runs on: `pi`, `claude` or `copilot` (see RUNTIMES). Which ones the
-           user has, their order of preference and the model policy live in
-           <profile>/config/runtimes.json
+  session  one Claude Code worker running in herdr, in its own git worktree, on one repo
   question something a worker (or Zed) needs the user to decide
   event    timestamped log line attached to a task (or global if no task)
-  inbox    feedback the user left on the dashboard (an answer, a comment, a rating, a new-task
-           request), waiting for Zed to act on it
 
-One active Zed per profile: the agent session (either runtime) that holds the profile's lock
+One active Zed per profile: the Claude Code session that holds the profile's lock
 (<profile>/.cache/zed.lock) is Zed. Other sessions get read-only access (status, list, show);
 mutating commands and `watch` refuse. See `zed lock`.
-
-`zed dashboard` serves a local web page (127.0.0.1 only) to see everything and leave feedback. It
-holds no lock and changes nothing but the inbox; Zed, the lock holder, acts on the inbox.
 
 Run `zed help` for commands.
 """
@@ -31,24 +22,19 @@ import atexit
 import contextlib
 import fcntl
 import json
-import math
 import os
 import re
 import shutil
 import signal
-import socket
 import sqlite3
-import statistics
 import subprocess
 import sys
 import time
-import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-import zedassign  # noqa: E402
+import zedconductor  # noqa: E402
 import zeddeny  # noqa: E402
 import zedemployee as emp  # noqa: E402
 import zedgates  # noqa: E402
@@ -61,86 +47,32 @@ STATUS_PATH = PROFILE_DIR / "STATUS.md"
 PROJECTS_PATH = PROFILE_DIR / "config" / "projects.json"
 CORE_WORKER_RULES = ZED_HOME / "templates" / "worker-rules.md"
 PROFILE_RULES = PROFILE_DIR / "rules.md"
-GENERATED_WORKER_RULES = PROFILE_DIR / ".cache" / "worker-rules.md"
 LOCK_PATH = PROFILE_DIR / ".cache" / "zed.lock"
-RUNTIMES_PATH = PROFILE_DIR / "config" / "runtimes.json"
-MODEL_RANKING_PATH = PROFILE_DIR / "config" / "model-ranking.json"
-RUNTIME_STATE_PATH = PROFILE_DIR / ".cache" / "runtime-state.json"
+CLAUDE_CONFIG_PATH = PROFILE_DIR / "config" / "claude.json"
 WATCH_STATE_PATH = PROFILE_DIR / ".cache" / "watch-state.json"
 SPEND_LEDGER_PATH = PROFILE_DIR / "db" / "spend.jsonl"
 WAKE_QUEUE_PATH = PROFILE_DIR / ".cache" / "wake-queue.json"
 WATCHER_PID_PATH = PROFILE_DIR / ".cache" / "watch.pid"
 WATCHER_LOCK_PATH = PROFILE_DIR / ".cache" / "watch.lock"
 ARM_STAMP_PATH = PROFILE_DIR / ".cache" / "hook-arm.stamp"  # touched by the Stop hook's arm step on every firing
-COPILOT_INSTRUCTIONS_DIR = PROFILE_DIR / ".cache" / "copilot-instructions"
-DASHBOARD_PAGE = ZED_HOME / "templates" / "dashboard.html"
-DASHBOARD_STATE_PATH = PROFILE_DIR / ".cache" / "dashboard.json"
 
-# What Zed needs to know about each agent CLI it can run on. Everything user-specific (which ones
-# they have, preference order, model policy, permission mode) is in <profile>/config/runtimes.json.
-RUNTIMES = {
-    "pi": {
-        "cli": "pi",
-        "session_env": "PI_SESSION_ID",
-        "pid_env": "PI_PID",
-        "efforts": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
-        "trust_prompt": "Trust project-local files",
-        "trust_keys": ["enter"],
-        "limit_patterns": [r"rate.limited", r"rate limit", r"quota exceeded", r"429\b", r"resource exhausted"],
-    },
-    "claude": {
-        "cli": "claude",
-        "session_env": "CLAUDE_CODE_SESSION_ID",  # set in the shell of every Claude Code session
-        "pid_env": "CLAUDE_PID",
-        "efforts": ["low", "medium", "high", "xhigh", "max"],
-        "trust_prompt": "Yes, I trust this folder",
-        "trust_keys": ["down", "enter"],
-        # e.g. "You've hit your session limit · resets 3pm", "Usage limit reached · continuing automatically at …"
-        "limit_patterns": [r"hit your \w+ limit", r"usage limit reached", r"limit reached\b.*\breset"],
-    },
-    "copilot": {
-        "cli": "copilot",
-        "session_env": "COPILOT_AGENT_SESSION_ID",
-        "pid_env": "COPILOT_LOADER_PID",
-        "efforts": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-        "trust_prompt": "Do you trust the files in this folder?",
-        "trust_keys": ["enter"],  # "1. Yes": trust for this session only
-        # e.g. "You've been rate limited on the current model. Would you like to switch to …"
-        "limit_patterns": [r"rate.limited", r"rate limit (reached|exceeded)", r"quota (reached|exceeded)",
-                           r"out of (ai )?credits", r"no (remaining )?(premium requests|ai credits)"],
-        "credits_pattern": r"Session: ([\d.]+) AIC used",
-    },
-    "opencode": {
-        "cli": "opencode",
-        "session_env": "OPENCODE_SESSION_ID",
-        "pid_env": "OPENCODE_PID",
-        "efforts": ["minimal", "low", "medium", "high", "max"],
-        "trust_prompt": "",
-        "trust_keys": [],
-        "limit_patterns": [r"rate.limited", r"rate limit", r"quota exceeded", r"429\b", r"out of credits"],
-    },
-}
+# Claude Code is the only runtime. The model, effort ceiling and capacity live in <profile>/config/claude.json.
+EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+TRUST_PROMPT = "Yes, I trust this folder"
+TRUST_KEYS = ["down", "enter"]
+# e.g. "You've hit your session limit · resets 3pm", "Usage limit reached · continuing automatically at …"
+LIMIT_PATTERNS = [r"hit your \w+ limit", r"usage limit reached", r"limit reached\b.*\breset"]
+# OpenCode is an opt-in worker runtime (`spawn runtime=opencode`) and a possible host for Zed itself. Its TUI takes --model and
+# --auto but no effort or session-name flag, and shows no trust dialog (opencode.ai/docs/cli, 2026-11-03).
+OPENCODE_START_TIMEOUT_MS = 180000
 
 TASK_STATES = ["intake", "active", "waiting_user", "in_review", "pr_open", "parked", "done", "cancelled"]
 SESSION_STATES = ["running", "waiting_user", "finished", "closed"]
-ASSIGN_ORIGINS = ["zed", "user", "schedule"]
 OPEN_TASK_STATES = ["intake", "active", "waiting_user", "in_review", "pr_open", "parked"]
-# How STATUS.md and the dashboard group the open tasks; finished ones (done, cancelled) follow separately.
+# How STATUS.md groups the open tasks; finished ones (done, cancelled) follow separately.
 TASK_GROUPS = [("In progress", ["active", "waiting_user", "in_review"]),
                ("PR open", ["pr_open"]),
                ("Not started / parked", ["intake", "parked"])]
-INBOX_KINDS = ["answer", "comment", "rating", "task"]
-RATINGS = ["good", "not_good"]
-RATABLE_STATES = ["pr_open", "done"]  # the worker's output has been delivered, so it can be judged
-FEEDBACK_TEXT_MAX = 10000  # characters, per field of a piece of dashboard feedback
-FEEDBACK_TITLE_MAX = 200
-DASHBOARD_PORT = 8765
-DASHBOARD_BODY_MAX = 64 * 1024  # bytes of JSON the dashboard accepts in one request
-# The page may run only its own inline script and style (matched by a per-response nonce), and talk only to
-# its own server: whatever it shows can't be sent anywhere else.
-DASHBOARD_CSP = ("default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; connect-src 'self'; "
-                 "img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
-
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
   id INTEGER PRIMARY KEY,
@@ -162,15 +94,13 @@ CREATE TABLE IF NOT EXISTS sessions (
   agent TEXT NOT NULL,
   workspace_id TEXT,
   pane_id TEXT,
-  claude_session_id TEXT,  -- the agent CLI's own session id, whichever runtime
+  claude_session_id TEXT,  -- Claude Code's own session id
   pr_url TEXT,
   status TEXT NOT NULL DEFAULT 'running',
   external INTEGER NOT NULL DEFAULT 0,
-  runtime TEXT NOT NULL DEFAULT 'claude',
   model TEXT,
   effort TEXT,
   brief TEXT,
-  credits REAL,  -- Copilot AI credits used, as last read from the session's footer
   pr_state TEXT,  -- open | merged | closed, as last polled by the watcher
   scratch TEXT,  -- per-session scratch folder in an in-place (non-git) project; removed on close
   created_at TEXT NOT NULL,
@@ -193,21 +123,6 @@ CREATE TABLE IF NOT EXISTS events (
   kind TEXT NOT NULL,
   text TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS inbox (  -- feedback from the dashboard, the only table it writes
-  id INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL,  -- answer | comment | rating | task (INBOX_KINDS)
-  task_id INTEGER REFERENCES tasks(id),
-  question_id INTEGER REFERENCES questions(id),  -- answer: the question it answers
-  rating TEXT,  -- rating: good | not_good
-  title TEXT,  -- task: what the new task is called
-  jira TEXT,  -- task: the ticket id, if the user gave one
-  repo TEXT,  -- task: the repo (a key of projects.json), if the user picked one
-  text TEXT,  -- the answer, the comment, the reason for a rating, or the new task's details
-  status TEXT NOT NULL DEFAULT 'new',  -- new | handled
-  response TEXT,  -- what Zed did with it, shown back to the user on the dashboard
-  created_at TEXT NOT NULL,
-  handled_at TEXT
-);
 """
 
 
@@ -217,7 +132,7 @@ def now():
 
 def require_profile():
     if not (PROFILE_DIR / "profile.md").exists():
-        die(f"no profile at {PROFILE_DIR}. Start `pi`, `claude` or `copilot` in {ZED_HOME} to run onboarding, "
+        die(f"no profile at {PROFILE_DIR}. Start `claude` in {ZED_HOME} to run onboarding, "
             "or set ZED_PROFILE_DIR.")
 
 
@@ -229,12 +144,11 @@ def db():
     conn.executescript(SCHEMA)
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(sessions)")]
     # migrate DBs created before these columns existed
-    for col, decl in [("external", "INTEGER NOT NULL DEFAULT 0"), ("runtime", "TEXT NOT NULL DEFAULT 'claude'"),
-                      ("model", "TEXT"), ("effort", "TEXT"), ("brief", "TEXT"), ("credits", "REAL"), ("pr_state", "TEXT"),
+    for col, decl in [("external", "INTEGER NOT NULL DEFAULT 0"), ("model", "TEXT"), ("effort", "TEXT"), ("brief", "TEXT"), ("pr_state", "TEXT"),
                       ("scratch", "TEXT")]:
         if col not in cols:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
-    zedlib.ensure_employee_schema(conn)
+    zedlib.ensure_session_schema(conn)
     return conn
 
 
@@ -252,42 +166,48 @@ def run(cmd, check=True, cwd=None):
 
 # ---------------------------------------------------------------- lock
 
-def ancestor_pids():
-    pids, pid = [], os.getppid()
-    while pid > 1 and len(pids) < 50:
-        pids.append(pid)
-        r = run(["ps", "-o", "ppid=", "-p", str(pid)], check=False)
-        pid = int(r.stdout.strip() or 0)
-    return pids
+
+GONE = "gone"
+
+
+def pane_record(pane):
+    """What herdr knows of a pane: its dict, GONE once it no longer exists, None when unknown
+    (no pane, no herdr binary, odd output)."""
+    if not pane:
+        return None
+    try:
+        r = run(["herdr", "pane", "get", pane], check=False)
+        if "pane_not_found" in r.stdout + r.stderr:
+            return GONE
+        return json.loads(r.stdout)["result"]["pane"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def session_in(record):
+    """The agent session herdr records in a pane record, or None."""
+    if not isinstance(record, dict):
+        return None
+    return (record.get("agent_session") or {}).get("value")
+
+
+def pane_session(pane):
+    """The agent session herdr records for a pane: None when herdr, the pane or the session is unknown.
+    This is the authority: after a restart, Bash may run under a helper whose env session id differs."""
+    return session_in(pane_record(pane))
 
 
 def me():
-    """Identity of the agent session running this command (falls back to the parent shell).
-    Env vars are inherited, so when both runtimes' vars are set, the nearest ancestor process wins."""
-    found = {name: int(os.environ[rt["pid_env"]]) for name, rt in RUNTIMES.items()
-             if os.environ.get(rt["pid_env"], "").isdigit()}
-    if "pi" not in found and (os.environ.get("PI_SESSION_ID") or os.environ.get("PI_CODING_AGENT")):
-        pi_pid = None
-        for p in ancestor_pids():
-            comm = run(["ps", "-o", "comm=", "-p", str(p)], check=False).stdout.strip()
-            if comm.endswith("pi") or comm.endswith("node"):
-                pi_pid = p
-                break
-        found["pi"] = pi_pid or os.getppid()
-    runtime = None
-    if len(found) > 1:
-        order = ancestor_pids()
-        runtime = min(found, key=lambda n: order.index(found[n]) if found[n] in order else len(order))
-    elif found:
-        runtime = next(iter(found))
-    rt = RUNTIMES.get(runtime, {})
-    return {"pane": os.environ.get("HERDR_PANE_ID"), "runtime": runtime,
-            "agent_session": os.environ.get(rt["session_env"]) if rt else None,
-            "pid": found.get(runtime) or os.getppid()}
+    """Identity of the Claude Code (or OpenCode) session running this command (falls back to the parent shell). Inside herdr
+    the pane's session wins over the env var (see pane_session)."""
+    pane = os.environ.get("HERDR_PANE_ID")
+    session = pane_session(pane) or os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("OPENCODE_SESSION_ID")
+    pid = os.environ.get("CLAUDE_PID", "") or os.environ.get("OPENCODE_PID", "")
+    return {"pane": pane, "agent_session": session, "pid": int(pid) if pid.isdigit() else os.getppid()}
 
 
 def session_of(h):
-    return h.get("agent_session") or h.get("claude_session")  # claude_session: locks written before runtimes
+    return h.get("agent_session")
 
 
 def same_holder(a, b):
@@ -297,21 +217,21 @@ def same_holder(a, b):
 
 
 def holder_alive(h):
-    """False once the holder's process is gone, or its herdr pane is gone or runs another session."""
+    """False once the holder's herdr pane is gone or runs another session. With a pane and a session the
+    pane decides (the recorded pid may be a short-lived helper); a pane without a session, or no herdr,
+    leaves the pid to decide: it must still exist."""
+    record = pane_record(h.get("pane"))
+    if record == GONE:
+        return False
+    session = session_in(record) if session_of(h) else None
+    if session:
+        return session == session_of(h)
     try:
         os.kill(h["pid"], 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         pass
-    if h.get("pane"):
-        r = run(["herdr", "pane", "get", h["pane"]], check=False)
-        if "pane_not_found" in r.stdout + r.stderr:
-            return False
-        if r.returncode == 0 and session_of(h):
-            session = (json.loads(r.stdout)["result"]["pane"].get("agent_session") or {}).get("value")
-            if session and session != session_of(h):
-                return False
     return True
 
 
@@ -322,13 +242,34 @@ def read_lock():
         return None
 
 
+def heal_lock(h, caller):
+    """A lock written under a helper's session id goes stale once herdr's pane session differs. When the
+    caller sits in the holder's pane and that pane's session is the caller's, record the caller as holder.
+    pane_session is asked again on purpose: me() also falls back to the env id, which is no proof."""
+    pane = h.get("pane")
+    if not (pane and pane == caller.get("pane") and caller.get("agent_session")
+            and session_of(h) != caller["agent_session"] and pane_session(pane) == caller["agent_session"]):
+        return h
+    if read_lock() != h:  # changed since it was read (e.g. a take-over): not ours to overwrite
+        return h
+    healed = h | {key: caller[key] for key in ("agent_session", "pid")}
+    healed.pop("claude_session", None)
+    tmp = LOCK_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(healed, indent=2) + "\n")
+    os.replace(tmp, LOCK_PATH)
+    print(f"zed: lock in pane {pane} healed: session {session_of(h) or '-'} -> {caller['agent_session']}",
+          file=sys.stderr)
+    return healed
+
+
 def holds_lock():
     h = read_lock()
-    return bool(h) and same_holder(h, me())
+    caller = me()
+    return bool(h) and same_holder(heal_lock(h, caller), caller)
 
 
 def describe(h):
-    return (f"pane {h.get('pane') or '-'}, {h.get('runtime') or 'claude'} session {session_of(h) or '-'}, "
+    return (f"pane {h.get('pane') or '-'}, Claude session {session_of(h) or '-'}, "
             f"pid {h.get('pid')}, since {h.get('acquired_at')}")
 
 
@@ -350,6 +291,7 @@ def cmd_lock(args):
     with open(LOCK_PATH.with_suffix(".guard"), "w") as guard:
         fcntl.flock(guard, fcntl.LOCK_EX)  # serialise read-modify-write of the lock file
         h, caller = read_lock(), me()
+        h = heal_lock(h, caller) if h else h
         alive = bool(h) and holder_alive(h)
         if h and not alive and not same_holder(h, caller):
             LOCK_PATH.unlink(missing_ok=True)
@@ -385,17 +327,11 @@ def herdr_json(args):
     return json.loads(r.stdout)
 
 
-# ---------------------------------------------------------------- runtimes
+# ---------------------------------------------------------------- Claude settings
 
-def runtime_config():
-    """The profile's runtimes.json; a profile without one is Claude-only (as before runtimes existed)."""
-    if not RUNTIMES_PATH.exists():
-        return {"order": ["claude"], "runtimes": {"claude": {"enabled": True}}}
-    return json.loads(RUNTIMES_PATH.read_text())
-
-
-def runtime_settings(name):
-    return runtime_config().get("runtimes", {}).get(name, {})
+def claude_config():
+    """The profile's config/claude.json: {"model", "effort" (the ceiling), "effort_by_kind", "max_running"}; a profile without one uses the CLI's defaults."""
+    return read_json(CLAUDE_CONFIG_PATH, {})
 
 
 def read_json(path, default):
@@ -407,283 +343,36 @@ def read_json(path, default):
         die(f"invalid JSON in {path}: {e}")
 
 
-def runtime_state():
-    return read_json(RUNTIME_STATE_PATH, {})
+def pick_model(kind):
+    """(model, effort, reason) for a new session: claude.json's model, and its effort for this kind of work
+    (effort_by_kind), never above claude.json's effort ceiling. None = let Claude Code use its default."""
+    cfg = claude_config()
+    effort = (cfg.get("effort_by_kind") or {}).get(kind or "") or cfg.get("effort")
+    cap = cfg.get("effort")
+    if effort and cap in EFFORTS and EFFORTS.index(effort) > EFFORTS.index(cap):
+        effort = cap
+    return cfg.get("model"), effort, "claude.json" if cfg else "Claude Code default (no claude.json)"
 
 
-def runtime_report(name):
-    """installed / enabled / limited for one runtime, as a dict."""
-    if name not in RUNTIMES:
-        die(f"unknown runtime '{name}'. Known: {', '.join(RUNTIMES)}")
-    cfg = runtime_config()
-    return {"runtime": name, "installed": bool(shutil.which(RUNTIMES[name]["cli"])),
-            "enabled": name in cfg.get("order", []) and cfg.get("runtimes", {}).get(name, {}).get("enabled", True),
-            "limited": runtime_state().get(name)}
-
-
-def choose_runtime(requested="auto", exclude=()):
-    """The runtime to start a session on: the one asked for, or the first usable one in the profile's order."""
-    if requested and requested != "auto":
-        rep = runtime_report(requested)
-        if not (rep["installed"] and rep["enabled"]) or rep["limited"]:
-            die(f"runtime '{requested}' is not usable here: {rep}")
-        return requested
-    order = [r for r in runtime_config().get("order", []) if r not in exclude]
-    for name in order:
-        rep = runtime_report(name)
-        if rep["installed"] and rep["enabled"] and not rep["limited"]:
-            return name
-    die("no runtime available: " + "; ".join(json.dumps(runtime_report(n)) for n in order)
-        + ". Wait for a limit to reset, or `bin/zed runtime ok <runtime>` if it already has.")
-
-
-def cmd_runtime(args):
-    """runtime status | runtime limited <rt> [until=<when>] [note...] | runtime ok <rt>"""
-    sub = args[0] if args else "status"
-    require_profile()
-    if sub == "status":
-        for name in RUNTIMES:
-            rep = runtime_report(name)
-            model, effort, why = pick_model(name)
-            print(json.dumps(rep | {"model": model, "effort": effort, "model_choice": why}))
-        print("order: " + " → ".join(runtime_config().get("order", [])))
-        return
-    if len(args) < 2:
-        die("runtime limited <runtime> [until=<when>] [note...] | runtime ok <runtime>")
-    name = args[1]
-    runtime_report(name)
-    conn = db()
-    require_lock()
-    state = runtime_state()
-    if sub == "limited":
-        until = next((a[6:] for a in args[2:] if a.startswith("until=")), None)
-        note = " ".join(a for a in args[2:] if not a.startswith("until="))
-        state[name] = {"since": now(), "until": until, "note": note}
-        log_event(conn, None, "runtime", f"{name} limited" + (f" until {until}" if until else "") + (f": {note}" if note else ""))
-    elif sub == "ok":
-        state.pop(name, None)
-        log_event(conn, None, "runtime", f"{name} available again")
-    else:
-        die(f"unknown runtime subcommand {sub}")
-    RUNTIME_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    RUNTIME_STATE_PATH.write_text(json.dumps(state, indent=2) + "\n")
-    conn.commit()
-    write_status(conn)
-    print(json.dumps(runtime_report(name)))
-
-
-# ---------------------------------------------------------------- models
-
-def norm_model(name):
-    return re.sub(r"[^a-z0-9]", "", name.lower())
-
-
-def available_models(runtime):
-    """Model ids this runtime accepts, as {normalised: id}. The profile may pin a list per runtime."""
-    pinned = runtime_settings(runtime).get("models")
-    if pinned is not None:
-        return {norm_model(m): m for m in pinned}
-    if runtime == "copilot":  # `copilot help config` lists the models this account can use
-        if not shutil.which("copilot"):
-            return {}
-        text = run(["copilot", "help", "config"], check=False).stdout
-        section = text.split("`model`", 1)[1].split("\n\n", 1)[0] if "`model`" in text else ""
-        return {norm_model(m): m for m in re.findall(r'-\s+"([^"]+)"', section)}
-    if runtime in ("claude", "pi"):  # Claude Code and Pi accept any model ID configured or given
-        return None
-    return {}
-
-
-def runtime_model_id(runtime, model, available):
-    if available is None:  # claude / pi
-        if runtime == "claude":
-            return model.replace(".", "-") if norm_model(model).startswith("claude") else None
-        return model  # pi accepts any model id
-    return available.get(norm_model(model))
-
-
-def model_ranking():
-    return read_json(MODEL_RANKING_PATH, None)
-
-
-def pick_model(runtime):
-    """(model, effort, reason) for a new session on `runtime`, per the profile's model policy.
-    model/effort None = let the CLI use its own default."""
-    rs = runtime_settings(runtime)
-    if rs.get("model"):  # an explicit choice in the profile always wins
-        return rs["model"], rs.get("effort"), "fixed in runtimes.json"
-    policy = runtime_config().get("model_policy", {"method": "default"})
-    method = policy.get("method", "default")
-    if method == "default":
-        return None, None, "CLI default (model_policy.method=default)"
-    if method != "attractive-quadrant":
-        die(f"unknown model_policy.method '{method}' (default | attractive-quadrant)")
-    ranking = model_ranking()
-    if not ranking or not ranking.get("entries"):
-        return None, None, f"CLI default: no model ranking yet ({MODEL_RANKING_PATH.name}; see the `models` skill)"
-    age = (datetime.now() - datetime.strptime(ranking["imported_at"][:10], "%Y-%m-%d")).days
-    stale = f"; ranking is {age} days old, refresh it (`models` skill)" if age > policy.get("max_age_days", 14) else ""
-    entries = [e for e in ranking["entries"] if e.get("intelligence") is not None and e.get("cost_per_task") is not None]
-    available = available_models(runtime)
-    offered = [(runtime_model_id(runtime, e["model"], available), e) for e in entries]
-    offered = [(mid, e) for mid, e in offered if mid]
-    if not offered:
-        return None, None, f"CLI default: no ranked model is offered by {runtime}{stale}"
-
-    def quadrant(population):
-        # The "most attractive quadrant" of Intelligence vs Cost per task: at least the median intelligence
-        # and at most the median cost of `population`. The most intelligent offered model there (cheaper on ties).
-        mid_i = statistics.median(e["intelligence"] for e in population)
-        mid_c = statistics.median(e["cost_per_task"] for e in population)
-        inside = [(mid, e) for mid, e in offered if e["intelligence"] >= mid_i and e["cost_per_task"] <= mid_c]
-        best = max(inside, key=lambda c: (c[1]["intelligence"], -c[1]["cost_per_task"]), default=None)
-        return best, f"medians {mid_i:g}/{mid_c:g}"
-
-    best, medians = quadrant(entries)
-    scope = "all ranked models"
-    if not best:  # none of this runtime's models is in the overall quadrant: use its own models' quadrant
-        best, medians = quadrant([e for _, e in offered])
-        scope = f"{runtime}'s own models (none in the overall quadrant)"
-    if not best:  # still empty: the cheapest of its models with at least their median intelligence
-        mid_i = statistics.median(e["intelligence"] for _, e in offered)
-        best = min(((m, e) for m, e in offered if e["intelligence"] >= mid_i),
-                   key=lambda c: (c[1]["cost_per_task"], -c[1]["intelligence"]))
-        scope, medians = f"{runtime}'s own models (empty quadrant), cheapest at or above", f"median intelligence {mid_i:g}"
-    mid, e = best
-    efforts = RUNTIMES[runtime]["efforts"]
-    effort = e.get("effort") if e.get("effort") in efforts else None
-    cap, capped = policy.get("max_effort"), ""
-    if effort and cap in efforts and efforts.index(effort) > efforts.index(cap):
-        effort, capped = cap, f"; effort capped at {cap} (model_policy.max_effort)"
-    return mid, effort, (f"{e.get('name', e['model'])}: intelligence {e['intelligence']}, cost/task {e['cost_per_task']} "
-                         f"(quadrant of {scope}, {medians}; ranking of {ranking['imported_at'][:10]}){stale}{capped}")
-
-
-def apply_ceiling(runtime, model, effort, why):
-    """Enforce the profile's per-runtime ceiling ({"model", "effort"} in runtimes.json): no model that
-    costs more per task than the ceiling model, no effort above the ceiling effort. Applies to overrides too."""
-    ceiling = runtime_settings(runtime).get("ceiling")
-    if not ceiling:
-        return model, effort, why
-    efforts = RUNTIMES[runtime]["efforts"]
-    cap = ceiling.get("effort")
-    if cap in efforts and (effort is None or efforts.index(effort) > efforts.index(cap)):
-        effort, why = cap, why + f"; effort set to the ceiling ({cap})"
-    if model is None:
-        return ceiling["model"], effort, why + f"; model set to the ceiling ({ceiling['model']})"
-    costs = {norm_model(e["model"]): e["cost_per_task"] for e in (model_ranking() or {}).get("entries", [])
-             if e.get("cost_per_task") is not None}
-    mine, top = costs.get(norm_model(model)), costs.get(norm_model(ceiling["model"]))
-    if norm_model(model) != norm_model(ceiling["model"]) and (mine is None or top is None or mine > top):
-        die(f"{model} is not known to cost less per task than the ceiling {ceiling['model']} "
-            f"(runtimes.json {runtime}.ceiling); refusing to spawn")
-    return model, effort, why
-
-
-def effort_for_kind(runtime, kind, effort, why):
-    """The profile's model_policy.effort_by_kind picks the reasoning effort by the kind of work (e.g. medium for a
-    well-specified story, high for investigation or design), never above model_policy.max_effort."""
-    policy = runtime_config().get("model_policy", {})
-    wanted = (policy.get("effort_by_kind") or {}).get(kind or "")
-    efforts = RUNTIMES[runtime]["efforts"]
-    if not wanted:
-        return effort, why
-    if wanted not in efforts:
-        die(f"effort_by_kind[{kind}]='{wanted}' is not an effort {runtime} accepts: {efforts}")
-    cap = policy.get("max_effort")
-    if cap in efforts and efforts.index(wanted) > efforts.index(cap):
-        wanted = cap
-    return wanted, why + f"; effort {wanted} for kind '{kind}' (model_policy.effort_by_kind)"
-
-
-def running_count(conn, runtime):
-    """How many sessions of this runtime are open right now: every live agent of that CLI in herdr, i.e. Zed itself,
-    its workers and the user's own, because they all draw on the same plan. Falls back to the DB's own sessions
-    when herdr can't be listed."""
+def running_count(conn):
+    """How many Claude sessions are open right now: every live Claude agent in herdr, i.e. Zed itself, its workers
+    and the user's own, because they all draw on the same plan. Falls back to the DB's own sessions when herdr
+    can't be listed."""
     live = live_agents()
     if live:
-        return sum(1 for a in live.values() if a.get("agent") == runtime)
-    return conn.execute("SELECT COUNT(*) FROM sessions WHERE runtime=? AND external=0 AND status IN ('running','waiting_user')",
-                        (runtime,)).fetchone()[0]
+        return sum(1 for a in live.values() if a.get("agent") == "claude")
+    return conn.execute("SELECT COUNT(*) FROM sessions WHERE external=0 AND status IN ('running','waiting_user')").fetchone()[0]
 
 
-def require_capacity(conn, runtime, tid):
-    """At most runtimes.<rt>.max_running sessions per runtime, counting all of them (see running_count): a plan's
-    limits are shared. Beyond it the task stays queued (exit 75, like firstmate's project capacity)."""
-    cap = runtime_settings(runtime).get("max_running")
-    n = running_count(conn, runtime)
+def require_capacity(conn, tid):
+    """At most claude.json max_running sessions, counting all of them (see running_count): a plan's limits are
+    shared. Beyond it the task stays queued (exit 75)."""
+    cap = claude_config().get("max_running")
+    n = running_count(conn)
     if cap is not None and n >= cap:
-        print(f"zed: queued: {n} {runtime} sessions are open (Zed, workers and your own; max_running {cap} in runtimes.json). "
+        print(f"zed: queued: {n} Claude sessions are open (Zed, workers and your own; max_running {cap} in claude.json). "
               f"T{tid} stays queued; spawn it again when one finishes (`bin/zed session list`).", file=sys.stderr)
         sys.exit(75)
-
-
-def coordinator_command(mode):
-    """The command line that starts Zed's own session in `mode` ('routine' or 'judgment'), from the
-    profile's runtimes.json `coordinator.<mode>` ({"model", "effort"}), never above the runtime ceiling."""
-    choice = runtime_config().get("coordinator", {}).get(mode)
-    if mode not in ("routine", "judgment") or not choice:
-        die(f"runtimes.json has no coordinator.{mode} ({{\"model\", \"effort\"}}); modes: routine, judgment")
-    order = runtime_config().get("order", ["claude"])
-    rt = order[0] if order else "claude"
-    if rt not in RUNTIMES:
-        rt = "claude"
-    model, effort, _ = apply_ceiling(rt, choice.get("model"), choice.get("effort"), "")
-    if effort and effort not in RUNTIMES[rt]["efforts"]:
-        die(f"invalid coordinator effort '{effort}'")
-    if rt == "pi":
-        return ["pi", *(["--model", model] if model else []), *(["--thinking", effort] if effort else [])]
-    return [RUNTIMES[rt]["cli"], *(["--model", model] if model else []), *(["--effort", effort] if effort else [])]
-
-
-def cmd_coordinator(args):
-    """coordinator [routine|judgment] [--print] — start Zed's own Claude session on the cheaper routine model/effort (the
-    default) or the stronger judgment one, in Zed's home. --print only shows the command and the `/model` switch."""
-    mode = next((a for a in args if not a.startswith("--")), "routine")
-    cmd = coordinator_command(mode)
-    if "--print" in args:
-        print(" ".join(cmd) + f"\n(inside a session: /model {cmd[cmd.index('--model') + 1] if '--model' in cmd else '<model>'})")
-        return
-    os.chdir(ZED_HOME)
-    os.execvp(cmd[0], cmd)
-
-
-def cmd_models(args):
-    """models show | models import <ranking.json>"""
-    sub = args[0] if args else "show"
-    require_profile()
-    if sub == "show":
-        r = model_ranking()
-        print(f"ranking: {MODEL_RANKING_PATH} " + (f"({len(r.get('entries', []))} entries, imported {r.get('imported_at')}, "
-                                                  f"source: {r.get('source')})" if r else "(none)"))
-        print("policy: " + json.dumps(runtime_config().get("model_policy", {"method": "default"})))
-        for name in runtime_config().get("order", []):
-            print(f"{name}: " + json.dumps(dict(zip(("model", "effort", "reason"), pick_model(name)))))
-    elif sub == "import":
-        if len(args) < 2:
-            die("models import <ranking.json>")
-        require_lock()
-        data = json.loads(Path(args[1]).read_text())
-        for e in data.get("entries", []):
-            missing = [k for k in ("model", "intelligence", "cost_per_task") if k not in e]
-            if missing:
-                die(f"ranking entry {e} lacks {missing}")
-            if not isinstance(e["model"], str) or not e["model"].strip():
-                die("ranking entries need a non-empty model id")
-            for k in ("intelligence", "cost_per_task"):
-                if (type(e[k]) not in (int, float) or not math.isfinite(e[k]) or e[k] < 0):
-                    die(f"ranking entry {e['model']} needs a finite, non-negative number for {k}")
-            if e.get("effort") and not any(e["effort"] in rt["efforts"] for rt in RUNTIMES.values()):
-                die(f"unknown reasoning effort '{e['effort']}' for {e['model']}")
-        if not data.get("entries"):
-            die("ranking has no entries")
-        data["imported_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-        MODEL_RANKING_PATH.parent.mkdir(parents=True, exist_ok=True)
-        MODEL_RANKING_PATH.write_text(json.dumps(data, indent=2) + "\n")
-        print(f"imported {len(data['entries'])} entries")
-        cmd_models(["show"])
-    else:
-        die("models show | models import <ranking.json>")
 
 
 def projects():
@@ -744,47 +433,6 @@ def resolve_session(conn, ref):
     return s
 
 
-# ---------------------------------------------------------------- inbox
-
-def one_line(text, width):
-    text = " ".join((text or "").split())
-    return text if len(text) <= width else text[:width - 1].rstrip() + "…"
-
-
-def inbox_what(item):
-    """What an inbox item is, in a few words: 'comment on T14'."""
-    if item["kind"] == "answer":
-        return f"answer to Q{item['question_id']}" + (f" (T{item['task_id']})" if item["task_id"] else "")
-    if item["kind"] == "comment":
-        return f"comment on T{item['task_id']}"
-    if item["kind"] == "rating":
-        return f"rating of T{item['task_id']}: {item['rating'].replace('_', ' ')}"
-    return "new task"
-
-
-def inbox_summary(item, width=100):
-    """One line for STATUS.md and watcher events: '#7 comment on T14: "Please also …"'."""
-    is_task = item["kind"] == "task"
-    detail = one_line(item["title"] if is_task else item["text"], width)
-    line = f"#{item['id']} {inbox_what(item)}" + (f': "{detail}"' if detail else "")
-    extras = [f"{label} {item[key]}" for label, key in (("ticket", "jira"), ("repo", "repo")) if is_task and item[key]]
-    return line + (f" ({', '.join(extras)})" if extras else "")
-
-
-def inbox_detail(item):
-    """An inbox item in full, for `zed inbox`."""
-    out = [f"#{item['id']} [{item['status']}] {inbox_what(item)} · {item['created_at']}"]
-    if item["kind"] == "task":
-        out.append(f"    title: {item['title']}")
-        meta = [f"{label}: {item[key]}" for label, key in (("ticket", "jira"), ("repo", "repo")) if item[key]]
-        if meta:
-            out.append("    " + " · ".join(meta))
-    out.extend("    " + line for line in (item["text"] or "").splitlines())
-    if item["status"] == "handled":
-        out.append(f"    → handled {item['handled_at']}" + (f": {item['response']}" if item["response"] else ""))
-    return "\n".join(out)
-
-
 # ---------------------------------------------------------------- status
 
 def herdr_agents():
@@ -803,7 +451,6 @@ def herdr_agents():
 
 
 STALL_MINUTES = 30          # running with no plan progress for this long → watch event
-USAGE_ALERT_OUTPUT = 500_000  # report every time a Claude session passes another multiple of this many output tokens
 
 
 def note_session_id(conn, s, a):
@@ -843,155 +490,27 @@ def claude_usage(worktree, sid):
     return total
 
 
-QUOTA_DEFAULT_WINDOW_HOURS = 5
-QUOTA_DEFAULT_COUNTS = ("output", "input", "cache_write")
-
-
-def quota_settings():
-    return runtime_config().get("quota", {})
-
-
-def window_usage(hours, root=None):
-    """Claude tokens used in the last `hours` hours by every session on this machine (Zed's workers, Zed itself,
-    the user's own), summed from the transcripts under ~/.claude/projects. Returns (totals, {project dir: output tokens})."""
-    root = root or Path.home() / ".claude" / "projects"
-    cutoff = time.time() - hours * 3600
-    since = datetime.fromtimestamp(cutoff, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-    total, by_project, seen = {"output": 0, "input": 0, "cache_read": 0, "cache_write": 0}, {}, set()
-    for f in root.glob("**/*.jsonl"):
-        if f.stat().st_mtime < cutoff:
-            continue
-        project_dir = f.relative_to(root).parts[0]
-        with f.open(errors="replace") as fh:
-            for line in fh:
-                if '"usage"' not in line:
-                    continue
-                try:
-                    r = json.loads(line)
-                except ValueError:
-                    continue
-                m = r.get("message")
-                u = m.get("usage") if isinstance(m, dict) else None
-                if not u or str(r.get("timestamp", ""))[:19] < since or (m.get("id"), r.get("requestId")) in seen:
-                    continue
-                seen.add((m.get("id"), r.get("requestId")))
-                for key, field in (("output", "output_tokens"), ("input", "input_tokens"),
-                                   ("cache_read", "cache_read_input_tokens"), ("cache_write", "cache_creation_input_tokens")):
-                    total[key] += u.get(field) or 0
-                by_project[project_dir] = by_project.get(project_dir, 0) + (u.get("output_tokens") or 0)
-    return total, by_project
-
-
-def quota_estimate():
-    """(counted tokens, threshold or None, window hours, totals, by_project) for the configured window."""
-    q = quota_settings()
-    hours = q.get("window_hours", QUOTA_DEFAULT_WINDOW_HOURS)
-    total, by_project = window_usage(hours)
-    counted = sum(total[k] for k in q.get("counts", QUOTA_DEFAULT_COUNTS))
-    return counted, q.get("threshold_tokens"), hours, total, by_project
-
-
-def quota_warning():
-    """A one-line warning when the estimate has passed the configured threshold; None otherwise (or if none is set)."""
-    counted, threshold, hours, _, _ = quota_estimate()
-    if threshold and counted >= threshold:
-        return (f"quota: ~{counted / 1e6:.1f}M tokens counted in the last {hours}h, past quota.threshold_tokens "
-                f"({threshold / 1e6:.1f}M): the plan may be close to its limit; consider waiting before starting more workers")
-    return None
-
-
-def cmd_quota(args):
-    """quota — estimate plan usage from the session transcripts: Claude tokens in the rolling window, per project."""
-    require_profile()
-    counted, threshold, hours, total, by_project = quota_estimate()
-    q = quota_settings()
-    print(f"window: last {hours}h, rolling" + ("" if "window_hours" in q else
-          f" (default; set quota.window_hours in runtimes.json: the plan's real window isn't known to Zed)"))
-    print(f"tokens: {total['output'] / 1e6:.2f}M output, {total['input'] / 1e6:.2f}M input, "
-          f"{total['cache_write'] / 1e6:.2f}M cache-write, {total['cache_read'] / 1e6:.0f}M cache-read")
-    print(f"counted ({'+'.join(q.get('counts', QUOTA_DEFAULT_COUNTS))}): {counted / 1e6:.2f}M" + (
-        f" of threshold {threshold / 1e6:.1f}M ({100 * counted / threshold:.0f}%)" if threshold else
-        " (no quota.threshold_tokens set: no warnings; Zed doesn't know the plan's limit)"))
-    for name, out in sorted(by_project.items(), key=lambda kv: -kv[1])[:5]:
-        print(f"  {out / 1e6:.2f}M output  {name}")
-
-
-CONTEXT_REFRESH_TOKENS = 150_000  # default for runtimes.claude.context_refresh_tokens
-CONTEXT_CHECK_SECONDS = 30
-
-
-def claude_context(worktree, sid):
-    """Size of a Claude session's context now: the input, cache-read and cache-write tokens of its last main-thread
-    turn (what it re-sends every turn), from the tail of its transcript. None if unknown."""
-    if not worktree or not sid:
-        return None
-    f = Path.home() / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(worktree)) / f"{sid}.jsonl"
-    try:
-        with f.open("rb") as fh:
-            fh.seek(0, 2)
-            fh.seek(max(0, fh.tell() - 512_000))
-            tail = fh.read().decode(errors="replace").splitlines()
-    except FileNotFoundError:
-        return None
-    for line in reversed(tail):
-        if '"usage"' not in line:
-            continue
-        try:
-            r = json.loads(line)
-        except ValueError:
-            continue
-        u = (r.get("message") or {}).get("usage") if isinstance(r.get("message"), dict) else None
-        if u and not r.get("isSidechain"):
-            return (u.get("input_tokens") or 0) + (u.get("cache_read_input_tokens") or 0) + (u.get("cache_creation_input_tokens") or 0)
-    return None
-
-
-def context_check(s, a, alerts):
-    """Flag a Claude worker whose context passed runtimes.claude.context_refresh_tokens (it re-sends all of it every
-    turn). Returns the flagged size once, when it is first seen."""
-    if s["runtime"] != "claude":
-        return None
-    seen = alerts.setdefault(s["id"], {})
-    if seen.get("refresh") or time.time() - seen.get("ctx_at", 0) < CONTEXT_CHECK_SECONDS:
-        return None
-    seen["ctx_at"] = time.time()
-    size = claude_context(s["worktree"], (a or {}).get("agent_session", {}).get("value") or s["claude_session_id"])
-    limit = runtime_settings("claude").get("context_refresh_tokens", CONTEXT_REFRESH_TOKENS)
-    if size and size >= limit:
-        seen["refresh"] = size
-        return size
-    return None
-
-
-def context_note(s, alerts):
-    size = alerts.get(s["id"], {}).get("refresh")
-    return f" · context {size // 1000}k tokens re-sent every turn: restart it fresh (`bin/zed handoff S{s['id']} restart`) once its question is answered" if size else ""
-
-
-def restart_for_context(conn, s, alerts):
-    """A flagged worker that ended its turn with nothing pending is restarted fresh (same runtime, worktree and
-    branch; the handoff note, plan and status file carry the state). Returns an event line."""
-    size = alerts[s["id"]].pop("refresh")
-    tag = f"S{s['id']} T{s['task_id']} {s['agent']}"
-    try:
-        conn.commit()
-        new = cmd_handoff([str(s["id"]), "restart"])
-    except SystemExit as e:
-        return f"{tag} · context restart FAILED (exit {e.code}); check `bin/zed session list` and the worktree"
-    return f"{tag} · restarted fresh as S{new}: its context had grown to {size // 1000}k tokens"
-
-
 def fmt_usage(u):
     return (f"{u['output'] / 1e6:.2f}M output, {(u['input'] + u['cache_write']) / 1e6:.1f}M input, "
             f"{u['cache_read'] / 1e6:.0f}M cache-read tokens")
 
 
-def task_plan_progress(task_id):
+def task_plan_progress(conn, task_id):
+    """(done, total) over the plans of the task's build and fix sessions."""
     done = todo = 0
-    for plan in plan_files(task_id):
+    for plan in plan_files(conn, task_id):
         d, t = plan_progress(plan)
         done, todo = done + d, todo + t
     return done, done + todo
+
+
+def session_plan_progress(conn, s):
+    """(done, total) of the session's own plan; the task's build progress when it recorded none (older sessions)."""
+    plan = zedlib.session_plan(s)
+    if plan and plan.is_file():
+        d, t = plan_progress(plan)
+        return d, d + t
+    return task_plan_progress(conn, s["task_id"])
 
 
 def spend_rows():
@@ -1002,36 +521,41 @@ def spend_rows():
 
 
 def record_spend(conn, s):
-    """Append what a session cost (tokens or Copilot credits), how long it ran and how far its plan got to the
-    spend ledger (db/spend.jsonl), when it is closed or handed over."""
+    """Append what a session cost (tokens), how long it ran and how far its plan got to the spend ledger
+    (db/spend.jsonl), when it is closed."""
     if s["external"]:
         return
-    usage = claude_usage(s["worktree"], s["claude_session_id"]) if s["runtime"] == "claude" else None
-    done, total = task_plan_progress(s["task_id"])
+    usage = claude_usage(s["worktree"], s["claude_session_id"])
+    done, total = session_plan_progress(conn, s)
     started = datetime.strptime(s["created_at"], "%Y-%m-%d %H:%M")
-    row = {"ts": now(), "session": s["id"], "task": s["task_id"], "repo": s["repo"], "runtime": s["runtime"],
+    row = {"ts": now(), "session": s["id"], "task": s["task_id"], "repo": s["repo"],
            "model": s["model"], "effort": s["effort"], "minutes": int((datetime.now() - started).total_seconds() // 60),
-           "tokens": usage, "credits": s["credits"], "plan_done": done, "plan_total": total}
+           "tokens": usage, "plan_done": done, "plan_total": total}
     SPEND_LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
     with SPEND_LEDGER_PATH.open("a") as f:
         f.write(json.dumps(row) + "\n")
 
 
-def spend_line(task_id, rows):
+def spend_line(conn, task_id, rows):
     """Spend against plan progress for a task, from its closed sessions' ledger rows."""
     mine = [r for r in rows if r["task"] == task_id]
     if not mine:
         return None
     out = sum((r["tokens"] or {}).get("output", 0) for r in mine)
-    credits = sum(r["credits"] or 0 for r in mine)
-    done, total = task_plan_progress(task_id)
-    spend = ", ".join(x for x in (f"{out / 1e6:.2f}M output tokens" if out else "", f"{credits:g} AI credits" if credits else "") if x) or "no usage recorded"
+    done, total = task_plan_progress(conn, task_id)
+    spend = f"{out / 1e6:.2f}M output tokens" if out else "no usage recorded"
     return (f"- spend (closed sessions): {spend}, {sum(r['minutes'] for r in mine)} min, plan {done}/{total} steps"
             + (f" (~{out / done / 1e3:.0f}k output tokens per step done)" if out and done else ""))
 
 
-def plan_files(task_id):
-    return sorted((PROFILE_DIR / "briefs").glob(f"T{task_id}-*-plan.md"))
+def plan_files(conn, task_id):
+    """The build and fix plans of a task (never review, QA or verify plans)."""
+    return zedlib.task_plans(conn, task_id)
+
+
+def session_plan_files(s):
+    plan = zedlib.session_plan(s)
+    return [plan] if plan and plan.is_file() else []
 
 
 def live_agents():
@@ -1056,21 +580,11 @@ def render_status(conn, live=None):
         lines.append("- Nothing.")
     lines.append("")
 
-    pending = conn.execute("SELECT * FROM inbox WHERE status='new' ORDER BY id").fetchall()
-    if pending:
-        lines.append("## Dashboard feedback to handle (`bin/zed inbox`, `inbox` skill)")
-        lines.append("")
-        lines.extend(f"- {inbox_summary(i, 160)} (sent {i['created_at']})" for i in pending)
-        lines.append("")
-
     def task_block(t):
         out = [f"### T{t['id']} · {t['jira'] or 'no-jira'} · {t['title']}",
                f"- status: **{t['status']}** · worktype: {t['worktype'] or '-'} · updated {t['updated_at']}"]
         if t["description"]:
             out.append(f"- {t['description']}")
-        credits = conn.execute("SELECT SUM(credits) FROM sessions WHERE task_id=?", (t["id"],)).fetchone()[0]
-        if credits is not None:
-            out.append(f"- Copilot AI credits used: {credits:g}")
         for s in conn.execute("SELECT * FROM sessions WHERE task_id=? ORDER BY id", (t["id"],)):
             state = s["status"]
             if s["status"] in ("running", "waiting_user") and s["pane_id"]:
@@ -1078,16 +592,18 @@ def render_status(conn, live=None):
                 state += f" / agent {a['agent_status']}" if a else " / agent NOT FOUND"
             pr = f" · PR {s['pr_url']}" if s["pr_url"] else ""
             ext = " (external)" if s["external"] else ""
-            rt = f" · {s['runtime']}" + (f" {s['model']}" if s["model"] else "") + (f" ({s['effort']})" if s["effort"] else "")
-            credits = f" · {s['credits']:g} AI credits" if s["credits"] is not None else ""
-            if s["runtime"] == "claude":
-                u = claude_usage(s["worktree"], s["claude_session_id"])
-                credits += f" · {fmt_usage(u)}" if u else ""
-            out.append(f"- S{s['id']}{ext} `{s['agent']}` {s['repo']} `{s['branch']}` ← `{s['base']}` · {state}{rt}{credits}{pr}")
-        for plan in plan_files(t["id"]):
+            rt = (f" · {s['model']}" if s["model"] else "") + (f" ({s['effort']})" if s["effort"] else "")
+            u = claude_usage(s["worktree"], s["claude_session_id"])
+            usage = f" · {fmt_usage(u)}" if u else ""
+            out.append(f"- S{s['id']}{ext} `{s['agent']}` {s['repo']} `{s['branch']}` ← `{s['base']}` · {state}{rt}{usage}{pr}")
+        for plan in plan_files(conn, t["id"]):
             done, todo = plan_progress(plan)
-            out.append(f"- plan `{plan.name}`: {done}/{done + todo} steps done")
-        if line := spend_line(t["id"], ledger):
+            out.append(f"- plan `{plan.name}`: {done}/{done + todo} steps done{awaiting_note([plan])}")
+        for s in conn.execute(f"SELECT * FROM sessions WHERE task_id=? AND status IN ('running','waiting_user') AND NOT {zedlib.AUTHOR_SESSION} ORDER BY id", (t["id"],)):
+            if plan := next(iter(session_plan_files(s)), None):
+                done, todo = plan_progress(plan)
+                out.append(f"- S{s['id']} {s['hat']} plan `{plan.name}`: {done}/{done + todo} steps done")
+        if line := spend_line(conn, t["id"], ledger):
             out.append(line)
         last = conn.execute("SELECT * FROM events WHERE task_id=? ORDER BY id DESC LIMIT 3", (t["id"],)).fetchall()
         for e in reversed(last):
@@ -1114,9 +630,7 @@ def render_status(conn, live=None):
         lines.append("- None.")
     for t in done:
         prs = [s["pr_url"] for s in conn.execute("SELECT pr_url FROM sessions WHERE task_id=? AND pr_url IS NOT NULL", (t["id"],))]
-        credits = conn.execute("SELECT SUM(credits) FROM sessions WHERE task_id=?", (t["id"],)).fetchone()[0]
         lines.append(f"- T{t['id']} {t['jira'] or ''} {t['title']} — {t['status']} {t['updated_at']}"
-                     + (f" · {credits:g} Copilot AI credits" if credits is not None else "")
                      + (f" — {', '.join(prs)}" if prs else ""))
     lines.append("")
     return "\n".join(lines)
@@ -1149,14 +663,6 @@ def cmd_task(args):
     elif sub == "set":
         tid, kv = int(rest[0].lstrip("T")), parse_kv(rest[1:])
         get_task(conn, tid)
-        if kv.get("status") == "done":
-            # Gate: a task is only done when both review and QA have clean verdicts
-            # recorded by employees who did not author the work.
-            rev = conn.execute("SELECT COUNT(*) FROM sessions WHERE task_id=? AND hat='review' AND verdict='clean'", (tid,)).fetchone()[0]
-            qa = conn.execute("SELECT COUNT(*) FROM sessions WHERE task_id=? AND hat='qa' AND verdict='clean'", (tid,)).fetchone()[0]
-            if rev == 0 or qa == 0:
-                die(f"refused: T{tid} cannot be marked done without clean review and QA verdicts "
-                    f"(review={rev}, qa={qa}). Get the review and QA done first.")
         for k, v in kv.items():
             if k not in ("title", "jira", "worktype", "description", "status"):
                 die(f"cannot set '{k}' on a task")
@@ -1246,8 +752,6 @@ def cmd_q(args):
         if not q:
             die(f"no question {qid}")
         conn.execute("UPDATE questions SET answer=?, status='answered', answered_at=? WHERE id=?", (ans, now(), qid))
-        conn.execute("UPDATE inbox SET status='handled', response=?, handled_at=? WHERE kind='answer' AND question_id=? "
-                     "AND status='new'", (f"Recorded as the answer to Q{qid}", now(), qid))  # answered, whichever way it came
         if q["task_id"]:
             log_event(conn, q["task_id"], "answer", f"Q{qid}: {ans}")
             touch_task(conn, q["task_id"])
@@ -1260,44 +764,12 @@ def cmd_q(args):
                 conn.execute("UPDATE sessions SET status='running', updated_at=? WHERE id=? AND status='waiting_user'", (now(), q["session_id"]))
     elif sub == "list":
         for q in conn.execute("SELECT * FROM questions WHERE status='open' ORDER BY id"):
-            print(f"Q{q['id']} T{q['task_id']} S{q['session_id']} {q['asked_at']}: {q['question']}")
+            ids = [f"{p}{q[k]}" for p, k in (("Q", "id"), ("T", "task_id"), ("S", "session_id")) if q[k] is not None]
+            print(f"{' '.join(ids)} {q['asked_at']}: {q['question']}")
     else:
         die(f"unknown q subcommand {sub}")
     conn.commit()
     write_status(conn)
-
-
-def cmd_inbox(args):
-    """inbox [list [--all]] | inbox done <id> [what Zed did...] — the user's feedback from the dashboard."""
-    sub = args[0] if args and not args[0].startswith("-") else "list"
-    conn = db()
-    if sub == "list":
-        rows = conn.execute("SELECT * FROM inbox" + ("" if "--all" in args else " WHERE status='new'") + " ORDER BY id").fetchall()
-        print("\n".join(inbox_detail(i) for i in rows) if rows else "the inbox is empty")
-        return
-    if sub != "done":
-        die("inbox [list [--all]] | inbox done <id> [what Zed did...]")
-    require_lock()
-    if len(args) < 2 or not args[1].isdigit():
-        die("inbox done <id> [what Zed did...] (the note is shown to the user on the dashboard)")
-    item = conn.execute("SELECT * FROM inbox WHERE id=?", (int(args[1]),)).fetchone()
-    if not item:
-        die(f"no inbox item {args[1]}")
-    if item["status"] == "handled":
-        print(f"#{item['id']} was already handled")
-        return
-    if item["kind"] == "answer" and item["question_id"]:
-        q = conn.execute("SELECT status FROM questions WHERE id=?", (item["question_id"],)).fetchone()
-        if q and q["status"] == "open":
-            die(f"Q{item['question_id']} is still open: pass the answer on with `q answer {item['question_id']} ...` first")
-    response = " ".join(args[2:]) or None
-    conn.execute("UPDATE inbox SET status='handled', response=?, handled_at=? WHERE id=?", (response, now(), item["id"]))
-    if item["kind"] in ("comment", "rating"):  # answers are logged by `q answer`, new tasks by `task add`
-        log_event(conn, item["task_id"], "feedback", f"dashboard {inbox_summary(item, 300)}" + (f" → {response}" if response else ""))
-        touch_task(conn, item["task_id"])
-    conn.commit()
-    write_status(conn)
-    print(f"handled #{item['id']}")
 
 
 def slugify(s, n=40):
@@ -1312,107 +784,36 @@ def worker_rules_text():
     return text.replace("{{ZED_HOME}}", str(ZED_HOME)).replace("{{PROFILE}}", str(PROFILE_DIR))
 
 
-def worker_rules():
-    """Write the worker rules where Claude (system-prompt file) and Copilot (instructions dir) read them."""
-    text = worker_rules_text()
-    GENERATED_WORKER_RULES.parent.mkdir(parents=True, exist_ok=True)
-    GENERATED_WORKER_RULES.write_text(text)
-    # Copilot has no system-prompt flag; it loads *.instructions.md from COPILOT_CUSTOM_INSTRUCTIONS_DIRS.
-    COPILOT_INSTRUCTIONS_DIR.mkdir(parents=True, exist_ok=True)
-    (COPILOT_INSTRUCTIONS_DIR / "zed-worker.instructions.md").write_text(text)
-    return GENERATED_WORKER_RULES
+def claude_launch(agent, model, effort, kit):
+    """CLI arguments to start a worker with its `kit` (hat_kit): the rules file and the hat's deny policy.
+    --add-dir: workers read their brief, rules and knowledge from the profile outside their worktree."""
+    return ["--permission-mode", "auto", "-n", agent, "--append-system-prompt-file", str(kit["rules"]),
+            "--add-dir", str(PROFILE_DIR), *(["--model", model] if model else []), *(["--effort", effort] if effort else []),
+            "--settings", str(kit["claude_settings"])]
 
 
-def runtime_launch(runtime, agent, model, effort, kit=None):
-    """(env for the herdr workspace, CLI arguments) to start a worker on `runtime`. An employee's session passes
-    its `kit` (employee_kit): its own rules file and its hat's deny policy replace the shared ones."""
-    rules = worker_rules()
-    model_args = (["--model", model] if model else [])
-    if runtime == "pi":
-        rs = runtime_settings("pi")
-        args = ["--approve", "-n", agent, "--append-system-prompt", str((kit or {}).get("rules", rules)),
-                *model_args, *(["--thinking", effort] if effort else [])]
-        if kit and kit.get("pi_extension"):
-            args.extend(["--extension", str(kit["pi_extension"])])
-        for tool in rs.get("exclude_tools", []):
-            args.append(f"--exclude-tools={tool}")
-        return [], args
-    if runtime == "claude":
-        # --add-dir: workers read their brief, rules and knowledge from the profile outside their worktree.
-        return [], ["--permission-mode", "auto", "-n", agent, "--append-system-prompt-file", str((kit or {}).get("rules", rules)),
-                    "--add-dir", str(PROFILE_DIR), *model_args, *(["--effort", effort] if effort else []),
-                    *(["--settings", str(kit["claude_settings"])] if kit else [])]
-    if runtime == "opencode":
-        rs = runtime_settings("opencode")
-        args = ["-n", agent, *model_args, *(["--variant", effort] if effort else []), "--auto"]
-        return [], args
-    rs = runtime_settings("copilot")
-    # Interactive mode, never autopilot: in autopilot Copilot answers its own questions with a guess.
-    # --experimental: needed for Assisted Permissions (selected after start, see set_copilot_permissions).
-    # --add-dir: Copilot limits file access to the worktree; workers read their brief and knowledge
-    # in the profile and use Zed's tools (e.g. bin/bb).
-    return [f"COPILOT_CUSTOM_INSTRUCTIONS_DIRS={(kit or {}).get('instructions', COPILOT_INSTRUCTIONS_DIR)}"], [
-        "--mode", "interactive", "--experimental", "-n", agent, "--add-dir", str(PROFILE_DIR), "--add-dir", str(ZED_HOME),
-        *model_args,
-        *(["--reasoning-effort", effort] if effort else []),
-        *[f"--allow-tool={a}" for a in rs.get("allow_tools", [])],
-        *[f"--deny-tool={d}" for d in rs.get("deny_tools", []) + (kit or {}).get("deny_tools", [])],
-        *(["--plugin-dir", str(kit["copilot_plugin"])] if kit else [])]
+def opencode_launch(model):
+    """CLI arguments to start an OpenCode worker: --auto approves whatever its config does not deny; the rules reach it
+    through the brief prompt (it has no system-prompt flag) and the deny policy through its plugin (hat_kit)."""
+    return [*(["--model", model] if model else []), "--auto"]
 
 
-def employee_kit(name, hat, repo, tags, sid, agent, worktree):
-    """What an employee's session starts with, written under profile/.cache/employees/<name>/: the memory pack, the
-    rules (worker rules, hat charter, employee rules), and the hat's deny policy rendered for both runtimes
-    (bin/zed-deny as a hook; Copilot also gets --deny-tool flags). Returns the kit for runtime_launch, plus the env
-    that identifies the session to its hooks and scripts."""
-    out = PROFILE_DIR / ".cache" / "employees" / name
-    pack = emp.make_pack(name, repo, hat, tags, f"S{sid}")[1]
-    rules = worker_rules_text() + "\n\n" + emp.employee_rules(name, hat, pack)
-    kit = {"pack": pack, "rules": out / f"{agent}-rules.md", "instructions": out / f"{agent}-instructions",
-           "claude_settings": out / f"{agent}-settings.json", "copilot_plugin": out / f"{agent}-plugin",
-           "pi_extension": out / f"{agent}-extension.ts", "opencode_plugin": out / f"{agent}-opencode-plugin.js"}
-    kit["instructions"].mkdir(parents=True, exist_ok=True)
-    kit["rules"].write_text(rules)
-    (kit["instructions"] / "zed-worker.instructions.md").write_text(rules)
-    kit["claude_settings"].write_text(json.dumps(zeddeny.claude_settings(ZED_HOME), indent=2) + "\n")
-    zeddeny.copilot_plugin(kit["copilot_plugin"], ZED_HOME)
-    zeddeny.pi_extension(kit["pi_extension"], ZED_HOME)
-    zeddeny.opencode_plugin(kit["opencode_plugin"], ZED_HOME)
-    kit["deny_tools"] = zeddeny.copilot_deny_tools(emp.load_manifest(hat))
-    env = [f"ZED_EMPLOYEE={name}", f"ZED_HAT={hat}", f"ZED_SESSION=S{sid}", f"ZED_WORKTREE={worktree}",
+def hat_kit(hat, sid, agent, worktree, runtime="claude"):
+    """What a hat session starts with, written under profile/.cache/hats/: the rules (worker rules and the hat's
+    charter) and the hat's deny policy (bin/zed-deny as a Claude hook, or as an OpenCode plugin when `runtime` is
+    opencode). Returns the kit for claude_launch, plus the env that identifies the session to its hooks and scripts."""
+    out = PROFILE_DIR / ".cache" / "hats"
+    out.mkdir(parents=True, exist_ok=True)
+    kit = {"rules": out / f"{agent}-rules.md"}
+    kit["rules"].write_text(worker_rules_text() + "\n\n" + emp.hat_charter(hat))
+    env = [f"ZED_HAT={hat}", f"ZED_SESSION=S{sid}", f"ZED_WORKTREE={worktree}",
            f"ZED_PROFILE_DIR={PROFILE_DIR}"]  # so zed-employee and zed-deny find this profile, wherever it is
-    return kit, env
-
-
-def set_copilot_permissions(agent):
-    """Switch a fresh Copilot session to the profile's permission mode via its /permissions dialog
-    (Assisted can't be chosen by flag in interactive mode). Returns an error string, or None."""
-    mode = runtime_settings("copilot").get("permission_mode", "assisted")
-    labels = {"manual": "Manual Approval", "assisted": "Assisted Permissions", "allow-all": "Allow All"}
-    if mode not in labels:
-        return f"unknown copilot permission_mode '{mode}' ({', '.join(labels)})"
-    r = run(["herdr", "agent", "prompt", agent, "/permissions"], check=False)
-    if r.returncode:
-        return f"could not open /permissions: {r.stderr or r.stdout}"
-    for _ in range(30):
-        screen = read_screen(agent)
-        if all(label in screen for label in labels.values()):
-            break
-        time.sleep(0.2)
+    if runtime == "opencode":
+        env.append(f"OPENCODE_CONFIG_DIR={zeddeny.opencode_plugin(out / f'{agent}-opencode', ZED_HOME)}")
     else:
-        return "the /permissions menu did not appear"
-    r = run(["herdr", "agent", "send-keys", agent, PERMISSION_MODE_MENU[mode]], check=False)
-    if r.returncode:
-        return f"could not select {labels[mode]}: {r.stderr or r.stdout}"
-    for _ in range(30):
-        screen = read_screen(agent)
-        # The menu itself contains every label; only accept the selected mode in the footer.
-        footer = "\n".join(screen.strip().splitlines()[-4:])
-        # While Copilot still waits on an extension its footer shows the "Loading:" line instead of the mode.
-        if (labels[mode] in footer or "Loading:" in footer) and not all(label in screen for label in labels.values()):
-            return None
-        time.sleep(0.2)
-    return f"could not switch to {labels[mode]}; footer: {footer!r}"
+        kit["claude_settings"] = out / f"{agent}-settings.json"
+        kit["claude_settings"].write_text(json.dumps(zeddeny.claude_settings(ZED_HOME), indent=2) + "\n")
+    return kit, env
 
 
 def prompt_worker(agent, text):
@@ -1422,7 +823,7 @@ def prompt_worker(agent, text):
     if r.returncode == 0:
         return True, ""
     if "agent_prompt_stalled" in r.stderr:
-        # Herdr's five-second activity gate can expire before Copilot starts its first turn.
+        # Herdr's five-second activity gate can expire before the CLI starts its first turn.
         # Observe activity/completion without ever submitting the same brief a second time.
         for _ in range(40):
             a = herdr_json(["agent", "get", agent])["result"]["agent"]
@@ -1490,19 +891,25 @@ def cmd_brief(args):
             print(f"  line {n}: {FILL.search(line).group(0)}")
 
 
-def cmd_spawn(args, worktree=None):
+SPAWN_KEYS = {"repo", "base", "branch", "brief", "name", "model", "effort", "kind", "from", "hat", "runtime"}
+RUNTIMES = ("claude", "opencode")
+
+
+def cmd_spawn(args):
     """spawn <task-id> repo=<repo> base=<branch> branch=<branch> brief=<path> [name=<agent>]
-    [runtime=auto|pi|claude|copilot] [model=] [effort=] [kind=<worktype|investigation|design…>] [handoff=<note>]
-    [employee=<name> hat=<build|review|qa|…> [tags=a,b] [origin=zed|user|schedule]]  (an employee's assignment)
-    [ephemeral=<why no employee fits>] [copilot_reason=<why Copilot while Claude is usable>]"""
-    if not args:
-        die("spawn <task-id> repo=... base=... branch=... brief=<file> [name=...] [runtime=auto|pi|claude|copilot] "
-            "[model=] [effort=] [kind=] [from=] [handoff=<note>] [employee= hat= tags= origin=]")
+    [model=] [effort=] [kind=<worktype|investigation|design…>] [from=<start point>]
+    [hat=build|review|qa]   the hat the session wears (default build)
+    [runtime=claude|opencode]   claude (default); opencode takes model= only (no effort) and no claude.json policy"""
+    if not args or args[0] in ("-h", "--help"):
+        print(cmd_spawn.__doc__)
+        sys.exit(0 if args else 1)
     tid = int(args[0].lstrip("T"))
     kv = parse_kv(args[1:])
     for k in ("repo", "base", "branch", "brief"):
         if k not in kv:
             die(f"spawn needs {k}=")
+    if unknown := sorted(set(kv) - SPAWN_KEYS):
+        die(f"spawn does not take {', '.join(k + '=' for k in unknown)} (workers wear a hat, not a name: hat=build|review|qa; see `bin/zed help`)")
     conn = db()
     require_lock()
     t = get_task(conn, tid)
@@ -1517,68 +924,44 @@ def cmd_spawn(args, worktree=None):
     missing = [h for h in ("## Plan", "## Definition of done") if h not in brief.read_text()]
     if missing:
         die(f"brief {brief.name} lacks {', '.join(missing)} (templates/brief.md); no worker starts without a plan")
-    employee, hat = kv.get("employee"), kv.get("hat")
-    if bool(employee) != bool(hat):
-        die("employee= and hat= go together (`bin/zed assign <employee> <T> hat=... repo=... base=... branch=... brief=...`)")
-    if kv.get("origin", "zed") not in ASSIGN_ORIGINS:
-        die(f"origin must be one of {', '.join(ASSIGN_ORIGINS)}")
-    tags = [x for x in kv.get("tags", "").split(",") if x]
-    if reason := zedgates.spawn_without_employee(zedassign.free_employees(conn), kv):
-        die(f"refused: {reason}")
-    sid = hat_kind = employee_runtime = None
-    if employee:
-        try:
-            employee_runtime = emp.load_employee(employee)[0].get("runtime")
-            hat_kind = emp.load_manifest(hat)["kind"]
-            zedassign.check_assignment(conn, employee, hat, tid, kv["repo"], kv["branch"],
-                                       None if p.get("worktrees") is False else worktree or worktree_path(kv["repo"], kv["branch"]))
-        except (zedassign.Refused, emp.EmployeeError) as e:
-            if getattr(e, "queued", False):
-                print(f"zed: queued: {e}", file=sys.stderr)
-                sys.exit(75)
-            die(f"refused: {e}")
-        sid = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM sessions").fetchone()[0]  # the pack is named by it
-    host = run([sys.executable, str(ZED_HOME / "bin" / "zed-hostload"), "check"], check=False)
-    if host.returncode == 2:
-        die(f"host is overloaded, not spawning (zed-hostload):\n{host.stdout.strip()}")
-    if host.returncode == 1:
-        print(f"zed: warning: host is under load (zed-hostload): {host.stdout.strip().splitlines()[0]}", file=sys.stderr)
-    runtime = choose_runtime(kv.get("runtime") or (employee_runtime if employee_runtime != "auto" else None) or "auto")
-    if reason := zedgates.copilot_before_claude(runtime, runtime_report("claude"), kv):
-        die(f"refused: {reason}")
-    if runtime == "claude" and (warning := quota_warning()):
-        print(f"zed: warning: {warning}", file=sys.stderr)
-    require_capacity(conn, runtime, tid)  # a handoff has already closed the session it replaces
-    model, effort, model_why = pick_model(runtime)
-    if "model" in kv:  # the policy's effort belongs to the policy's model
-        model, effort, model_why = kv["model"], kv.get("effort"), "given to spawn"
-    elif "effort" in kv:
+    hat = kv.get("hat", "build")
+    runtime = kv.get("runtime", "claude")
+    if runtime not in RUNTIMES:
+        die(f"runtime={runtime} is not supported: {' or '.join(RUNTIMES)}")
+    if runtime == "opencode" and "effort" in kv:
+        die("runtime=opencode takes no effort= (its TUI has no effort flag)")
+    try:
+        hat_kind = emp.load_manifest(hat)["kind"]
+        zedgates.check_assignment(conn, hat, tid, kv["repo"], kv["branch"],
+                                  None if p.get("worktrees") is False else worktree_path(kv["repo"], kv["branch"]))
+    except (zedgates.Refused, emp.HatError) as e:
+        die(f"refused: {e}")
+    sid = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM sessions").fetchone()[0]  # the session's env names it
+    kind = kv.get("kind") or t["worktype"]
+    if hat_kind in (claude_config().get("effort_by_kind") or {}) and "kind" not in kv:
+        kind = hat_kind  # the hat's own kind, when claude.json has an effort for it
+    if runtime == "claude":
+        require_capacity(conn, tid)
+        model, effort, model_why = pick_model(kind)
+    else:  # claude.json names Claude models and efforts: an OpenCode worker gets only what spawn is given
+        model, effort, model_why = None, None, "OpenCode default"
+    if "model" in kv:
+        model, model_why = kv["model"], "given to spawn"
+    if "effort" in kv:
         effort, model_why = kv["effort"], model_why + "; effort given to spawn"
-    if "effort" not in kv and not runtime_settings(runtime).get("effort"):
-        kind = kv.get("kind") or t["worktype"]
-        if hat_kind in (runtime_config().get("model_policy", {}).get("effort_by_kind") or {}) and "kind" not in kv:
-            kind = hat_kind  # the hat's own kind, when the profile's policy has an effort for it
-        effort, model_why = effort_for_kind(runtime, kind, effort, model_why)
-    if effort and effort not in RUNTIMES[runtime]["efforts"]:
-        die(f"invalid effort '{effort}' for {runtime}: {RUNTIMES[runtime]['efforts']}")
-    model, effort, model_why = apply_ceiling(runtime, model, effort, model_why)
-    if runtime == "copilot" and runtime_settings(runtime).get("permission_mode", "assisted") not in PERMISSION_MODE_MENU:
-        die("copilot permission_mode must be manual, assisted or allow-all")
+    if effort and effort not in EFFORTS:
+        die(f"invalid effort '{effort}': {EFFORTS}")
 
-    agent = kv.get("name") or (f"{employee}-t{tid}-{hat}" if employee else f"t{tid}-{slugify(kv['repo'], 12)}")
-    if employee and "name" not in kv and conn.execute("SELECT 1 FROM sessions WHERE agent=? AND status!='closed'", (agent,)).fetchone():
+    agent = kv.get("name") or f"{hat}-t{tid}"
+    if "name" not in kv and conn.execute("SELECT 1 FROM sessions WHERE agent=? AND status!='closed'", (agent,)).fetchone():
         agent = f"{agent}-{sid}"  # an earlier session of the same name is still open (finished, not yet closed)
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", agent):
         die(f"bad agent name '{agent}'")
-    reuse_worktree = worktree is not None
-    if reuse_worktree and not worktree.is_dir():
-        die(f"handoff worktree is missing: {worktree}")
-    worktree = worktree or worktree_path(kv["repo"], kv["branch"])
+    worktree = worktree_path(kv["repo"], kv["branch"])
 
     # 1. worktree (projects with "worktrees": false, e.g. plain doc folders, run in place)
     if p.get("worktrees") is False:
-        if not reuse_worktree:
-            worktree = repo_path
+        worktree = repo_path
     elif worktree.exists():
         print(f"reusing existing worktree {worktree}")
     else:
@@ -1608,44 +991,40 @@ def cmd_spawn(args, worktree=None):
 
     # 2. herdr workspace + agent CLI
     require_lock()
-    kit, employee_env = employee_kit(employee, hat, kv["repo"], tags, sid, agent, worktree) if employee else (None, [])
-    env, cli_args = runtime_launch(runtime, agent, model, effort, kit)
-    env += employee_env
+    kit, env = hat_kit(hat, sid, agent, worktree, runtime)
+    cli_args = opencode_launch(model) if runtime == "opencode" else claude_launch(agent, model, effort, kit)
     label = f"T{tid} {t['jira'] or ''} {kv['repo']}".strip()
     ws = herdr_json(["workspace", "create", "--cwd", str(worktree), "--label", label, "--no-focus",
                      *[a for e in env for a in ("--env", e)]])["result"]
     ws_id, pane_id = ws["workspace"]["workspace_id"], ws["root_pane"]["pane_id"]
     time.sleep(1.5)  # let the shell reach its prompt
-    r = run(["herdr", "agent", "start", agent, "--kind", runtime, "--pane", pane_id, "--timeout", "180000",
-             "--", *cli_args], check=False)
-    if r.returncode != 0 and "agent_not_ready" in r.stderr:
+    r = run(["herdr", "agent", "start", agent, "--kind", runtime, "--pane", pane_id,
+             "--timeout", str(OPENCODE_START_TIMEOUT_MS if runtime == "opencode" else 60000), "--", *cli_args], check=False)
+    if r.returncode != 0 and "agent_not_ready" in r.stderr and runtime == "claude":
         # A fresh worktree triggers the CLI's folder-trust dialog. Zed created this worktree
         # from a configured repo, so accept it; anything else stays blocked for Zed to inspect.
         screen = run(["herdr", "agent", "read", agent, "--source", "visible"], check=False).stdout
-        tp = RUNTIMES[runtime].get("trust_prompt", "")
-        if tp and tp in screen:  # the pane was opened with cwd=worktree
-            run(["herdr", "agent", "send-keys", agent, *RUNTIMES[runtime]["trust_keys"]], check=False)
+        if TRUST_PROMPT in screen:  # the pane was opened with cwd=worktree
+            run(["herdr", "agent", "send-keys", agent, *TRUST_KEYS], check=False)
             r = run(["herdr", "agent", "wait", agent, "--until", "idle", "--timeout", "60000"], check=False)
-    perm_error = set_copilot_permissions(agent) if runtime == "copilot" and r.returncode == 0 else None
     ts = now()
     cur = conn.execute(
-        "INSERT INTO sessions(id,task_id,repo,base,branch,worktree,agent,workspace_id,pane_id,status,runtime,model,effort,"
-        "brief,scratch,employee,hat,origin,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO sessions(id,task_id,repo,base,branch,worktree,agent,workspace_id,pane_id,status,model,effort,"
+        "brief,scratch,hat,plan,core_start,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (sid, tid, kv["repo"], kv["base"], kv["branch"], str(worktree), agent, ws_id, pane_id, "running",
-         runtime, model, effort, str(brief), str(scratch) if scratch else None, employee, hat,
-         kv.get("origin", "zed") if employee else kv.get("origin"), ts, ts))
+         model, effort, str(brief), str(scratch) if scratch else None, hat,
+         str(zedlib.brief_plan_file(brief.read_text()) or PROFILE_DIR / "briefs" / f"T{tid}-{kv['repo']}-plan.md"),
+         zedlib.core_tree(worktree) if hat in zedgates.GATE_HATS else None, ts, ts))
     sid = cur.lastrowid
     conn.execute("UPDATE tasks SET status='active' WHERE id=? AND status IN ('intake','parked')", (tid,))
     log_event(conn, tid, "spawn", f"S{sid} {agent} on {kv['repo']} {kv['branch']} ← {kv['base']} ({worktree}); "
-              f"{runtime} model {model or 'default'} effort {effort or 'default'} ({model_why})"
-              + (f"; {employee} wearing {hat}" if employee else ""))
+              f"model {model or 'default'} effort {effort or 'default'} ({model_why})"
+              + f"; wearing {hat}" + (f"; runtime {runtime}" if runtime != "claude" else ""))
     touch_task(conn, tid)
     conn.commit()
     write_status(conn)
     if r.returncode != 0:
         die(f"S{sid}: agent start did not report ready (pane {pane_id}). Inspect with: herdr agent read {agent}\n{r.stderr}")
-    if perm_error:
-        die(f"S{sid}: {perm_error}. The worker hasn't been given its brief; inspect with: herdr agent read {agent}")
 
     # 3. hand over the brief
     require_lock()
@@ -1653,43 +1032,32 @@ def cmd_spawn(args, worktree=None):
     text = (f"You are the engineering worker, NOT the Zed coordinator, for session S{sid} / task T{tid}. "
             f"Do not onboard, acquire the coordinator lock, or change the coordinator's task database. "
             f"Zed's home is {ZED_HOME}; the user's profile is {PROFILE_DIR}. "
-            f"Read your worker rules at {kit['rules'] if kit else GENERATED_WORKER_RULES} and your brief at {brief}, then "
+            f"Read your worker rules at {kit['rules']} and your brief at {brief}, then "
             f"{PROFILE_DIR}/knowledge/repos/{kv['repo']}.md if it exists. "
             f"Your status file is {STATUS_DIR}/S{sid}.log (see 'Report status' in your rules). ")
-    if employee:
-        text += employee_intro(conn, employee, hat, kit, tid)
+    text += hat_intro(conn, hat, tid)
     if scratch:
         text += (f"Your scratch folder is {scratch}: keep every clone, download and temporary file there and nowhere "
                  f"else in the project; Zed deletes it when your session closes. ")
-    if kv.get("handoff"):
-        text += (f"You are taking over from an earlier session that stopped (see the handoff note at "
-                 f"{Path(kv['handoff']).resolve()}): read it, check the worktree's git state, and continue "
-                 f"from where it stopped; don't redo finished work. ")
-    prompt_ok, prompt_error = prompt_worker(agent, text + "Then start.")
+    text += "Then start."
+    prompt_ok, prompt_error = prompt_worker(agent, text)
     print(json.dumps({"task": f"T{tid}", "session": f"S{sid}", "agent": agent, "pane": pane_id,
-                      "workspace": ws_id, "worktree": str(worktree), "runtime": runtime, "model": model,
+                      "workspace": ws_id, "worktree": str(worktree), "model": model,
                       "effort": effort, "model_choice": model_why, "prompt_ok": prompt_ok}))
     if not prompt_ok:
         die(f"S{sid}: brief submission did not report activity; inspect before retrying:\n{prompt_error}")
     return sid
 
 
-def cmd_assign(args):
-    """assign <employee> <task-id> hat=<hat> repo= base= branch= brief= [tags=] [origin=] …: `spawn` for an employee."""
-    if len(args) < 2:
-        die("assign <employee> <task-id> hat=<build|review|qa> repo=... base=... branch=... brief=<file> [tags=a,b] [origin=zed|user|schedule]")
-    return cmd_spawn([args[1], f"employee={args[0]}", *args[2:]])
-
-
-def employee_intro(conn, name, hat, kit, tid):
-    """The employee's paragraph of the first prompt: the pack, the hat's skills, and the findings drafts earlier
-    assignments on this task left (a fix or a re-review starts from them, not from anyone's memory of the work)."""
-    text = (f"You are {name.capitalize()}, a named employee wearing the {hat} hat. Read your memory pack at {kit['pack']} first. "
+def hat_intro(conn, hat, tid):
+    """The hat's paragraph of the first prompt: the hat, its skills, and the findings drafts earlier sessions on this
+    task left (a fix or a re-review starts from them, not from anyone's memory of the work)."""
+    text = (f"You wear the {hat} hat. "
             f"Skills load when they apply (`zed-employee skill show <name>`): {', '.join(emp.load_manifest(hat)['skills'])}. "
             f"Before ZED:DONE run `zed-employee finish`. ")
     findings = [r["text"] for r in conn.execute("SELECT text FROM events WHERE task_id=? AND kind='findings' ORDER BY id", (tid,))]
     if findings:
-        text += "Findings drafts from earlier assignments on this task, read them: " + "; ".join(findings) + ". "
+        text += "Findings drafts from earlier sessions on this task, read them: " + "; ".join(findings) + ". "
     return text
 
 
@@ -1731,7 +1099,7 @@ def cmd_prompt(args):
 def cmd_relay_post(args):
     """relay-post <S|agent> <user-words-file> --action "<exact action>" [--redirect] [--print] — relay the user's OK to
     post (a PR review, comment, ticket edit): the prompt carries their words verbatim plus the exact action, so the
-    auto-mode classifier sees the request. Never `handoff restart` a worker between the OK and its posting."""
+    auto-mode classifier sees the request."""
     redirect, show = "--redirect" in args, "--print" in args
     args = [a for a in args if a not in ("--redirect", "--print")]
     if "--action" not in args or len(args) != 4 or args.index("--action") != 2:
@@ -1753,13 +1121,14 @@ def cmd_relay_post(args):
 
 
 def cmd_gate(args):
-    """gate check <sha|branch> [repo-dir] — exit 0 when the commit has a clean review and a clean qa verdict (both by
-    employees who did not author it); else print what is missing and exit 1. Read-only: usable by git hooks."""
+    """gate check <sha|branch> [repo-dir] — exit 0 when the commit's code (everything outside profile/) has a clean review
+    and a clean qa verdict (both by sessions that did not author it); else print what is missing and exit 1. Read-only: usable by git hooks."""
     if len(args) < 2 or args[0] != "check":
         die("gate check <sha|branch> [repo-dir]")
-    sha = run(["git", "-C", args[2] if len(args) > 2 else ".", "rev-parse", "--verify", args[1] + "^{commit}"]).stdout.strip()
+    repo_dir = args[2] if len(args) > 2 else "."
+    sha = run(["git", "-C", repo_dir, "rev-parse", "--verify", args[1] + "^{commit}"]).stdout.strip()
     conn = db()
-    problems = zedgates.merge_problems(conn, sha)
+    problems = zedgates.merge_problems(conn, zedlib.core_tree(repo_dir, sha))
     for p in problems:
         print(f"merge gate: {p}", file=sys.stderr)
     if problems and (override := os.environ.get("ZED_GATE_OVERRIDE", "").strip()):
@@ -1773,7 +1142,7 @@ def cmd_gate(args):
 def cmd_merge(args):
     """merge <branch> [repo-dir] [--override "<reason>"] — merge a worker branch into the current branch of repo-dir
     (default: Zed's checkout) with `git merge --no-ff`, only when the merge gate passes (clean review + clean qa by
-    non-authors at the branch head). --override records the reason in the task log (the user's decision)."""
+    non-authors for the branch head's code, which ignores profile/). --override records the reason in the task log (the user's decision)."""
     override = args[args.index("--override") + 1] if "--override" in args and args.index("--override") + 1 < len(args) else None
     args = [a for i, a in enumerate(args) if a != "--override" and (i == 0 or args[i - 1] != "--override")]
     if not args:
@@ -1782,9 +1151,15 @@ def cmd_merge(args):
     conn = db()
     require_lock()
     sha = run(["git", "-C", repo_dir, "rev-parse", "--verify", args[0] + "^{commit}"]).stdout.strip()
-    problems = zedgates.merge_problems(conn, sha)
+    problems = zedgates.merge_problems(conn, zedlib.core_tree(repo_dir, sha))
     if problems and not override:
         die("refused: " + "; ".join(problems) + '. Get the review and qa done, or pass --override "<reason>" (the user\'s call)')
+    trial = run(["git", "-C", repo_dir, "merge-tree", "--write-tree", "--name-only", "HEAD", sha], check=False)  # writes objects only, never the checkout
+    if trial.returncode != 0:
+        files = [l for l in trial.stdout.splitlines()[1:] if l.strip() and ("\t" not in l) and not l.startswith(("Auto-merging", "CONFLICT"))]
+        die(f"refused: merging {args[0]} into {run(['git', '-C', repo_dir, 'branch', '--show-current']).stdout.strip() or 'HEAD'} would conflict"
+            + (f" in {', '.join(files)}" if files else f": {trial.stderr.strip()}")
+            + f". Nothing was touched. Merge it into the branch first, resolve there, then merge again")
     row = conn.execute("SELECT task_id FROM sessions WHERE branch=? ORDER BY id DESC", (args[0],)).fetchone()
     log_event(conn, row["task_id"] if row else None, "merge",
               f"{args[0]} {sha[:10]} into {run(['git', '-C', repo_dir, 'branch', '--show-current']).stdout.strip()}"
@@ -1820,7 +1195,7 @@ def cmd_session(args):
         for s in conn.execute("SELECT * FROM sessions WHERE status!='closed' ORDER BY id"):
             a = live.get(s["pane_id"])
             print(f"S{s['id']:<3} T{s['task_id']:<3} {s['agent']:<20} {s['status']:<13} "
-                  f"agent={a['agent_status'] if a else 'GONE':<8} {s['runtime']:<8} {s['repo']} {s['branch']}")
+                  f"agent={a['agent_status'] if a else 'GONE':<8} {s['repo']} {s['branch']}")
     else:
         die(f"unknown session subcommand {sub}")
     conn.commit()
@@ -1895,7 +1270,7 @@ def landed_blockers(conn, s, git_checks=True):
             out.append(f"PR state unknown (could not read {s['pr_url']})")
         elif snap["state"] == "open":
             out.append(f"PR still open: {s['pr_url']} (needs to be merged or closed)")
-    done, total = task_plan_progress(s["task_id"])
+    done, total = session_plan_progress(conn, s)
     if done < total:
         out.append(f"plan has {total - done} of {total} steps left")
     open_q = conn.execute("SELECT COUNT(*) FROM questions WHERE session_id=? AND status='open'", (s["id"],)).fetchone()[0]
@@ -1934,7 +1309,6 @@ def own_scratch(s):
         return scratch
 
 
-
 def cmd_close(args):
     """close <S|agent> [keep-worktree] [keep-scratch] [force] — stop the worker, close its herdr workspace, then remove
     its scratch folder and its worktree unless they hold unique work (the landed-work test; see scratch_unique_work)."""
@@ -1964,7 +1338,6 @@ def cmd_close(args):
                 "Resolve these, or pass 'keep-worktree' (close the session only) / 'force'.")
         print(f"note: S{s['id']} is not landed yet (worktree kept):\n{report}")
     remove_wt = "keep-worktree" not in args and wt.exists()
-    record_credits(conn, s)
     record_spend(conn, s)
     if s["workspace_id"]:
         close_workspace(s["workspace_id"])
@@ -1973,7 +1346,7 @@ def cmd_close(args):
         repo_path = expand(project(s["repo"])["path"])
         run(["git", "-C", str(repo_path), "worktree", "remove", *(["--force"] if "force" in args else []), str(wt)])
         report.append(f"removed worktree {wt}")
-    elif not in_place:
+    elif not in_place and wt.exists():
         report.append(f"kept worktree {wt}")
     scratch = own_scratch(s)
     if scratch and "keep-scratch" not in args:
@@ -2005,9 +1378,9 @@ def cmd_adopt(args):
     ts = now()
     cur = conn.execute(
         "INSERT INTO sessions(task_id,repo,base,branch,worktree,agent,workspace_id,pane_id,claude_session_id,status,external,"
-        "runtime,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?,?)",
+        "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?)",
         (tid, kv.get("repo", Path(cwd).name), "-", branch, cwd, a.get("name") or pane_id, a["workspace_id"], pane_id,
-         (a.get("agent_session") or {}).get("value"), "running", a.get("agent") or "claude", ts, ts))
+         (a.get("agent_session") or {}).get("value"), "running", ts, ts))
     log_event(conn, tid, "adopt", f"S{cur.lastrowid} adopted external session in {pane_id} ({cwd})")
     conn.execute("UPDATE tasks SET status='active' WHERE id=? AND status='intake'", (tid,))
     touch_task(conn, tid)
@@ -2016,116 +1389,23 @@ def cmd_adopt(args):
     print(f"S{cur.lastrowid}")
 
 
-def cmd_handoff(args):
-    """handoff <S|agent> [runtime=auto|pi|claude|copilot] [brief=<file>] [model=] [effort=] [copilot_reason=<why>] — move a stopped worker (e.g. one paused
-    by a usage limit) to a new session on another runtime, in the same worktree and branch. Only with the user's OK."""
-    if not args:
-        die("handoff <S|agent> [runtime=auto|pi|claude|copilot] [brief=<file>]")
-    conn = db()
-    require_lock()
-    ref = session_ref(args[0])
-    s = resolve_session(conn, ref)
-    kv = parse_kv([a for a in args[1:] if a != "restart"])
-    if s["external"] or s["status"] == "closed":
-        die(f"S{s['id']} is {'external' if s['external'] else 'closed'}; handoff is for running sessions Zed started")
-    brief = kv.get("brief") or s["brief"] or str(PROFILE_DIR / "briefs" / f"T{s['task_id']}-{s['repo']}.md")
-    if not Path(brief).exists():
-        die(f"brief not found: {brief}; pass brief=<file>")
-    who = []  # who runs the new session: the same employee, a free one, or an ephemeral worker only with a reason
-    if s["employee"]:
-        who = [f"{k}={s[k]}" for k in ("employee", "hat", "origin") if s[k]]
-    elif zedassign.free_employees(conn):
-        if kv.get("ephemeral", "").strip():
-            who = [f"ephemeral={kv['ephemeral']}"]
-        else:
-            hat = kv.get("hat", "build")
-            pick = [r["name"] for r in zedassign.suggest(conn, s["task_id"], hat, s["repo"], s["branch"]) if r["eligible"]]
-            if not pick:
-                die(f"refused: S{s['id']} has no employee and none is eligible for the {hat} hat: pass ephemeral=\"<why>\"")
-            who = [f"employee={pick[0]}", f"hat={hat}"]
-            print(f"zed: S{s['id']} had no employee; the new session goes to {pick[0]} ({hat} hat)", file=sys.stderr)
-    else:
-        who = [f"ephemeral={kv.get('ephemeral') or 'no employee is free'}"]
-    restart = "restart" in args[1:]  # same runtime, fresh session (e.g. to apply a new model/effort ceiling)
-    target = s["runtime"] if restart else choose_runtime(kv.get("runtime", "auto"), exclude=(s["runtime"],))
-    if target == s["runtime"] and not restart:
-        die("handoff needs a different runtime (or `restart` for a fresh session on the same one)")
-    if reason := zedgates.copilot_before_claude(target, runtime_report("claude"), kv):
-        die(f"refused: {reason}")  # before anything is closed: spawn would refuse it after the old session is gone
-    wt = s["worktree"]
-    if not s["workspace_id"]:
-        die("handoff needs the old worker's managed workspace so it can be stopped safely")
-    if not Path(wt).is_dir():
-        die(f"handoff worktree is missing: {wt}")
-    if project(s["repo"]).get("worktrees") is not False:
-        actual = run(["git", "-C", wt, "branch", "--show-current"]).stdout.strip()
-        if actual != s["branch"]:
-            die(f"handoff worktree is on '{actual}', not '{s['branch']}'; left untouched")
-
-    def git(*a):
-        r = run(["git", "-C", wt, *a], check=False)
-        return (r.stdout + r.stderr).strip() or "(nothing)"
-
-    screen = run(["herdr", "agent", "read", s["agent"], "--source", "recent-unwrapped", "--lines", "150"], check=False)
-    qs = conn.execute("SELECT * FROM questions WHERE session_id=? ORDER BY id", (s["id"],)).fetchall()
-    note = PROFILE_DIR / "briefs" / f"T{s['task_id']}-{s['repo']}-handoff-S{s['id']}.md"
-    note.write_text("\n".join([
-        f"# Handoff from S{s['id']} ({s['runtime']}) — T{s['task_id']} {s['repo']}", "",
-        f"Written by Zed on {now()}. S{s['id']} stopped before finishing (state: {s['status']}); "
-        f"{runtime_state().get(s['runtime'], {}).get('note') or 'see its last output below'}.",
-        f"Brief: {brief}", f"Worktree: {wt}", f"Branch: {s['branch']} (base {s['base']})", "",
-        "## Git state", "", "```", f"$ git status --short", git("status", "--short"), "",
-        f"$ git log --oneline origin/{s['base']}..HEAD", git("log", "--oneline", f"origin/{s['base']}..HEAD"), "",
-        "$ git diff --stat HEAD", git("diff", "--stat", "HEAD"), "```", "",
-        "## Questions and answers so far", "",
-        *([f"- Q{q['id']} [{q['status']}] {q['question']}" + (f"\n  → {q['answer']}" if q["answer"] else "") for q in qs]
-          or ["- None."]), "",
-        "## Last output of the previous session", "", "```",
-        (screen.stdout.strip() if screen.returncode == 0 else f"(could not read it: {screen.stderr.strip()})"), "```", ""]))
-    # Stop the old session so it doesn't resume on its own (e.g. after a limit resets) and race the new one.
-    record_credits(conn, s)
-    record_spend(conn, s)
-    require_lock()
-    if s["workspace_id"]:
-        close_workspace(s["workspace_id"])
-    conn.execute("UPDATE sessions SET status='closed', updated_at=? WHERE id=?", (now(), s["id"]))
-    log_event(conn, s["task_id"], "handoff", f"S{s['id']} ({s['runtime']}) closed, worktree kept; handing over to {target} ({note})")
-    conn.commit()
-    conn.close()
-    return cmd_spawn([str(s["task_id"]), f"repo={s['repo']}", f"base={s['base']}", f"branch={s['branch']}",
-                      f"brief={brief}", f"runtime={target}", f"handoff={note}", f"name={s['agent']}",
-                      *[f"{k}={kv[k]}" for k in ("model", "effort", "copilot_reason") if k in kv],
-                      *who],
-                     worktree=Path(wt))
-
-
 def read_screen(agent, source="visible", lines=None):
     r = run(["herdr", "agent", "read", agent, "--source", source, *(["--lines", str(lines)] if lines else [])], check=False)
     return r.stdout if r.returncode == 0 else ""
 
 
-def limit_line(runtime, screen, last=25):
-    """The line near the bottom of the screen that looks like the runtime's usage-limit message, if any."""
+def limit_line(screen, last=25):
+    """The line near the bottom of the screen that looks like Claude Code's usage-limit message, if any."""
     for line in reversed(screen.strip().splitlines()[-last:]):
-        if any(re.search(p, line, re.I) for p in RUNTIMES.get(runtime, {}).get("limit_patterns", [])):
+        if any(re.search(p, line, re.I) for p in LIMIT_PATTERNS):
             return line.strip(" │┃●")
     return None
-
-
-def record_credits(conn, s, screen=None):
-    """Store the AI credits a Copilot session has used so far (its footer: "Session: 4.2 AIC used")."""
-    pattern = RUNTIMES.get(s["runtime"], {}).get("credits_pattern")
-    if not pattern or s["external"]:
-        return
-    m = re.findall(pattern, screen if screen is not None else read_screen(s["agent"]))
-    if m:
-        conn.execute("UPDATE sessions SET credits=? WHERE id=?", (float(m[-1]), s["id"]))
 
 
 # ---------------------------------------------------------------- worker reports
 
 BLOCK_START = re.compile(r"^ZED:(QUESTION|DONE|BLOCKED)\s*$")
-BLOCK_END = re.compile(r"^(```|[─━╭╰❯⏵✻✢✽]|.*\bAIC used\b|.*\besc to\b)")  # closing fence or the CLI's prompt/footer chrome
+BLOCK_END = re.compile(r"^(```|[─━╭╰❯⏵✻✢✽]|.*\besc to\b)")  # closing fence or the CLI's prompt/footer chrome
 BLOCK_MAX_LINES = 80           # a marker with more text than this after it is old output, not a final report
 DONE_FIELDS = ("Summary", "Branch", "PR", "QA", "Follow-ups", "Learnings")
 NO_QA = re.compile(r"^\W*(none|n/?a|not (run|done|tested)|skipped|no qa|-)?\W*$", re.I)
@@ -2257,9 +1537,8 @@ def record_block(conn, s, block):
         else:
             conn.execute("UPDATE tasks SET status='pr_open' WHERE id=? AND status IN ('active','waiting_user','in_review')", (tid,))
     out.append(f"QA: {qa or '(missing)'}")
-    if s["employee"] and not conn.execute("SELECT 1 FROM events WHERE kind='finish' AND text LIKE ?", (f"S{sid} %",)).fetchone():
-        out.append(f"DONE without write-back: {s['employee']} has not run `zed-employee finish` for S{sid}; "
-                   "send it back to write back what it learned before accepting the work")
+    if problem := zedlib.session_plan_problem(s):
+        out.append(f"DONE with an incomplete plan: {problem}; send it back to finish the plan before review or QA")
     for k in ("Follow-ups", "Learnings"):
         if f.get(k) and f[k].strip().lower() not in ("none", "-"):
             out.append(f"{k}: {f[k]}")
@@ -2267,18 +1546,9 @@ def record_block(conn, s, block):
     return "\n".join(out)
 
 
-def mark_runtime_limited(conn, name, note):
-    state = runtime_state()
-    state[name] = {"since": now(), "until": None, "note": note}
-    log_event(conn, None, "runtime", f"{name} limited: {note}")
-    RUNTIME_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    RUNTIME_STATE_PATH.write_text(json.dumps(state, indent=2) + "\n")
-
-
 def settle_turn(conn, s, screen, alerts, line, seq):
     """A worker's turn ended (idle/done). Returns the event text for Zed, or None when the watcher
-    dealt with it: a new ZED block is recorded and surfaced; a usage limit marks the runtime limited and
-    wakes Zed once; no block at all is a protocol lapse, nudged by `lapse_tick` after a grace period."""
+    dealt with it: a new ZED block is recorded and surfaced; a usage limit wakes Zed once; no block at all is a protocol lapse, nudged by `lapse_tick` after a grace period."""
     seen = alerts.setdefault(s["id"], {})
     block = parse_block(read_screen(s["agent"], "recent-unwrapped", 150) or screen)
     if block and seen.get("block") != block["fingerprint"]:
@@ -2286,21 +1556,14 @@ def settle_turn(conn, s, screen, alerts, line, seq):
         seen.pop("lapse", None)
         if block_known(conn, s, block):  # already reported from the worker's status file
             return None
-        note = context_note(s, alerts) if block["kind"] != "DONE" else ""
-        return f"{line}{note}\n{record_block(conn, s, block)}"
-    hit = limit_line(s["runtime"], screen)
+        return f"{line}\n{record_block(conn, s, block)}"
+    hit = limit_line(screen)
     if hit:
         if seen.get("limit") == hit:
             return None
         seen["limit"] = hit
-        if not runtime_state().get(s["runtime"]):
-            mark_runtime_limited(conn, s["runtime"], hit)
-        return (f"{line} · USAGE LIMIT: {hit} · {s['runtime']} marked limited (undo: bin/zed runtime ok {s['runtime']}); "
-                "moving the worker needs the user's OK (switch-runtime skill)")
+        return f"{line} · USAGE LIMIT: {hit} · the worker is paused until it resets; tell the user"
     young = (datetime.now() - datetime.strptime(s["created_at"], "%Y-%m-%d %H:%M")).total_seconds() < 180
-    pending = conn.execute("SELECT COUNT(*) FROM questions WHERE session_id=? AND status='open'", (s["id"],)).fetchone()[0]
-    if seen.get("refresh") and s["status"] == "running" and not pending and not young:
-        return restart_for_context(conn, s, alerts)  # idle with nothing pending and a huge context: start fresh
     if not young:
         seen["lapse"] = {"seq": seq, "since": time.time()}
     return None
@@ -2478,11 +1741,9 @@ def claim_watcher():
 
 
 def cmd_watch(args):
-    """Emit one line whenever a managed worker changes to a state that needs Zed's attention, or the user
-    leaves feedback on the dashboard (`INBOX #<id> ...`; every unhandled item is reported once per watch).
-    Claude Code: run it under the Monitor tool. Copilot CLI: run `watch --once` as a detached shell; it
-    exits after the first event(s), which wakes Zed, and remembers what it has reported so a re-armed
-    watch only reports new changes. Exits (3) when this session loses the Zed lock."""
+    """Emit one line whenever a managed worker changes to a state that needs Zed's attention. Run it under the
+    Monitor tool, or as `watch --once`, which exits after the first event(s) and remembers what it has reported so
+    a re-armed watch only reports new changes. Exits (3) when this session loses the Zed lock."""
     once = "--once" in args
     until_idle = "--exit-when-idle" in args  # the Stop hook's watcher gives up when no work is tracked any more
     idle_ticks, tracked = 0, True
@@ -2500,8 +1761,6 @@ def cmd_watch(args):
         return True
     saved = read_json(WATCH_STATE_PATH, None)
     prev = {int(k): v for k, v in saved.items()} if saved is not None else {}
-    inbox_path = WATCH_STATE_PATH.with_name("watch-inbox.json")
-    announced = set(read_json(inbox_path, []))  # inbox items already reported, kept across runs
     first = saved is None
     alerts_path = WATCH_STATE_PATH.with_name("watch-alerts.json")
     alerts = {int(k) if k.isdigit() else k: v for k, v in read_json(alerts_path, {}).items()}  # health alerts already reported, kept across runs
@@ -2524,13 +1783,10 @@ def cmd_watch(args):
                 key = s["id"]
                 for line in health_events(conn, s, a, state, alerts):
                     events.append(line)
-                if (size := context_check(s, a, alerts)):
-                    log_event(conn, s["task_id"], "auto", f"S{s['id']} context {size // 1000}k tokens: restart fresh at its next idle")
                 for block in status_blocks(new_status_lines(s, alerts)):
                     alerts[s["id"]]["nudges"] = 0
                     alerts[s["id"]].pop("lapse", None)
-                    note = context_note(s, alerts) if block["kind"] != "DONE" else ""
-                    events.append(f"S{s['id']} T{s['task_id']} {s['agent']} · status file: ZED:{block['kind']}{note}\n"
+                    events.append(f"S{s['id']} T{s['task_id']} {s['agent']} · status file: ZED:{block['kind']}\n"
                                   + record_block(conn, s, block))
                 snapshot = {"state": state, "sequence": a.get("state_change_seq") if a else None}
                 if prev.get(key) != snapshot:
@@ -2544,18 +1800,17 @@ def cmd_watch(args):
                         line = f"S{s['id']} T{s['task_id']} {s['agent']} is {state} (at watch start)"
                     if line and state != "gone":
                         screen = read_screen(s["agent"])
-                        record_credits(conn, s, screen)
                         if state == "blocked":
                             prompt = prompt_summary(screen)
-                            if auto_approve(conn, s, screen, alerts):
+                            if zedgates.may_auto_approve(s) and auto_approve(conn, s, screen, alerts):
                                 line = None  # handled by rule; logged, no need to wake Zed
                             else:
                                 line += f" · prompt: {prompt}" if prompt else ""
                         elif state in ("idle", "done"):
                             line = settle_turn(conn, s, screen, alerts, line, snapshot["sequence"])
-                        hit = line and state not in ("idle", "done") and limit_line(s["runtime"], screen)
+                        hit = line and state not in ("idle", "done") and limit_line(screen)
                         if hit:
-                            line += f" · possible {s['runtime']} usage limit: {hit}"
+                            line += f" · possible usage limit: {hit}"
                     if line:
                         events.append(line)
                     prev[key] = snapshot
@@ -2570,15 +1825,8 @@ def cmd_watch(args):
                         events.append(text)
             for s in open_prs:
                 events.extend(pr_events(conn, s, alerts))
-            events += delivery_events(alerts)
-            events += core_sync_events(alerts)
+            events += zedconductor.tick(conn, alerts, zed_cli)
             first = False
-            waiting = conn.execute("SELECT * FROM inbox WHERE status='new' ORDER BY id").fetchall()
-            for item in waiting:
-                if item["id"] not in announced:
-                    events.append(f"INBOX {inbox_summary(item)} — handle it with the inbox skill (bin/zed inbox)")
-                    announced.add(item["id"])
-            announced &= {item["id"] for item in waiting}  # handled items need no remembering
             conn.commit()
             conn.close()
         except Exception as e:  # keep the watch alive through transient failures
@@ -2587,7 +1835,6 @@ def cmd_watch(args):
             print(line, flush=True)
         WATCH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         WATCH_STATE_PATH.write_text(json.dumps(prev))
-        inbox_path.write_text(json.dumps(sorted(announced)))
         alerts_path.write_text(json.dumps(alerts))
         if once and events:
             return True
@@ -2605,37 +1852,6 @@ def prompt_summary(screen):
     lines = [l.strip(" │┃") .strip() for l in (screen or "").splitlines()[-30:]]
     keep = [l for l in lines if l and PROMPT_LINE.search(l) and "Tip:" not in l]
     return " | ".join(keep)[:600]
-
-
-DELIVERY_PROBES_PATH = PROFILE_DIR / "config" / "delivery-probes.json"
-DELIVERY_STALL_MINUTES = 60
-
-
-def delivery_events(alerts):
-    """Outcome checks: per task, a command printing one number, what has actually been delivered
-    (e.g. pages live on Confluence, PRs merged). Run every 15 min; wake Zed if a task with a running
-    session delivers nothing new for DELIVERY_STALL_MINUTES. Activity (files, plan ticks) is not delivery."""
-    out, now_t = [], time.time()
-    state = alerts.setdefault("delivery", {})
-    for tid, probe in read_json(DELIVERY_PROBES_PATH, {}).items():
-        st = state.setdefault(tid, {})
-        if now_t - st.get("checked", 0) < 900:
-            continue
-        st["checked"] = now_t
-        r = run(["bash", "-c", probe["command"]], check=False)
-        try:
-            value = int(r.stdout.strip().split()[-1])
-        except (ValueError, IndexError):
-            out.append(f"T{tid} delivery probe failed: {(r.stderr or r.stdout).strip()[:200]}")
-            continue
-        if value != st.get("value"):
-            st["value"], st["since"] = value, now_t
-            continue
-        idle = int((now_t - st.get("since", now_t)) // 60)
-        if idle >= DELIVERY_STALL_MINUTES and st.get("reported") != st.get("since"):
-            st["reported"] = st["since"]
-            out.append(f"T{tid} · NO DELIVERY: {probe.get('what', 'delivered count')} still {value} for {idle} min")
-    return out
 
 
 TOOLING_DIRS = {".git", "tools", "bin", "node_modules", ".venv", "venv", "__pycache__", ".ext"}
@@ -2681,26 +1897,10 @@ def auto_approve(conn, s, screen, alerts):
     return False
 
 
-CORE_SYNC_CHECK_SECONDS = 300
-
-
-def core_sync_events(alerts):
-    """One event when core commits have waited for `main` over an hour (lesson: core sync after every core commit).
-    Checked every few minutes; reported once per oldest waiting commit."""
-    seen = alerts.setdefault("core_sync", {})
-    if time.time() - seen.get("checked", 0) < CORE_SYNC_CHECK_SECONDS:
-        return []
-    seen["checked"] = time.time()
-    r = run([sys.executable, str(ZED_HOME / "bin" / "zed-core-sync"), "--check", "--json"], check=False)
-    try:
-        found = json.loads(r.stdout)
-    except ValueError:  # not on a profile branch, or no main: nothing to flag
-        return []
-    if not zedgates.core_sync_stale(found.get("oldest"), time.time()) or seen.get("reported") == found["oldest"]:
-        return []
-    seen["reported"] = found["oldest"]
-    return [f"core sync: {found['count']} core commit(s) have waited over an hour for main "
-            "(`bin/zed-core-sync --check` lists them; sync, then push as profile.md says)"]
+def zed_cli(args):
+    """Run one `bin/zed` command as the conductor does (the lock and every gate apply as for a person): (exit code, output)."""
+    r = run([sys.executable, str(ZED_HOME / "bin" / "zed"), *args], check=False)
+    return r.returncode, r.stdout + r.stderr
 
 
 def health_events(conn, s, a, state, alerts):
@@ -2710,7 +1910,7 @@ def health_events(conn, s, a, state, alerts):
     now = datetime.now()
     started = datetime.strptime(s["created_at"], "%Y-%m-%d %H:%M")
     if state == "working":
-        plans = plan_files(s["task_id"])
+        plans = session_plan_files(s)
         last = max([started] + [datetime.fromtimestamp(p.stat().st_mtime) for p in plans])
         idle = int((now - last).total_seconds() // 60)
         what = "no plan file yet" if not plans else "no plan progress"
@@ -2726,19 +1926,7 @@ def health_events(conn, s, a, state, alerts):
     else:
         seen.pop("blocked_since", None)
         seen.pop("block_reminded", None)
-    if s["runtime"] == "claude":
-        u = claude_usage(s["worktree"], note_session_id(conn, s, a))
-        if u:
-            step = u["output"] // USAGE_ALERT_OUTPUT
-            if step > seen.setdefault("usage_step", 0):
-                done = sum(plan_progress(p)[0] for p in plan_files(s["task_id"]))
-                since = seen.get("usage_at", 0)
-                wrote = output_files_since(s["worktree"], since)
-                if done <= seen.get("usage_plan_done", -1) and not wrote:  # tokens spent, nothing produced: needs judgment
-                    out.append(f"{tag} · USAGE without progress: {fmt_usage(u)}, still {done} plan steps, no new output files")
-                else:
-                    log_event(conn, s["task_id"], "auto", f"S{s['id']} usage {fmt_usage(u)}; {done} plan steps; {wrote} output files changed")
-                seen["usage_step"], seen["usage_plan_done"], seen["usage_at"] = step, done, time.time()
+    note_session_id(conn, s, a)  # the transcript's id, kept so the spend ledger can find it after the session closes
     return out
 
 
@@ -2817,12 +2005,12 @@ def cmd_hook(args):
 
 
 CONTEXT_FILES = ["CLAUDE.md", "playbook.md", "failure-modes.md", "profile/profile.md", "profile/lessons.md"]
-CONTEXT_BUDGET_WORDS = 9000
+CONTEXT_BUDGET_WORDS = 4000
 
 
 def context_words():
     """(words per always-loaded file, budget). The budget is `context_budget_words` in the profile's
-    config/settings.json (default 9000); the files are what every Zed session reads at start."""
+    config/settings.json (default 4000); the files are what every Zed session reads at start."""
     files = {"CLAUDE.md": ZED_HOME / "CLAUDE.md", "playbook.md": ZED_HOME / "playbook.md",
              "failure-modes.md": ZED_HOME / "failure-modes.md", "profile.md": PROFILE_DIR / "profile.md",
              "lessons.md": PROFILE_DIR / "lessons.md"}
@@ -2841,7 +2029,7 @@ def context_line():
 
 
 def cmd_doctor(args):
-    """doctor [--quiet] — checks Zed's own health; for now the always-loaded context budget. Exits 1 when over."""
+    """doctor [--quiet] — the always-loaded context budget (the pre-commit hook runs it). Exits 1 when over."""
     words, budget = context_words()
     over = sum(words.values()) > budget
     if over or "--quiet" not in args:
@@ -2849,310 +2037,12 @@ def cmd_doctor(args):
     sys.exit(1 if over else 0)
 
 
-# ---------------------------------------------------------------- dashboard
-# A local web page for seeing everything Zed tracks and leaving feedback. It is not Zed: it holds no lock,
-# never talks to workers and writes nothing but inbox rows. Zed (the lock holder) acts on them: see `cmd_inbox`.
-
-class FeedbackError(ValueError):
-    """Feedback Zed can't use. The message says why and is shown to the user on the dashboard."""
-
-
-def feedback_text(data, key, label, required=True, limit=FEEDBACK_TEXT_MAX):
-    value = data.get(key)
-    if value is not None and not isinstance(value, str):
-        raise FeedbackError(f"{label} must be text")
-    value = (value or "").replace("\r\n", "\n").strip()
-    if required and not value:
-        raise FeedbackError(f"{label} is required")
-    if len(value) > limit:
-        raise FeedbackError(f"{label} is too long ({len(value)} characters, at most {limit})")
-    return value or None
-
-
-def feedback_target(conn, data, key, table, label):
-    """The task or question row a piece of feedback is about."""
-    ref = data.get(key)
-    row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (ref,)).fetchone() if type(ref) is int and 0 < ref < 2**31 else None
-    if row is None:
-        raise FeedbackError(f"there is no {label} {ref!r}")
-    return row
-
-
-def dashboard_repos():
-    """The repo names in the profile's projects.json, for the new-task form ([] if it can't be read)."""
-    try:
-        return sorted(json.loads(PROJECTS_PATH.read_text()).get("repos", {}))
-    except (OSError, ValueError, AttributeError):
-        return []
-
-
-def add_feedback(conn, data):
-    """Validate one piece of feedback from the dashboard, store it in the inbox and return its id."""
-    kind = data.get("kind")
-    item = {"task_id": None, "question_id": None, "rating": None, "title": None, "jira": None, "repo": None}
-    if kind == "answer":
-        question = feedback_target(conn, data, "question_id", "questions", "question")
-        if question["status"] != "open":
-            raise FeedbackError(f"Q{question['id']} has already been answered")
-        item |= {"question_id": question["id"], "task_id": question["task_id"]}
-        item["text"] = feedback_text(data, "text", "The answer")
-    elif kind == "comment":
-        item["task_id"] = feedback_target(conn, data, "task_id", "tasks", "task")["id"]
-        item["text"] = feedback_text(data, "text", "The comment")
-    elif kind == "rating":
-        task = feedback_target(conn, data, "task_id", "tasks", "task")
-        if task["status"] not in RATABLE_STATES:
-            raise FeedbackError(f"T{task['id']} is {task['status']}: only delivered work (PR open or done) can be rated")
-        if data.get("rating") not in RATINGS:
-            raise FeedbackError("the rating must be good or not_good")
-        item |= {"task_id": task["id"], "rating": data["rating"]}
-        item["text"] = feedback_text(data, "text", "The reason", required=data["rating"] == "not_good")
-    elif kind == "task":
-        item["title"] = feedback_text(data, "title", "The title", limit=FEEDBACK_TITLE_MAX)
-        item["jira"] = feedback_text(data, "jira", "The ticket ID", required=False, limit=40)
-        item["repo"] = feedback_text(data, "repo", "The repo", required=False, limit=100)
-        if item["repo"] and item["repo"] not in dashboard_repos():
-            raise FeedbackError(f"unknown repo '{item['repo']}'")
-        item["text"] = feedback_text(data, "text", "The details", required=False)
-    else:
-        raise FeedbackError(f"unknown kind of feedback (expected {', '.join(INBOX_KINDS)})")
-    row = {"kind": kind, **item, "created_at": now()}
-    cur = conn.execute(f"INSERT INTO inbox({','.join(row)}) VALUES ({','.join('?' * len(row))})", list(row.values()))
-    conn.commit()
-    return cur.lastrowid
-
-
-def dashboard_task(conn, t, agents):
-    sessions = []
-    for s in conn.execute("SELECT * FROM sessions WHERE task_id=? ORDER BY id", (t["id"],)):
-        live = None  # herdr's state for a worker that should be running; None for finished/closed sessions
-        if s["status"] in ("running", "waiting_user") and s["pane_id"]:
-            if agents is None:
-                live = "unavailable"
-            else:
-                live = agents[s["pane_id"]]["agent_status"] if s["pane_id"] in agents else "gone"
-        sessions.append({k: s[k] for k in ("id", "agent", "repo", "branch", "base", "status", "runtime", "model",
-                                           "effort", "credits", "pr_url", "external", "employee", "hat", "verdict")} | {"live": live})
-    rating = conn.execute("SELECT * FROM inbox WHERE task_id=? AND kind='rating' ORDER BY id DESC LIMIT 1", (t["id"],)).fetchone()
-    done, total = task_plan_progress(t["id"])
-    return {k: t[k] for k in ("id", "title", "jira", "worktype", "description", "status", "created_at", "updated_at")} | {
-        "sessions": sessions,
-        "events": [dict(e) for e in conn.execute(
-            "SELECT ts, kind, text FROM events WHERE task_id=? ORDER BY id DESC LIMIT 10", (t["id"],))],
-        "feedback": [dict(i) for i in conn.execute("SELECT * FROM inbox WHERE task_id=? ORDER BY id DESC LIMIT 5", (t["id"],))],
-        "rating": dict(rating) if rating else None,
-        "plan": {"done": done, "total": total} if total else None,
-        "can_rate": t["status"] in RATABLE_STATES}
-
-
-def dashboard_zed():
-    """Whether a Zed session is listening for feedback, and which runtimes are marked limited."""
-    holder = read_lock()
-    try:
-        active = bool(holder) and holder_alive(holder)
-    except OSError:  # herdr isn't installed, so the holder's pane can't be checked
-        active = bool(holder)
-    try:
-        limited = {name: s for name, s in json.loads(RUNTIME_STATE_PATH.read_text()).items() if isinstance(s, dict)}
-    except (OSError, ValueError, AttributeError):
-        limited = {}
-    zed = {"active": active, "runtime": None, "since": None, "limited": limited}
-    if active:
-        zed |= {"runtime": holder.get("runtime") or "claude", "since": holder.get("acquired_at")}
-    return zed
-
-
-def dashboard_team(conn):
-    """The employees (who is on what, in which hat) and the work waiting for one, as `zed-employee board` has it."""
-    working = {r["employee"]: r for r in conn.execute(
-        f"SELECT id, task_id, employee, hat, repo FROM sessions WHERE employee IS NOT NULL AND status IN ({','.join('?' * len(zedassign.OPEN))})",
-        zedassign.OPEN)}
-    people = []
-    for name in emp.names():
-        fields = emp.load_employee(name)[0]
-        s = working.get(name)
-        people.append({"name": name, "voice": fields.get("voice"), "senior": zedassign.is_senior(fields),
-                       "assignment": {k: s[k] for k in ("id", "task_id", "hat", "repo")} if s else None})
-    return {"employees": people, "waits": zedassign.board(conn)["waits"]}
-
-
-def dashboard_state(conn, agents):
-    """Everything the dashboard shows, as JSON-ready data. `agents` is herdr's live agents by pane
-    (see herdr_agents), or None when herdr can't be reached."""
-    groups = []
-    for title, states in TASK_GROUPS:
-        rows = conn.execute(f"SELECT * FROM tasks WHERE status IN ({','.join('?' * len(states))}) ORDER BY id", states).fetchall()
-        groups.append({"title": title, "tasks": [dashboard_task(conn, t, agents) for t in rows]})
-    finished = conn.execute("SELECT * FROM tasks WHERE status IN ('done','cancelled') "
-                            "ORDER BY updated_at DESC, id DESC LIMIT 20").fetchall()
-    groups.append({"title": "Recently finished", "tasks": [dashboard_task(conn, t, agents) for t in finished],
-                   "total": conn.execute("SELECT COUNT(*) FROM tasks WHERE status IN ('done','cancelled')").fetchone()[0]})
-    questions = []
-    for q in conn.execute("SELECT q.*, t.jira, t.title AS task_title FROM questions q LEFT JOIN tasks t ON t.id=q.task_id "
-                          "WHERE q.status='open' ORDER BY q.id").fetchall():
-        sent = conn.execute("SELECT * FROM inbox WHERE kind='answer' AND question_id=? AND status='new' ORDER BY id DESC LIMIT 1",
-                            (q["id"],)).fetchone()  # an answer from the dashboard that Zed hasn't picked up yet
-        questions.append({k: q[k] for k in ("id", "task_id", "session_id", "question", "asked_at", "jira", "task_title")}
-                         | {"sent": dict(sent) if sent else None})
-    return {"groups": groups, "questions": questions, "repos": dashboard_repos(), "herdr": agents is not None,
-            "inbox": [dict(i) for i in conn.execute("SELECT * FROM inbox ORDER BY id DESC LIMIT 20")],
-            "pending_feedback": conn.execute("SELECT COUNT(*) FROM inbox WHERE status='new'").fetchone()[0],
-            "zed": dashboard_zed(), "team": dashboard_team(conn)}
-
-
-def dashboard_server(port, token):
-    """The dashboard's HTTP server, bound to 127.0.0.1 only. Every request needs the per-run token and a
-    local Host header (so a web page the user happens to visit can't reach it through DNS rebinding)."""
-    import hmac  # imported here, like http.server (~15 ms): only the dashboard needs them
-    import traceback
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-    class Handler(BaseHTTPRequestHandler):
-        server_version = "ZedDashboard"
-        sys_version = ""
-
-        def log_message(self, *args):
-            pass  # the page's URL carries the token: no access log
-
-        def reply(self, status, body, content_type, headers=None):
-            data = body.encode()
-            self.send_response(status)
-            for name, value in {"Content-Type": content_type, "Content-Length": len(data), "Cache-Control": "no-store",
-                                "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY",
-                                "Referrer-Policy": "no-referrer", **(headers or {})}.items():
-                self.send_header(name, str(value))
-            self.end_headers()
-            self.wfile.write(data)
-
-        def reply_json(self, status, payload):
-            self.reply(status, json.dumps(payload), "application/json; charset=utf-8")
-
-        def authorized(self, query):
-            if self.headers.get("Host") not in self.server.hosts:
-                return False
-            supplied = self.headers.get("X-Zed-Token") or query.get("token", [""])[0]
-            return hmac.compare_digest(supplied.encode(), token.encode())
-
-        def post_feedback(self):
-            if not self.headers.get("Content-Type", "").startswith("application/json"):
-                return self.reply_json(415, {"error": "expected a JSON body"})
-            try:
-                length = int(self.headers.get("Content-Length", ""))
-            except ValueError:
-                return self.reply_json(411, {"error": "Content-Length is required"})
-            if not 0 < length <= DASHBOARD_BODY_MAX:
-                return self.reply_json(413, {"error": f"the body must be 1 to {DASHBOARD_BODY_MAX} bytes"})
-            try:
-                data = json.loads(self.rfile.read(length))
-            except ValueError:
-                data = None
-            if not isinstance(data, dict):
-                return self.reply_json(400, {"error": "expected a JSON object"})
-            conn = db()
-            try:
-                self.reply_json(200, {"id": add_feedback(conn, data)})
-            except FeedbackError as e:
-                self.reply_json(400, {"error": str(e)})
-            finally:
-                conn.close()
-
-        def route(self):
-            url = urlsplit(self.path)
-            if not self.authorized(parse_qs(url.query)):
-                return self.reply(403, "Forbidden. Open the URL that `zed dashboard` printed: it carries the access token.\n",
-                                  "text/plain; charset=utf-8")
-            if (self.command, url.path) == ("GET", "/"):
-                nonce = os.urandom(12).hex()
-                return self.reply(200, DASHBOARD_PAGE.read_text().replace("{{NONCE}}", nonce), "text/html; charset=utf-8",
-                                  {"Content-Security-Policy": DASHBOARD_CSP.format(nonce=nonce)})
-            if (self.command, url.path) == ("GET", "/api/state"):
-                conn = db()
-                try:
-                    return self.reply_json(200, dashboard_state(conn, herdr_agents()))
-                finally:
-                    conn.close()
-            if (self.command, url.path) == ("POST", "/api/feedback"):
-                return self.post_feedback()
-            self.reply_json(404, {"error": "not found"})
-
-        def handle_request(self):
-            try:
-                self.route()
-            except (BrokenPipeError, ConnectionResetError):
-                pass  # the browser went away mid-response
-            except sqlite3.Error as e:
-                self.reply_json(503, {"error": f"the task database is busy or unreadable: {e}"})
-            except Exception as e:  # never leave the browser waiting on a request that blew up
-                traceback.print_exc()
-                self.reply_json(500, {"error": f"{type(e).__name__}: {e}"})
-
-        do_GET = do_POST = handle_request
-
-    class Server(ThreadingHTTPServer):
-        daemon_threads = True
-
-    server = Server(("127.0.0.1", port), Handler)
-    server.hosts = {f"{name}:{server.server_address[1]}" for name in ("127.0.0.1", "localhost")}
-    return server
-
-
-def running_dashboard():
-    """The dashboard of this profile that is still up (its URL, pid and port), else None."""
-    try:
-        info = json.loads(DASHBOARD_STATE_PATH.read_text())
-        os.kill(info["pid"], 0)
-        socket.create_connection(("127.0.0.1", info["port"]), timeout=1).close()
-    except (OSError, ValueError, KeyError, TypeError):  # no record, a stale one, or an unreadable one
-        return None
-    return info
-
-
-def cmd_dashboard(args):
-    """dashboard [--port N] [--open] — serve the local dashboard on 127.0.0.1 until interrupted."""
-    ap = argparse.ArgumentParser(prog="zed dashboard", description=cmd_dashboard.__doc__)
-    ap.add_argument("--port", type=int, default=DASHBOARD_PORT, help=f"port to listen on (default {DASHBOARD_PORT}; 0 = any free one)")
-    ap.add_argument("--open", action="store_true", help="open the dashboard in the default browser")
-    opts = ap.parse_args(args)
-    if not 0 <= opts.port <= 65535:
-        ap.error("--port must be between 0 and 65535")
-    db().close()  # require the profile and create/upgrade the schema now rather than in the first request
-    info = running_dashboard()
-    if info:
-        print(f"the dashboard is already running (pid {info['pid']}): {info['url']}")
-        if opts.open:
-            webbrowser.open(info["url"])
-        return
-    token = os.urandom(18).hex()
-    try:
-        server = dashboard_server(opts.port, token)
-    except OSError as e:
-        die(f"can't listen on 127.0.0.1:{opts.port} ({e.strerror}). Pick another port with --port (0 = any free one).")
-    port = server.server_address[1]
-    info = {"url": f"http://127.0.0.1:{port}/?token={token}", "port": port, "pid": os.getpid(), "started_at": now()}
-    DASHBOARD_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    DASHBOARD_STATE_PATH.write_text(json.dumps(info))
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # so the cleanup below also runs when it is stopped with kill
-    print(f"Zed dashboard: {info['url']}", flush=True)
-    print("Open that URL in a browser on this Mac. It carries the access token, so keep it to yourself. "
-          "Ctrl-C stops the dashboard.", flush=True)
-    if opts.open:
-        webbrowser.open(info["url"])
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("dashboard stopped")
-    finally:
-        server.server_close()
-        DASHBOARD_STATE_PATH.unlink(missing_ok=True)
-
-
 def cmd_paths(args):
     """Print where Zed's files are, for skills and scripts."""
     print(json.dumps({"home": str(ZED_HOME), "profile": str(PROFILE_DIR),
                       "profile_exists": (PROFILE_DIR / "profile.md").exists(),
                       "db": str(DB_PATH), "status": str(STATUS_PATH), "projects": str(PROJECTS_PATH),
-                      "briefs": str(PROFILE_DIR / "briefs"), "runtimes": str(RUNTIMES_PATH),
-                      "model_ranking": str(MODEL_RANKING_PATH)}, indent=2))
+                      "briefs": str(PROFILE_DIR / "briefs"), "claude": str(CLAUDE_CONFIG_PATH)}, indent=2))
 
 
 BRIEF_LINES = 12  # per section; the rest is "N more omitted"
@@ -3174,9 +2064,10 @@ def render_brief(conn, live=None):
     for s in conn.execute("SELECT * FROM sessions WHERE status IN ('running','waiting_user') ORDER BY id"):
         a = live.get(s["pane_id"])
         state = a["agent_status"] if a else "GONE"
-        plan = [plan_progress(p) for p in plan_files(s["task_id"])]
-        note = f" · plan {plan[0][0]}/{plan[0][0] + plan[0][1]}" if plan else ""
-        sess.append(f"  S{s['id']} T{s['task_id']} {s['agent']} {s['runtime']} {s['status']}/{state}{note}")
+        plans = session_plan_files(s)
+        done, todo = plan_progress(plans[0]) if plans else (0, 0)
+        note = f" · {s['hat'] or 'build'} {done}/{done + todo}{awaiting_note(plans)}" if plans else ""
+        sess.append(f"  S{s['id']} T{s['task_id']} {s['agent']} {s['status']}/{state}{note}")
     out += ["Sessions running:", *(capped(sess) or ["  none"])]
     other = [f"  T{t['id']} {t['status']} {t['jira'] or '-'} {t['title']}" for t in conn.execute(
         "SELECT * FROM tasks WHERE status IN ('pr_open','intake','parked') ORDER BY id")]
@@ -3185,8 +2076,19 @@ def render_brief(conn, live=None):
 
 
 def plan_progress(plan):
-    text = plan.read_text()
-    return len(re.findall(r"^\s*- \[[xX]\]", text, re.M)), len(re.findall(r"^\s*- \[ \]", text, re.M))
+    """(done, todo) of a plan file; open merge/push/raise-PR steps are counted apart by plan_awaiting, not as todo."""
+    steps = zedlib.parse_plan_steps(plan.read_text())
+    return sum(s["done"] for s in steps), sum(not s["done"] and not zedlib.step_exempt(s) for s in steps)
+
+
+def plan_awaiting(plans):
+    """How many unticked merge/push/raise-PR steps these plan files hold: work that is done but waits for the PR."""
+    return sum(not st["done"] and zedlib.step_exempt(st) for plan in plans for st in zedlib.parse_plan_steps(plan.read_text()))
+
+
+def awaiting_note(plans):
+    n = plan_awaiting(plans)
+    return f" (+{n} awaiting merge/PR)" if n else ""
 
 
 def cmd_status(args):
@@ -3209,9 +2111,21 @@ def script_findings(label, script, *args, limit=6):
     return [f"{label}:", *(f"  {l[:200]}" for l in lines[:limit]), *([f"  … {len(lines) - limit} more (bin/{script})"] if len(lines) > limit else [])]
 
 
+def arm_watcher():
+    """Start one detached `watch --once` for this profile and return its pid once it holds the watcher lock (or None)."""
+    with open(PROFILE_DIR / ".cache" / "watch.log", "w") as log:
+        subprocess.Popen([str(ZED_HOME / "bin" / "zed"), "watch", "--once"], stdout=log, stderr=subprocess.STDOUT,
+                         start_new_session=True)
+    for _ in range(20):
+        time.sleep(0.25)
+        if pid := watcher_alive():
+            return pid
+    return None
+
+
 def cmd_start(args):
     """start [--take-over] — session start in one command: claim the Zed lock, then print one bounded
-    digest (lock, runtimes, watcher, what needs the user, running sessions). Read it once and trust it."""
+    digest (lock, watcher, what needs the user, running sessions). Read it once and trust it."""
     require_profile()
     notes = []
     try:
@@ -3224,32 +2138,18 @@ def cmd_start(args):
     conn = db()
     lock = read_lock()
     out = [f"Zed home {ZED_HOME} · profile {PROFILE_DIR}",
-           f"lock: {'held by this session (' + (me().get('runtime') or '?') + ')' if holds_lock() else describe(lock) if lock else 'none'}",
-           "runtimes: " + "; ".join(
-               f"{n} {'LIMITED ' + json.dumps(r['limited']) if r['limited'] else 'ok' if r['installed'] and r['enabled'] else 'unusable'}"
-               for n, r in ((n, runtime_report(n)) for n in runtime_config().get("order", [])))]
+           f"lock: {'held by this session' if holds_lock() else describe(lock) if lock else 'none'}"]
     watcher = watcher_alive()
     running = conn.execute("SELECT COUNT(*) FROM sessions WHERE status IN ('running','waiting_user')").fetchone()[0]
-    if not watcher and running and holds_lock():
-        # Auto-arm the watcher in the background so we get notified when workers finish.
-        # Pi has no Stop hooks, so we must ensure the watcher is running.
-        subprocess.Popen(["nohup", str(ZED_HOME / "bin" / "zed"), "watch", "--once"],
-                         stdout=open("/tmp/zed-watcher.log", "w"), stderr=subprocess.STDOUT,
-                         start_new_session=True)
-        time.sleep(1)
-        watcher = watcher_alive()
+    if not watcher and running and holds_lock() and os.environ.get("OPENCODE_SESSION_ID"):
+        watcher = arm_watcher()  # OpenCode has no blocking Stop hook to re-arm it after each turn: arm it here
     out.append(f"watcher: {'alive, pid ' + str(watcher) if watcher else 'NOT RUNNING' + (' — arm it: bin/zed watch --once (background)' if running else '')}")
     out.append(context_line())
-    if quota_settings().get("threshold_tokens"):
-        out.append(quota_warning() or "quota: under the configured threshold (`bin/zed quota` for detail)")
     out += notes + render_brief(conn)
     if holds_lock():  # read-only sessions only report what the DB says
-        out += script_findings("employees: who is free, what waits (zed-employee board)", "zed-employee", "board", "--brief")
-        out += script_findings("reality differs from the DB (zed-crew)", "zed-crew", "reconcile")
+        out += script_findings("sessions out of step with the DB (zed-crew)", "zed-crew", "reconcile")
         out += script_findings("core commits not on main yet (zed-core-sync)", "zed-core-sync", "--check")
         out += script_findings("git guard (zed-guard)", "zed-guard", "audit")
-        out += script_findings("core updates waiting (zed-update; `bin/zed-update apply` merges)", "zed-update", "check", "--no-fetch")
-        out += script_findings("housekeeping (zed-hygiene)", "zed-hygiene", "report")
     pending = [f"  [E{e['id']}] {e['ts']} {e['text'].splitlines()[0][:160]}" for e in queue_pending()]
     if pending:
         out += ["Un-acked wake events (handle, then `bin/zed ack E<id>…`):", *capped(pending)]
@@ -3268,13 +2168,11 @@ def cmd_help(args):
                                      scaffold the brief from the task, projects.json, repo notes and plan
                                      block; leaves <FILL: …> for the model, which spawn refuses
   spawn <T> repo= base= branch= brief=<file> [name=<agent>] [from=<start-ref, default origin/<base>>]
-        [runtime=auto|pi|claude|copilot] [model=] [effort=] [kind=] [handoff=<note>]
-                                     runtime/model/effort default to the profile's order and model policy;
-                                     kind (default: the task's worktype) picks the effort by model_policy.effort_by_kind;
-                                     beyond runtimes.<rt>.max_running the task is queued (exit 75)
-        [employee= hat= tags=a,b origin=zed]   an employee's assignment (also: assign <employee> <T> hat= …);
-                                     refused for an author reviewing/QAing their own work or a second writer
-                                     on a worktree; exit 75 (queued) if the employee is busy
+        [model=] [effort=] [kind=]   model/effort default to claude.json; kind (default: the task's worktype)
+                                     picks the effort by claude.json effort_by_kind; beyond max_running the task is queued (exit 75)
+        [hat=build|review|qa]        the hat the session wears (default build);
+                                     refused for a second writer on a worktree or a review/qa before the build's plan is done
+        [runtime=claude|opencode]    claude by default; opencode (opt-in) takes model= only, no effort, no max_running
   session list | session set <S|agent> key=value... (status pr_url claude_session_id pane_id workspace_id base brief)
   close <S|agent> [keep-worktree] [keep-scratch] [force]
                                      (external sessions are only untracked; the landed-work test below
@@ -3282,44 +2180,21 @@ def cmd_help(args):
                                      folder is removed too unless it holds unique work)
   landed <S|agent>                   landed-work test: pushed, nothing uncommitted, PR merged/closed, plan
                                      complete, no open questions; prints exactly what blocks closing
-        [ephemeral=<why>] [copilot_reason=<why>]   without employee= a free employee blocks spawn unless
-                                     ephemeral= says why none fits; runtime=copilot needs claude limited or copilot_reason=
   prompt <S|agent> [--redirect] <text | --file F>
                                      the way to prompt a worker: refused while it is `working` unless --redirect
   relay-post <S|agent> <words-file> --action "<exact action>" [--redirect] [--print]
                                      relay the user's OK to post: their words verbatim + the exact action
-  gate check <sha|branch> [dir]      exit 1 unless the commit has a clean review and qa by non-authors (read-only)
+  gate check <sha|branch> [dir]      exit 1 unless the commit's code (profile/ ignored) has a clean review and qa by non-authors (read-only)
   merge <branch> [dir] [--override "<reason>"]
                                      `git merge --no-ff` only past the gate; --override is the user's call, logged
   adopt <pane-id> <T> [repo=]        track a session Zed didn't start (user's own)
-  handoff <S|agent> [runtime=] [brief=] [model=] [effort=] [restart]
-                                     move a stopped worker to another runtime, same worktree
-                                     (writes a handoff note, closes the old session, spawns the new one)
-  runtime status | runtime limited <rt> [until=<when>] [note...] | runtime ok <rt>
-                                     which runtimes are usable; mark one limited / available again
   hook arm | hook stop-guard         Claude Stop hooks (.claude/settings.json): tokenless watcher re-arm and a
                                      turn-end guard; act only in the session holding the lock
   ack <E-id>... | ack --all          retire handled watcher events; un-acked ones are shown again by `watch`
                                      (up to 3 times) and always by `start`
-  doctor [--quiet]                   check the always-loaded context budget (context_budget_words in
-                                     config/settings.json, default 9000); exits 1 when over
-  quota                              estimate plan usage from session transcripts (rolling window, all Claude
-                                     sessions); spawn warns past runtimes.json quota.threshold_tokens
-  coordinator [routine|judgment] [--print]
-                                     start Zed's own session on the cheaper routine model/effort (default) or the
-                                     stronger judgment one (runtimes.json coordinator.<mode>, within the ceiling)
-  models show | models import <ranking.json>
-                                     the model ranking and what the policy picks per runtime
-  watch [interval-seconds] [--once]  Claude: run under Monitor. Copilot: run `watch --once` as a
-                                     detached shell; it exits after the first event(s).
-                                     Also reports `INBOX #<id> ...` for each unhandled dashboard item
-  dashboard [--port N] [--open]      local web dashboard on 127.0.0.1 (default port 8765; 0 = any free one).
-                                     Prints a URL carrying this run's access token. See everything, answer
-                                     questions, comment, rate finished work, request tasks: it only writes
-                                     the inbox. Already running? Prints its URL. Needs no lock
-  inbox [list [--all]]               feedback from the dashboard still to handle (--all: handled too)
-  inbox done <id> [what Zed did...]  mark an item handled; the note is shown to the user on the dashboard
-                                     (needs the lock; see the `inbox` skill)
+  watch [interval-seconds] [--once]  run under Monitor, or `watch --once` as a background shell; exits after the first event(s)
+  doctor [--quiet]                   check the always-loaded context budget (4000 words; context_budget_words in
+                                     config/settings.json); exits 1 when over. The pre-commit hook runs it
   status [--brief]                   (regenerate + print STATUS.md; --brief: only what needs attention)
   start [--take-over]                (session start: claim the lock, print one bounded digest)
   paths                              (Zed home, profile dir, DB/STATUS/config/briefs locations)
@@ -3330,9 +2205,9 @@ Task states:    """ + ", ".join(TASK_STATES) + """
 Session states: """ + ", ".join(SESSION_STATES))
 
 
-COMMANDS = {"task": cmd_task, "log": cmd_log, "q": cmd_q, "spawn": cmd_spawn, "assign": cmd_assign, "session": cmd_session,
-            "prompt": cmd_prompt, "relay-post": cmd_relay_post, "gate": cmd_gate, "merge": cmd_merge, "close": cmd_close, "adopt": cmd_adopt, "handoff": cmd_handoff, "watch": cmd_watch, "status": cmd_status,
-            "brief": cmd_brief, "coordinator": cmd_coordinator, "quota": cmd_quota, "landed": cmd_landed, "doctor": cmd_doctor, "ack": cmd_ack, "hook": cmd_hook, "paths": cmd_paths, "start": cmd_start, "lock": cmd_lock, "runtime": cmd_runtime, "models": cmd_models, "inbox": cmd_inbox, "dashboard": cmd_dashboard, "help": cmd_help}
+COMMANDS = {"task": cmd_task, "log": cmd_log, "q": cmd_q, "spawn": cmd_spawn, "session": cmd_session,
+            "prompt": cmd_prompt, "relay-post": cmd_relay_post, "gate": cmd_gate, "merge": cmd_merge, "close": cmd_close, "adopt": cmd_adopt, "watch": cmd_watch, "status": cmd_status,
+            "brief": cmd_brief, "landed": cmd_landed, "doctor": cmd_doctor, "ack": cmd_ack, "hook": cmd_hook, "paths": cmd_paths, "start": cmd_start, "lock": cmd_lock, "help": cmd_help}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:

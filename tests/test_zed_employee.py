@@ -1,7 +1,6 @@
 import contextlib
 import io
 import json
-import re
 import sqlite3
 import tempfile
 import unittest
@@ -12,10 +11,8 @@ import _load
 
 import zedemployee as emp
 import zedlib
-import zedmem
 
 cli = _load.load("zed-employee")
-SIX = ["atlas", "forge", "juno", "pip", "quill", "scout"]
 
 
 def run(*argv):
@@ -54,7 +51,7 @@ class TemplateTests(unittest.TestCase):
     def test_every_manifest_validates(self):
         self.assertEqual(emp.hat_names(), ["build", "qa", "review"])
         for hat in emp.hat_names():
-            self.assertEqual(emp.validate_manifest(emp.load_manifest(hat), emp.TEMPLATES / "hats" / hat), [], hat)
+            self.assertEqual(emp.validate_manifest(emp.load_manifest(hat), emp.HATS / hat), [], hat)
 
     def test_manifest_schema_refusals(self):
         good = emp.load_manifest("review")
@@ -85,167 +82,38 @@ class TemplateTests(unittest.TestCase):
             for skill in emp.load_manifest(hat)["skills"]:
                 code, out, _ = run("skill", "show", skill, "--hat", hat)
                 self.assertEqual(code, 0, f"{hat}/{skill}")
-                fields, body = emp.parse_frontmatter(out)
-                self.assertEqual(fields["name"], skill)
-                self.assertTrue(fields["description"] and body)
+                self.assertTrue(out.startswith(f"---\nname: {skill}\ndescription: "), f"{hat}/{skill}")
 
-    def test_roster_has_the_six_and_only_atlas_and_forge_are_senior(self):
-        self.assertEqual(emp.roster_names(), SIX)
-        for n in SIX:
-            f, body = emp.parse_frontmatter((emp.TEMPLATES / "roster" / f"{n}.md").read_text())
-            self.assertEqual(f["name"], n)
-            self.assertTrue(f["voice"] and f["strengths"] and body)
-            self.assertEqual(f["senior"], n in ("atlas", "forge"))
+    def test_hats_command_and_the_charter(self):
+        self.assertEqual(run("hats"), (0, "build: ok\nqa: ok\nreview: ok\n", ""))
+        self.assertIn("# Hat: review", emp.hat_charter("review"))
 
-    def test_employee_rules_names_its_placeholders(self):
-        text = (emp.TEMPLATES / "employee-rules.md").read_text()
-        self.assertEqual(sorted(set(re.findall(r"\{\{(\w+)\}\}", text))), ["HAT", "NAME", "PACK", "VOICE"])
-
-
-class FrontmatterTests(unittest.TestCase):
-    def test_roundtrip(self):
-        fields = {"name": "x", "voice": 'Kind: "yes"', "strengths": ["a", "b"], "senior": False, "memory_words": 1500}
-        parsed, body = emp.parse_frontmatter(emp.render_frontmatter(fields) + "# X\n")
-        self.assertEqual(parsed, fields)
-        self.assertEqual(body, "# X")
-
-    def test_list_items_with_commas_and_brackets_roundtrip(self):
-        fields = {"strengths": ["fast, careful", "uses [x]", 'says "no"', "plain", "# tag", "a # b", "a #b"], "none": []}
-        parsed, _ = emp.parse_frontmatter(emp.render_frontmatter(fields) + "# X\n")
-        self.assertEqual(parsed, fields)
-
-    def test_comments_and_missing_block(self):
-        self.assertEqual(emp.parse_frontmatter("---\nruntime: auto   # the profile order\n---\n")[0], {"runtime": "auto"})
-        self.assertEqual(emp.parse_frontmatter('---\nk: "x # y" # c\n---\n')[0], {"k": "x # y"})
-        self.assertEqual(emp.parse_frontmatter("no block"), ({}, "no block"))
-
-
-class HireTests(ProfileCase):
-    def test_hire_juno_and_quill_and_print_intro_cards_from_files(self):
-        for n in ("juno", "quill"):
-            self.assertEqual(run("hire", n)[0], 0)
-        edir = self.profile / "employees" / "quill"
-        fields, body = emp.parse_frontmatter((edir / "employee.md").read_text())
-        self.assertEqual((fields["name"], fields["senior"], fields["runtime"], fields["memory_words"]),
-                         ("quill", False, "auto", 1500))
-        self.assertNotIn("role", fields)
-        self.assertIn("Quill reads for the person who maintains this next year", body)
-        for hat in ("general", "build", "review", "qa"):
-            self.assertTrue((edir / "memory" / "craft" / f"{hat}.md").exists(), hat)
-        self.assertTrue((edir / "log.md").exists())
-        code, out, _ = run("intro", "quill", "--record")
-        self.assertEqual(code, 0)
-        for needle in ("Quill", "Kind but exacting", "readability", "build, qa, review", "Never without approval", "Remembers"):
-            self.assertIn(needle, out)
-        _, listing, _ = run("list")
-        self.assertIn("juno", listing)
-        self.assertRegex(listing, r"quill\s+hired \S+\s+memory 0\s+introduced \d{4}")
-        self.assertIn("not introduced", listing.splitlines()[0])
-        rows = sqlite3.connect(zedlib.DB_PATH).execute("SELECT name, senior FROM employees ORDER BY name").fetchall()
-        self.assertEqual(rows, [("juno", 0), ("quill", 0)])
-
-    def test_hire_refusals(self):
-        run("hire", "juno")
-        self.assertIn("already hired", run("hire", "juno")[2])
-        self.assertIn("not in the roster", run("hire", "newbie")[2])
-        self.assertIn("lowercase", run("hire", "Bad Name")[2])
-        self.assertEqual(run("hire", "newbie", "--voice", "Dry.", "--strengths", "x,y", "--senior")[0], 0)
-        fields, _ = emp.load_employee("newbie")
-        self.assertEqual((fields["senior"], fields["strengths"]), (True, ["x", "y"]))
-
-    def test_is_senior_reads_true_and_the_text_true_only(self):
-        import zedassign
-        for value, expected in ((True, True), ("true", True), ("True", True), (False, False), ("false", False), (None, False)):
-            self.assertEqual(zedassign.is_senior({"senior": value}), expected, value)
-        self.assertFalse(zedassign.is_senior({}))
-
-    def test_senior_comes_from_the_card_unless_overridden(self):
-        run("hire", "atlas")
-        run("hire", "forge", "--no-senior")
-        self.assertTrue(emp.load_employee("atlas")[0]["senior"])
-        self.assertFalse(emp.load_employee("forge")[0]["senior"])
-
-    def test_show_and_unknown_employee(self):
-        run("hire", "juno")
-        code, out, _ = run("show", "juno")
-        self.assertIn("name: juno", out)
-        self.assertIn("memory: fact 0, preference 0", out)
-        code, _, err = run("show", "ghost")
-        self.assertEqual(code, 2)
-        self.assertIn("no employee 'ghost'", err)
-
-    def test_employee_own_skill_wins_over_the_templates(self):
-        run("hire", "juno")
-        own = self.profile / "employees" / "juno" / "skills" / "finish"
-        own.mkdir(parents=True)
-        (own / "SKILL.md").write_text("---\nname: finish\n---\nJuno's own version\n")
-        self.assertEqual(emp.skill_path("finish", "juno"), own / "SKILL.md")
-        self.assertNotEqual(emp.skill_path("finish", "quill"), own / "SKILL.md")
-
-
-class MemoryCliTests(ProfileCase):
-    def setUp(self):
-        super().setUp()
-        run("hire", "quill")
-
-    def test_remember_pack_verify_end_to_end(self):
-        code, out, _ = run("remember", "-e", "quill", "--kind", "fact", "--repo", "api", "--src", "guard.py",
-                           "--anchor", "def require_role", "--tags", "auth", "Role checks live in guard.py.")
-        self.assertEqual((code, out.strip()), (0, "remembered m-0001"))
-        run("remember", "-e", "quill", "--kind", "lesson", "--hat", "review", "--src", "T17 S31", "Name the fix.")
-        code, text, _ = run("pack", "-e", "quill", "--repo", "api", "--hat", "review", "--tags", "auth", "--dry-run")
-        self.assertIn("Role checks live in guard.py.", text)
-        self.assertIn("Name the fix.", text)
-        code, out, _ = run("pack", "-e", "quill", "--repo", "api", "--hat", "review", "--tags", "auth",
-                         "--session", "S42")
-        packfile = self.profile / ".cache" / "employees" / "quill" / "S42-pack.md"
-        self.assertEqual(packfile.read_text().strip(), text.strip())
-        self.assertIn("2 entries", out)
-        self.assertEqual(zedmem.find(self.profile / "employees" / "quill", "m-0001")[1].uses, 1)
-        # the anchor disappears from the base branch: verify says stale, the next pack lists it for attention
-        (self.repo / "guard.py").write_text("renamed\n")
-        zedlib.git(self.repo, "commit", "-qam", "rename")
-        code, out, _ = run("verify", "-e", "quill", "--repo", "api")
-        self.assertEqual(code, 1)
-        self.assertIn("stale 1 (m-0001)", out)
-        self.assertIn("## Needs your attention", run("pack", "-e", "quill", "--repo", "api", "--hat", "build", "--dry-run")[1])
-        # the employee refuses to refresh without a real anchor, then drops with a reason
-        self.assertEqual(run("refresh", "-e", "quill", "m-0001", "--anchor", "def require_role")[0], 1)
-        self.assertEqual(run("drop", "-e", "quill", "m-0001", "--reason", "renamed")[0], 0)
-        self.assertEqual(run("verify", "-e", "quill", "--repo", "api")[0], 0)
-
-    def test_refusals_exit_1_with_the_reason_and_unknown_things_exit_2(self):
-        code, _, err = run("remember", "-e", "quill", "--kind", "preference", "--repo", "api", "Small PRs.")
-        self.assertEqual(code, 1)
-        self.assertIn("src is mandatory", err)
-        code, _, err = run("remember", "-e", "quill", "--kind", "fact", "--repo", "nope", "--src", "a.py", "--anchor", "a", "x")
-        self.assertEqual(code, 1)
-        self.assertIn("not in config/projects.json", err)
-        self.assertEqual(run("pack", "-e", "quill", "--repo", "api", "--hat", "wizard")[0], 2)
-        self.assertEqual(run("remember", "--kind", "lesson", "--src", "T1", "x")[0], 2)  # no employee given
-
-    def test_employee_defaults_to_zed_employee_env(self):
-        with patch.dict("os.environ", {"ZED_EMPLOYEE": "quill"}):
-            self.assertEqual(run("remember", "--kind", "lesson", "--src", "T1", "Read twice.")[0], 0)
-        self.assertEqual(len(zedmem.all_entries(self.profile / "employees" / "quill")), 1)
-
-    def test_pack_never_marks_facts_stale_when_the_repo_is_unreadable(self):
-        run("remember", "-e", "quill", "--kind", "fact", "--repo", "api", "--src", "guard.py", "--anchor", "def require_role", "x")
-        zedlib.PROJECTS_PATH.write_text(json.dumps({"repos": {}}))
-        code, _, err = run("pack", "-e", "quill", "--repo", "api", "--hat", "build", "--dry-run")
-        self.assertEqual(code, 1)
-        self.assertEqual(zedmem.find(self.profile / "employees" / "quill", "m-0001")[1].get("stale"), None)
+    def test_no_template_names_a_person_or_a_memory(self):
+        words = " ".join(p.read_text().lower() for p in emp.HATS.rglob("*") if p.is_file())
+        words += " ".join(p.read_text().lower() for p in emp.SHARED_SKILLS.rglob("*") if p.is_file())
+        for gone in ("memory", "remember", "roster", "employees/", "write-back"):
+            self.assertNotIn(gone, words, gone)
 
 
 class DbTests(ProfileCase):
     def test_ensure_schema_works_before_and_after_sessions_exist(self):
         conn = sqlite3.connect(":memory:")
-        zedlib.ensure_employee_schema(conn)           # a DB with no sessions table yet: no error
+        zedlib.ensure_session_schema(conn)           # a DB with no sessions table yet: no error
         conn.execute("CREATE TABLE sessions (id INTEGER PRIMARY KEY)")
-        zedlib.ensure_employee_schema(conn)
-        zedlib.ensure_employee_schema(conn)           # idempotent
+        zedlib.ensure_session_schema(conn)
+        zedlib.ensure_session_schema(conn)           # idempotent
         cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
-        self.assertTrue({"employee", "hat", "verdict", "origin", "direct"} <= cols)
+        self.assertTrue({"hat", "verdict", "verdict_tree", "core_start", "plan"} <= cols)
+        self.assertFalse({"employee", "verdict_sha", "origin"} & cols)  # no new column for the removed identity
+
+    def test_a_database_from_before_hats_lost_their_identities_keeps_working(self):
+        conn = sqlite3.connect(":memory:")
+        conn.executescript("CREATE TABLE sessions (id INTEGER PRIMARY KEY, employee TEXT, verdict_sha TEXT, origin TEXT);"
+                           "CREATE TABLE employees (name TEXT); CREATE TABLE queue (id INTEGER PRIMARY KEY, employee TEXT NOT NULL);"
+                           "INSERT INTO sessions(id, employee, verdict_sha) VALUES (1, 'juno', 'abc');")
+        zedlib.ensure_session_schema(conn)
+        row = conn.execute("SELECT employee, verdict_sha, hat, verdict_tree FROM sessions").fetchone()
+        self.assertEqual(row, ("juno", "abc", None, None))  # the old columns stay, unused; the old verdict matches no tree
 
 
 if __name__ == "__main__":

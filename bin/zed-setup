@@ -9,16 +9,11 @@ for tool in herdr git gh python3; do
     echo "MISSING  $tool"; missing=1
   fi
 done
-# Zed runs on Pi, Claude Code, GitHub Copilot CLI, or a mix; at least one is needed.
-runtimes=0
-for tool in pi claude copilot; do
-  if command -v "$tool" >/dev/null 2>&1; then
-    echo "ok       $tool ($($tool --version 2>/dev/null | head -n 1))"; runtimes=$((runtimes + 1))
-  else
-    echo "absent   $tool"
-  fi
-done
-[ "$runtimes" -gt 0 ] || { echo "MISSING  an agent CLI: install Pi (pi), Claude Code (claude), and/or GitHub Copilot CLI (copilot)"; missing=1; }
+if command -v claude >/dev/null 2>&1; then
+  echo "ok       claude ($(claude --version 2>/dev/null | head -n 1))"
+else
+  echo "MISSING  claude (Claude Code)"; missing=1
+fi
 command -v security >/dev/null 2>&1 || echo "note     no macOS 'security' tool: bin/bb (Bitbucket) needs the macOS Keychain"
 
 current=$(git config --get core.hooksPath)
@@ -34,6 +29,6 @@ fi
 if [ -f profile/profile.md ]; then
   echo "ok       profile/ present (branch: $(git branch --show-current))"
 else
-  echo "note     no profile yet: start 'pi', 'claude' or 'copilot' here (inside herdr) and Zed will onboard you"
+  echo "note     no profile yet: start 'claude' here (inside herdr) and Zed will onboard you"
 fi
 exit $missing

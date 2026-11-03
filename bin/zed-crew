@@ -15,7 +15,8 @@ Usage
       bounded tail of a worker's terminal, for diagnosis when the facts above are not enough
 
 Flags: pane-gone, worktree-missing, wrong-branch, on-protected-branch, finished-unpushed (work that would be
-lost), closed-with-worktree, no-plan (running >10 min), pr-merged, pr-closed.
+lost), closed-with-unlanded-work (a closed session whose worktree still holds uncommitted work, or commits that are on no
+remote and no other local branch; a clean or merged leftover worktree is not reported), no-plan (running >10 min), pr-merged, pr-closed.
 """
 import argparse
 import re
@@ -31,18 +32,15 @@ LIVE_STATUSES = ("running", "waiting_user", "finished")
 NO_PLAN_MINUTES = 10
 
 
-def plan_files(task_id):
-    return sorted(zedlib.BRIEFS_DIR.glob(f"T{task_id}-*-plan.md"))
-
-
-def plan_progress(task_id, now=None):
+def plan_progress(s, now=None):
+    """Progress of the session's own plan (hat included), or None when it has not written it yet."""
     now = now or time.time()
-    files = plan_files(task_id)
-    if not files:
+    path = zedlib.session_plan(s)
+    if not path or not path.is_file():
         return None
-    steps = [st for f in files for st in zedlib.parse_plan_steps(f.read_text())]
-    age = int((now - max(f.stat().st_mtime for f in files)) // 60)
-    return {"done": sum(s["done"] for s in steps), "total": len(steps), "age_min": age}
+    steps = zedlib.parse_plan_steps(path.read_text())
+    return {"hat": (s["hat"] if "hat" in s.keys() else None) or "build", "done": sum(x["done"] for x in steps), "total": len(steps),
+            "age_min": int((now - path.stat().st_mtime) // 60)}
 
 
 def protected_branches(repo, base):
@@ -58,14 +56,17 @@ def git_facts(wt, base):
     g = lambda *a: zedlib.git(wt, *a)
     branch = g("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     dirty = len([ln for ln in g("status", "--porcelain").stdout.splitlines() if ln.strip()])
-    up = g("rev-list", "--count", "HEAD", "--not", "--remotes")  # commits on no remote branch (upstream may just be the base)
     base_ref = next((r for r in (f"origin/{base}", base) if g("rev-parse", "--verify", "--quiet", r).ok), None)
+    # commits on no remote branch and not in the base: a branch cut from an unpushed base does not count the base's history
+    up = g("rev-list", "--count", "HEAD", "--not", "--remotes", *([base_ref] if base_ref else []))
     ahead = g("rev-list", "--count", f"{base_ref}..HEAD").stdout.strip() if base_ref else ""
     last = g("log", "-1", "--format=%h%x09%ct%x09%s").stdout.strip().split("\t")
     stat = g("diff", "--shortstat", f"{base_ref}...HEAD").stdout.strip() if base_ref else ""
     nums = [int(x) for x in re.findall(r"(\d+) (?:files? changed|insertion|deletion)", stat)]
+    held_by = g("branch", "--contains", "HEAD", "--format=%(refname:short)").stdout.split()  # local branches holding the head
     return {"branch": branch, "dirty": dirty,
             "unpushed": int(up.stdout) if up.ok and up.stdout.strip().isdigit() else None,
+            "merged_locally": any(b != branch for b in held_by),
             "ahead_of_base": int(ahead) if ahead.isdigit() else None,
             "last_commit": {"sha": last[0], "age_min": int((time.time() - int(last[1])) // 60), "subject": last[2]} if len(last) == 3 and last[1].isdigit() else None,
             "diffstat": stat or None, "_nums": nums}
@@ -75,9 +76,9 @@ def facts(s, live, now=None):
     """Everything about one session row (a dict), plus its mismatch flags."""
     now = now or time.time()
     agent = live.get(s["pane_id"]) if s["pane_id"] else None
-    out = {"session": s["id"], "task": s["task_id"], "agent": s["agent"], "repo": s["repo"], "runtime": s["runtime"],
+    out = {"session": s["id"], "task": s["task_id"], "agent": s["agent"], "repo": s["repo"],
            "db_status": s["status"], "herdr": agent["agent_status"] if agent else "gone", "branch_expected": s["branch"],
-           "base": s["base"], "pr": s["pr_url"], "external": bool(s["external"]), "plan": plan_progress(s["task_id"], now),
+           "base": s["base"], "pr": s["pr_url"], "external": bool(s["external"]), "plan": plan_progress(s, now),
            "git": None, "flags": []}
     flags = out["flags"]
     live_status = s["status"] in ("running", "waiting_user")
@@ -88,15 +89,15 @@ def facts(s, live, now=None):
         g = out["git"] = git_facts(s["worktree"], s["base"]) if s["base"] != "-" else None  # base "-": not a git project
         if g is None and s["status"] != "closed" and s["base"] != "-":
             flags.append("worktree-missing")
-        if g and not in_place:
+        if g and not in_place and s["status"] != "closed":
             if g["branch"] != s["branch"]:
                 flags.append(f"wrong-branch (on {g['branch']}, expected {s['branch']})")
             if g["branch"] in protected_branches(s["repo"], s["base"]):
                 flags.append(f"on-protected-branch ({g['branch']})")
         if g and s["status"] == "finished" and (g["dirty"] or g["unpushed"]):
             flags.append(f"finished-unpushed ({g['dirty']} uncommitted, {g['unpushed']} unpushed)")
-        if g and s["status"] == "closed" and not in_place:
-            flags.append("closed-with-worktree")
+        if g and s["status"] == "closed" and not in_place and (g["dirty"] or (g["unpushed"] and not g["merged_locally"])):
+            flags.append(f"closed-with-unlanded-work ({g['dirty']} uncommitted, {g['unpushed']} unpushed, on no other branch)")
         if live_status and not out["plan"]:
             started = time.mktime(time.strptime(s["created_at"], "%Y-%m-%d %H:%M"))
             if (now - started) // 60 >= NO_PLAN_MINUTES:
@@ -114,7 +115,7 @@ def pr_flags(f, verdict_of):
 
 def render_session(f):
     g = f["git"] or {}
-    bits = [f"S{f['session']} T{f['task']} {f['agent']} {f['repo']}", f"{f['db_status']}/{f['herdr']}", f["runtime"]]
+    bits = [f"S{f['session']} T{f['task']} {f['agent']} {f['repo']}", f"{f['db_status']}/{f['herdr']}"]
     if g:
         bits.append(f"{g['branch']}←{f['base']}")
         bits.append(f"dirty {g['dirty']}")
@@ -124,7 +125,7 @@ def render_session(f):
         if g["diffstat"]:
             bits.append(g["diffstat"])
     if f["plan"]:
-        bits.append(f"plan {f['plan']['done']}/{f['plan']['total']} ({f['plan']['age_min']}m ago)")
+        bits.append(f"{f['plan']['hat']} plan {f['plan']['done']}/{f['plan']['total']} ({f['plan']['age_min']}m ago)")
     if f["pr"]:
         bits.append(f"PR {f['pr']}")
     return [" · ".join(bits)] + [f"  ! {fl}" for fl in f["flags"]]

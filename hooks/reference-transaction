@@ -1,6 +1,6 @@
 #!/bin/sh
 # Zed merge gate (installed with the other hooks by bin/zed-setup). A merge commit written to `main` or a profile branch
-# needs a clean review and a clean qa verdict (by employees who did not write the work) at the merged head:
+# needs a clean review and a clean qa verdict (by sessions that did not write the work) for the merged code (profile/ ignored):
 # `bin/zed gate check`. (pre-merge-commit cannot do this: git has not written MERGE_HEAD when it runs.)
 # Override: ZED_GATE_OVERRIDE="<reason>" (logged), or `bin/zed merge <branch> --override "<reason>"`.
 # Skipped without asking: the head `bin/zed merge` just vetted (ZED_MERGE_GATE_DONE=<sha>), and heads a remote-tracking
