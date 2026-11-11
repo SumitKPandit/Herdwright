@@ -11,6 +11,8 @@ import types
 import unittest
 from unittest.mock import patch
 
+import _load  # noqa: F401  (drops a worker session's ZED_* variables: `start` refuses a worker)
+
 
 HOME = Path(__file__).resolve().parents[1]
 

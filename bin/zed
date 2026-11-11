@@ -58,8 +58,18 @@ ARM_STAMP_PATH = PROFILE_DIR / ".cache" / "hook-arm.stamp"  # touched by the Sto
 
 # Claude Code is the only runtime. The model, effort ceiling and capacity live in <profile>/config/claude.json.
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
-TRUST_PROMPT = "Yes, I trust this folder"
-TRUST_KEYS = ["down", "enter"]
+# Dialogs Claude Code can show before its first prompt, in the order it shows them: (name, text on screen, keys, note).
+# Claude Code documents no flag or setting that answers either one in advance (code.claude.com/docs/en/memory and
+# /cli-reference, read 2026-11-11; dialogs observed on v2.1.322), so spawn answers them with key presses.
+# - Folder trust: Zed created the worktree from a configured repo, so it accepts ("No, exit" is preselected).
+# - External imports: a CLAUDE.md, here or in a parent folder, imports a file from outside the worktree. Zed declines
+#   ("No, disable external imports" is preselected): the worktree's own instructions and their imports still load, only
+#   files outside it are refused, so a folder the user never delegated cannot instruct the worker.
+START_DIALOGS = [
+    ("folder trust", "Yes, I trust this folder", ["down", "enter"], "accepted"),
+    ("external CLAUDE.md imports", "No, disable external imports", ["enter"],
+     "declined: instructions imported from outside the worktree are not loaded"),
+]
 # e.g. "You've hit your session limit · resets 3pm", "Usage limit reached · continuing automatically at …"
 LIMIT_PATTERNS = [r"hit your \w+ limit", r"usage limit reached", r"limit reached\b.*\breset"]
 # OpenCode is an opt-in worker runtime (`spawn runtime=opencode`) and a possible host for Zed itself. Its TUI takes --model and
@@ -816,6 +826,25 @@ def hat_kit(hat, sid, agent, worktree, runtime="claude"):
     return kit, env
 
 
+def answer_start_dialogs(agent, seconds=60):
+    """Answer each of START_DIALOGS the CLI shows at startup, once, until the agent is idle. Returns (the dialogs
+    answered, whether the agent became ready). A screen that shows none of them before any was answered is left
+    blocked for Zed to inspect. Herdr reports "blocked" for every dialog alike, so the screen tells them apart."""
+    answered = []
+    for _ in range(int(seconds / 0.5)):
+        screen = run(["herdr", "agent", "read", agent, "--source", "visible"], check=False).stdout
+        dialog = next((d for d in START_DIALOGS if d not in answered and d[1] in screen), None)
+        if dialog:
+            run(["herdr", "agent", "send-keys", agent, *dialog[2]], check=False)
+            answered.append(dialog)
+        elif not answered:
+            break
+        elif herdr_json(["agent", "get", agent])["result"]["agent"]["agent_status"] == "idle":
+            return answered, True
+        time.sleep(0.5)
+    return answered, False
+
+
 def started_since(agent, before, seconds):
     """True once the agent has worked, is blocked on a dialog, or changed state since sequence `before`."""
     for _ in range(int(seconds / 0.25)):
@@ -1016,13 +1045,11 @@ def cmd_spawn(args):
     time.sleep(1.5)  # let the shell reach its prompt
     r = run(["herdr", "agent", "start", agent, "--kind", runtime, "--pane", pane_id,
              "--timeout", str(OPENCODE_START_TIMEOUT_MS if runtime == "opencode" else 60000), "--", *cli_args], check=False)
-    if r.returncode != 0 and "agent_not_ready" in r.stderr and runtime == "claude":
-        # A fresh worktree triggers the CLI's folder-trust dialog. Zed created this worktree
-        # from a configured repo, so accept it; anything else stays blocked for Zed to inspect.
-        screen = run(["herdr", "agent", "read", agent, "--source", "visible"], check=False).stdout
-        if TRUST_PROMPT in screen:  # the pane was opened with cwd=worktree
-            run(["herdr", "agent", "send-keys", agent, *TRUST_KEYS], check=False)
-            r = run(["herdr", "agent", "wait", agent, "--until", "idle", "--timeout", "60000"], check=False)
+    ready = r.returncode == 0
+    if not ready and "agent_not_ready" in r.stderr and runtime == "claude":
+        dialogs, ready = answer_start_dialogs(agent)
+        for name, _, _, note in dialogs:
+            print(f"startup dialog: {name}: {note}")
     ts = now()
     cur = conn.execute(
         "INSERT INTO sessions(id,task_id,repo,base,branch,worktree,agent,workspace_id,pane_id,status,model,effort,"
@@ -1039,7 +1066,7 @@ def cmd_spawn(args):
     touch_task(conn, tid)
     conn.commit()
     write_status(conn)
-    if r.returncode != 0:
+    if not ready:
         die(f"S{sid}: agent start did not report ready (pane {pane_id}). Inspect with: herdr agent read {agent}\n{r.stderr}")
 
     # 3. hand over the brief
@@ -2142,6 +2169,9 @@ def arm_watcher():
 def cmd_start(args):
     """start [--take-over] — session start in one command: claim the Zed lock, then print one bounded
     digest (lock, watcher, what needs the user, running sessions). Read it once and trust it."""
+    if os.environ.get("ZED_SESSION"):  # set by spawn for every worker (hat_kit)
+        die(f"this is worker session {os.environ['ZED_SESSION']}, not Zed: `start` is for the coordinator only. "
+            "Follow your worker rules and brief; the coordinator manual in CLAUDE.md does not apply to you.")
     require_profile()
     notes = []
     try:
