@@ -4,6 +4,7 @@
 The plan file (profile/briefs/T<id>-<repo>-plan.md) is a checklist of steps, each with a "done when" and a
 rough time (worker rules: "Work to a plan"). Ported from the heading-reader and definition-of-done checks in
 firstmate's fm-brief-heading-lib / fm-dod-lib. Read-only.
+firstmate: Copyright (c) 2026 Kun Chen, MIT licence, see THIRD_PARTY_LICENSES.md.
 
 Usage
   zed-plan lint <plan-file|T<id>> [--json]

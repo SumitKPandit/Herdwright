@@ -3,6 +3,7 @@
 
 Ported from firstmate's fm-crew-state / fm-peek / fm-inactive-reconcile / fm-fleet-snapshot. Read-only: it never
 writes the DB, never prompts a worker and never touches a worktree.
+firstmate: Copyright (c) 2026 Kun Chen, MIT licence, see THIRD_PARTY_LICENSES.md.
 
 Usage
   zed-crew state [S<id>|agent] [--json]

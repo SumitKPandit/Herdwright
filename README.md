@@ -53,6 +53,9 @@ profile (handy for testing with a throwaway one).
 Onboarding copies `profile.template/config/claude.json` to `profile/config/claude.json`: the `model`, the `effort`
 ceiling, `effort_by_kind` (reasoning effort by kind of work, never above the ceiling) and `max_running` (open Claude
 sessions, Zed's and yours included; `spawn` queues the rest). Without the file Claude Code's defaults apply.
+`config/settings.json` holds `guard` (protected branches, commit format) and `worker.deny_tools`: the tool names workers
+may not call. The template lists the write tools of one tracker and wiki connector so a new profile's workers cannot
+post outward; replace them with your own connector's write tools.
 
 Tests: `python3 -B -m unittest discover -s tests -v`.
 

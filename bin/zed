@@ -656,6 +656,9 @@ def write_status(conn):
 
 # ---------------------------------------------------------------- commands
 
+TASK_FIELDS = ("title", "ticket", "worktype", "description", "status")
+
+
 def cmd_task(args):
     if not args:
         die("task add|set|show|list")
@@ -667,6 +670,9 @@ def cmd_task(args):
         kv = parse_kv(rest)
         if "title" not in kv:
             die("task add title=... [ticket=<ticket-id>] [worktype=<e.g. story>] [description=...] [status=intake]")
+        unknown = sorted(set(kv) - set(TASK_FIELDS))
+        if unknown:
+            die(f"cannot set '{unknown[0]}' on a task")
         ts = now()
         cur = conn.execute(
             "INSERT INTO tasks(title,ticket,worktype,description,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
@@ -677,7 +683,7 @@ def cmd_task(args):
         tid, kv = int(rest[0].lstrip("T")), parse_kv(rest[1:])
         get_task(conn, tid)
         for k, v in kv.items():
-            if k not in ("title", "ticket", "worktype", "description", "status"):
+            if k not in TASK_FIELDS:
                 die(f"cannot set '{k}' on a task")
             if k == "status" and v not in TASK_STATES:
                 die(f"status must be one of {TASK_STATES}")
@@ -924,7 +930,7 @@ def cmd_brief(args):
     worktree = expand(p["path"]) if p.get("worktrees") is False else worktree_path(kv["repo"], kv["branch"])
     values = {"TASK": tid, "TICKET_ID": t["ticket"] or "no ticket", "TITLE": t["title"], "REPO": kv["repo"],
               "ROLE": p.get("role", "-"), "WORKTREE": worktree, "BRANCH": kv["branch"], "BASE": kv["base"],
-              "TICKET": f"{t['ticket']} — read it for full details; ask Zed if you can't reach it" if t["ticket"] else "none",
+              "TICKET_LINE": f"{t['ticket']} — read it for full details; ask Zed if you can't reach it" if t["ticket"] else "none",
               "QA_ENV": knowledge_qa_notes(kv["repo"]), "PLAN_FILE": PROFILE_DIR / "briefs" / f"T{tid}-{kv['repo']}-plan.md"}
     text = (ZED_HOME / "templates" / "brief.md").read_text()
     for k, v in values.items():

@@ -3,6 +3,7 @@
 
 Ported from firstmate's fm-subagent-pretool-check / fm-cd-pretool-check / fm-primary-scope-lib. Prime directive 1:
 engineering work is delegated to worker sessions; the coordinator only does bookkeeping in Zed's own repo.
+firstmate: Copyright (c) 2026 Kun Chen, MIT licence, see THIRD_PARTY_LICENSES.md.
 
 It acts ONLY in the session that holds the profile's Zed lock (the hook payload's session_id must equal the
 lock's agent session). Workers, read-only sessions and every other tool call pass untouched. It is fail-open: a

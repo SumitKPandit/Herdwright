@@ -33,7 +33,7 @@ class CrewTests(unittest.TestCase):
         sh("git", "worktree", "add", "-q", "-b", "feat/x", str(self.wt), "origin/main", cwd=root / "clone")
         (self.wt / "a.txt").write_text("a\n")
         sh("git", "add", "a.txt", cwd=self.wt)
-        sh("git", "commit", "-q", "-m", "MENT-1 | Add a", cwd=self.wt)
+        sh("git", "commit", "-q", "-m", "ABC-1 | Add a", cwd=self.wt)
         self.briefs = root / "briefs"
         self.briefs.mkdir()
         old = (zedlib.BRIEFS_DIR, zedlib.PROJECTS_PATH)

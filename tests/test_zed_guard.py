@@ -22,17 +22,17 @@ class PureTests(unittest.TestCase):
         pats = guard.DEFAULT_PROTECTED
         for b in ("main", "master", "releases/v6.2.1"):
             self.assertTrue(guard.is_protected(b, pats), b)
-        for b in ("story/abc-1-x", "chore/releases", "mainline", "deploy", "medusa"):
+        for b in ("story/abc-1-x", "chore/releases", "mainline", "deploy", "staging"):
             self.assertFalse(guard.is_protected(b, pats), b)
 
     def test_commit_message(self):
         f = guard.commit_message_problem
-        self.assertIsNone(f("MENT-123 | Add thing"))
+        self.assertIsNone(f("ABC-123 | Add thing"))
         self.assertIsNone(f("Merge branch 'x'"))
         self.assertIsNotNone(f("add thing"))
-        self.assertIsNotNone(f("MENT-123: Add thing"))
-        self.assertIsNone(f("MENT-5 | x", ticket="MENT-5"))
-        self.assertIn("MENT-5 | ", f("MENT-6 | x", ticket="MENT-5"))
+        self.assertIsNotNone(f("ABC-123: Add thing"))
+        self.assertIsNone(f("ABC-5 | x", ticket="ABC-5"))
+        self.assertIn("ABC-5 | ", f("ABC-6 | x", ticket="ABC-5"))
         self.assertIsNone(f("anything", enforce=False))
 
     def test_push_problems_ask_the_gate_about_branch_pushes_only(self):
@@ -87,7 +87,7 @@ class HookTests(unittest.TestCase):
         hook.chmod(0o755)
         git(r / "clone", "config", "core.hooksPath", str(r / "repohooks"))
         self.wt = r / "wt"
-        git(r / "clone", "worktree", "add", "-q", "-b", "task/ment-9-x", str(self.wt), "origin/main")
+        git(r / "clone", "worktree", "add", "-q", "-b", "task/abc-9-x", str(self.wt), "origin/main")
         self.r = r
 
     def install(self, *extra, profile=None):
@@ -100,12 +100,23 @@ class HookTests(unittest.TestCase):
         git(self.wt, "add", name)
         return git(self.wt, "commit", "-q", "-m", msg, check=False)
 
+    def test_a_guard_installed_before_the_ticket_rename_still_enforces_its_ticket(self):
+        self.install("--ticket", "ABC-9")
+        config = guard.hook_dir(self.wt) / "config.json"
+        cfg = json.loads(config.read_text())
+        cfg["jira"] = cfg.pop("ticket")  # the key the older install wrote
+        config.write_text(json.dumps(cfg))
+        other = self.commit("XYZ-1 | Add file")
+        self.assertNotEqual(other.returncode, 0)
+        self.assertIn("must start with 'ABC-9 | '", other.stderr)
+        self.assertEqual(self.commit("ABC-9 | Add file").returncode, 0)
+
     def test_commit_rules_and_chaining(self):
-        self.install("--ticket", "MENT-9")
+        self.install("--ticket", "ABC-9")
         bad = self.commit("fix stuff")
         self.assertNotEqual(bad.returncode, 0)
-        self.assertIn("must start with 'MENT-9 | '", bad.stderr)
-        ok = self.commit("MENT-9 | Add file")
+        self.assertIn("must start with 'ABC-9 | '", bad.stderr)
+        ok = self.commit("ABC-9 | Add file")
         self.assertEqual(ok.returncode, 0, ok.stderr)
         self.assertIn("ran", (self.r / "chain.log").read_text())  # the repo's own pre-commit still ran
         # the main checkout is untouched by the per-worktree install
@@ -161,23 +172,23 @@ class HookTests(unittest.TestCase):
         self.assertIn("must start with 'ABC-9 | '", r.stderr)
 
     def test_push_rules(self):
-        self.install("--ticket", "MENT-9")
-        self.assertEqual(self.commit("MENT-9 | one").returncode, 0)
-        ok = git(self.wt, "push", "-q", "origin", "HEAD:refs/heads/task/ment-9-x", check=False)
+        self.install("--ticket", "ABC-9")
+        self.assertEqual(self.commit("ABC-9 | one").returncode, 0)
+        ok = git(self.wt, "push", "-q", "origin", "HEAD:refs/heads/task/abc-9-x", check=False)
         self.assertEqual(ok.returncode, 0, ok.stderr)
         to_main = git(self.wt, "push", "origin", "HEAD:refs/heads/main", check=False)
         self.assertNotEqual(to_main.returncode, 0)
         self.assertIn("protected branch 'main'", to_main.stderr)
         git(self.wt, "reset", "-q", "--hard", "HEAD~1")
-        self.assertEqual(self.commit("MENT-9 | two", "h.txt").returncode, 0)
-        forced = git(self.wt, "push", "-f", "origin", "HEAD:refs/heads/task/ment-9-x", check=False)
+        self.assertEqual(self.commit("ABC-9 | two", "h.txt").returncode, 0)
+        forced = git(self.wt, "push", "-f", "origin", "HEAD:refs/heads/task/abc-9-x", check=False)
         self.assertNotEqual(forced.returncode, 0)
         self.assertIn("force-push", forced.stderr)
-        gone = git(self.wt, "push", "origin", ":task/ment-9-x", check=False)
+        gone = git(self.wt, "push", "origin", ":task/abc-9-x", check=False)
         self.assertIn("deleting remote branch", gone.stderr)
 
     def test_installing_again_with_the_gate_turns_it_on_in_a_guarded_worktree(self):
-        self.install("--ticket", "MENT-9")
+        self.install("--ticket", "ABC-9")
         cfg = Path(git(self.wt, "config", "--get", "core.hooksPath").stdout.strip()) / "config.json"
         self.assertFalse(json.loads(cfg.read_text())["gate"])
         again = subprocess.run([GUARD, "install", str(self.wt), "--gate"], capture_output=True, text=True,
@@ -191,53 +202,53 @@ class HookTests(unittest.TestCase):
                               env={**os.environ, "ZED_PROFILE_DIR": str(self.r / "no-profile")})
 
     def test_a_refused_reinstall_without_the_gate_never_turns_an_enabled_gate_off(self):
-        self.install("--ticket", "MENT-9", "--gate")
+        self.install("--ticket", "ABC-9", "--gate")
         cfg = Path(git(self.wt, "config", "--get", "core.hooksPath").stdout.strip()) / "config.json"
         before = cfg.read_text()
-        again = self.reinstall("--ticket", "MENT-9")
+        again = self.reinstall("--ticket", "ABC-9")
         self.assertEqual(again.returncode, 2)
         self.assertIn("already pointing", again.stderr)
         self.assertEqual(cfg.read_text(), before)
         self.assertTrue(json.loads(cfg.read_text())["gate"])
 
     def test_only_remove_then_install_switches_the_gate_off(self):
-        self.install("--ticket", "MENT-9", "--gate")
+        self.install("--ticket", "ABC-9", "--gate")
         cfg = Path(git(self.wt, "config", "--get", "core.hooksPath").stdout.strip()) / "config.json"
         self.assertEqual(subprocess.run([GUARD, "remove", str(self.wt)], capture_output=True, text=True).returncode, 0)
-        self.install("--ticket", "MENT-9")
+        self.install("--ticket", "ABC-9")
         self.assertFalse(json.loads(cfg.read_text())["gate"])
 
     def test_a_gated_worktree_refuses_a_push_without_review_and_qa(self):
         profile = self.r / "gate-profile"
         (profile / "db").mkdir(parents=True)
         (profile / "profile.md").write_text("# test profile\n")
-        self.install("--ticket", "MENT-9", "--gate", profile=str(profile))
-        self.assertEqual(self.commit("MENT-9 | one").returncode, 0)
+        self.install("--ticket", "ABC-9", "--gate", profile=str(profile))
+        self.assertEqual(self.commit("ABC-9 | one").returncode, 0)
         env = {**os.environ, "ZED_PROFILE_DIR": str(profile), "ZED_GATE_OVERRIDE": "worker says so"}  # only the user may override
-        refused = subprocess.run(["git", "push", "origin", "HEAD:refs/heads/task/ment-9-x"], cwd=self.wt, capture_output=True, text=True, env=env)
+        refused = subprocess.run(["git", "push", "origin", "HEAD:refs/heads/task/abc-9-x"], cwd=self.wt, capture_output=True, text=True, env=env)
         self.assertNotEqual(refused.returncode, 0)
-        self.assertIn("push of 'task/ment-9-x' refused", refused.stderr)
+        self.assertIn("push of 'task/abc-9-x' refused", refused.stderr)
         self.assertIn("no review verdict recorded", refused.stderr)
 
     def test_an_ungated_worktree_pushes_without_asking_the_gate(self):
-        self.install("--ticket", "MENT-9")
-        self.assertEqual(self.commit("MENT-9 | one").returncode, 0)
-        ok = git(self.wt, "push", "-q", "origin", "HEAD:refs/heads/task/ment-9-x", check=False)
+        self.install("--ticket", "ABC-9")
+        self.assertEqual(self.commit("ABC-9 | one").returncode, 0)
+        ok = git(self.wt, "push", "-q", "origin", "HEAD:refs/heads/task/abc-9-x", check=False)
         self.assertEqual(ok.returncode, 0, ok.stderr)
 
     def test_remove_restores_repo_hooks(self):
-        self.install("--ticket", "MENT-9")
+        self.install("--ticket", "ABC-9")
         subprocess.run([GUARD, "remove", str(self.wt)], check=True, capture_output=True)
         self.assertEqual(self.commit("any message", "z.txt").returncode, 0)
         self.assertEqual(git(self.wt, "config", "--get", "core.hooksPath").stdout.strip(), str(self.r / "repohooks"))
 
     def test_audit_worktree_findings(self):
-        s = {"id": 1, "agent": "a", "repo": "none", "base": "main", "branch": "task/ment-9-x", "worktree": str(self.wt)}
+        s = {"id": 1, "agent": "a", "repo": "none", "base": "main", "branch": "task/abc-9-x", "worktree": str(self.wt)}
         self.assertIn("hooks not installed", "\n".join(guard.audit_worktree(s, False, 0)))
-        self.install("--ticket", "MENT-9")
+        self.install("--ticket", "ABC-9")
         self.assertEqual(guard.audit_worktree(s, False, 0), [])
         git(self.wt, "checkout", "-q", "-b", "other")
-        self.assertIn("expected 'task/ment-9-x'", "\n".join(guard.audit_worktree(s, False, 0)))
+        self.assertIn("expected 'task/abc-9-x'", "\n".join(guard.audit_worktree(s, False, 0)))
         lock = Path(git(self.wt, "rev-parse", "--absolute-git-dir").stdout.strip()) / "index.lock"
         lock.write_text("")
         old = lock.stat().st_mtime - 3600

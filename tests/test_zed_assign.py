@@ -53,11 +53,11 @@ class AssignCase(unittest.TestCase):
         self.conn = self.z.db()
         self.addCleanup(self.conn.close)
         ts = "2026-10-27 09:00"
-        self.conn.execute("INSERT INTO tasks(id,title,ticket,worktype,status,created_at,updated_at) VALUES (20,'Role guard','MENT-20','story','active',?,?)", (ts, ts))
+        self.conn.execute("INSERT INTO tasks(id,title,ticket,worktype,status,created_at,updated_at) VALUES (20,'Role guard','ABC-20','story','active',?,?)", (ts, ts))
         self.conn.commit()
         self.brief = self.root / "brief.md"
         self.brief.write_text(BRIEF)
-        self.branch = "story/ment-20-guard"
+        self.branch = "story/abc-20-guard"
         self.herdr_calls = []
         real_run = self.z.run
 
@@ -80,7 +80,7 @@ class AssignCase(unittest.TestCase):
         patcher = patch.object(self.z.time, "sleep")
         patcher.start()
         self.addCleanup(patcher.stop)
-        wt = self.wt_root / "api" / "ment-20-guard"
+        wt = self.wt_root / "api" / "abc-20-guard"
         wt.parent.mkdir(parents=True)
         zedlib.git(self.repo, "worktree", "add", "-q", "-b", self.branch, str(wt))
         self.worktree = wt

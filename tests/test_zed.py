@@ -200,9 +200,13 @@ class ZedTests(unittest.TestCase):
             self.z.cmd_task(["set", "T1", "ticket=ABC-8"])
             with self.assertRaises(SystemExit):
                 self.z.cmd_task(["set", "T1", "jira=ABC-9"])
+            with self.assertRaises(SystemExit):  # an unknown key is refused, never dropped: the task is not created
+                self.z.cmd_task(["add", "title=Old key", "jira=ABC-9"])
+        self.assertIn("cannot set 'jira' on a task", self.output.getvalue())
         conn = self.z.db()
         self.addCleanup(conn.close)
         self.assertEqual(conn.execute("SELECT ticket FROM tasks WHERE id=1").fetchone()["ticket"], "ABC-8")
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 1)
 
     def test_hat_columns_default_to_none(self):
         conn = self.z.db()
@@ -315,7 +319,7 @@ class ZedTests(unittest.TestCase):
 
   ZED:DONE
   Summary: Added the digest label
-  Branch: story/ment-1-x  Commits: abc123
+  Branch: story/abc-1-x  Commits: abc123
   PR: https://github.com/org/repo/pull/7  (draft)
   QA: playwright-cli on localhost, happy path and empty digest
   Follow-ups: none
@@ -429,7 +433,7 @@ class ZedTests(unittest.TestCase):
 
     def test_brief_scaffold_and_spawn_refuses_placeholders(self):
         conn = self.session()
-        conn.execute("UPDATE tasks SET ticket='MENT-9', description='Add a label'")
+        conn.execute("UPDATE tasks SET ticket='ABC-9', description='Add a label'")
         conn.commit()
         (self.root / "config").mkdir(exist_ok=True)
         (self.root / "config" / "projects.json").write_text(json.dumps({
@@ -437,9 +441,9 @@ class ZedTests(unittest.TestCase):
         notes = self.root / "knowledge" / "repos"
         notes.mkdir(parents=True)
         (notes / "r.md").write_text("# r\n## Setup\nnpm ci\n## History\nold stuff\n## Test logins\nadmin / from vault\n")
-        self.z.cmd_brief(["T1", "repo=r", "base=main", "branch=story/ment-9-label"])
+        self.z.cmd_brief(["T1", "repo=r", "base=main", "branch=story/abc-9-label"])
         brief = (self.root / "briefs" / "T1-r.md").read_text()
-        self.assertIn("MENT-9", brief)
+        self.assertIn("ABC-9", brief)
         self.assertIn("admin / from vault", brief)
         self.assertNotIn("old stuff", brief)
         self.assertNotIn("{{", brief)
