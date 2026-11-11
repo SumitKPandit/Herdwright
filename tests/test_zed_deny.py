@@ -237,15 +237,32 @@ class DecideTests(unittest.TestCase):
         self.manifests["review"] = {**self.manifests["review"], "subagents": "read-only"}
         self.assertIsNone(self.call("review", "Agent", prompt="x"))
 
-    def test_opencode_tool_names_and_apply_patch_text_are_checked(self):
+    def test_opencode_v2_tool_names_and_patch_text_are_checked(self):
         src = str(self.wt / "src" / "a.py")
-        self.assertIn("denied", self.call("review", "edit", filePath=src))  # OpenCode names its tools in lower case
-        self.assertIn("denied", self.call("review", "apply_patch", patchText=f"*** Begin Patch\n*** Update File: {src}\n@@\n-a\n+b\n*** End Patch"))
-        self.assertIn("denied", self.call("qa", "apply_patch", patchText=f"*** Add File: {self.wt}/new.py\n+x\n"))
-        self.assertIn("denied", self.call("review", "apply_patch", patchText=f"*** Add File: {self.evidence}/ok.md\n+x\n*** Delete File: {src}\n"))
-        self.assertIsNone(self.call("review", "apply_patch", patchText=f"*** Add File: {self.evidence}/ok.md\n+x\n"))
-        self.assertIsNone(self.call("build", "apply_patch", patchText=f"*** Update File: {src}\n"))
-        self.assertIn("denied", self.call("review", "bash", command="gh pr comment 1"))
+        for tool in ("edit", "write"):  # OpenCode V2 names its tools in lower case and its file `path`
+            self.assertIn("denied", self.call("review", tool, path=src))
+            self.assertIn("denied", self.call("review", tool, path="src/a.py"))  # relative to the session's directory
+            self.assertIsNone(self.call("build", tool, path=src))
+        self.assertIn("denied", self.call("review", "patch", patchText=f"*** Begin Patch\n*** Update File: {src}\n@@\n-a\n+b\n*** End Patch"))
+        self.assertIn("denied", self.call("qa", "patch", patchText=f"*** Add File: {self.wt}/new.py\n+x\n"))
+        self.assertIn("denied", self.call("review", "patch", patchText=f"*** Add File: {self.evidence}/ok.md\n+x\n*** Delete File: {src}\n"))
+        self.assertIsNone(self.call("review", "patch", patchText=f"*** Add File: {self.evidence}/ok.md\n+x\n"))
+        self.assertIsNone(self.call("build", "patch", patchText=f"*** Update File: {src}\n"))
+        self.assertIn("denied", self.call("review", "shell", command="gh pr comment 1"))
+        self.assertIn("denied", self.call("review", "shell", command="git commit -m x"))
+        self.assertIsNone(self.call("review", "shell", command="git log --oneline"))
+        self.assertIn("no subagents", self.call("build", "subagent", prompt="x"))
+
+    def test_opencode_shell_workdir_is_where_relative_targets_resolve(self):
+        self.assertIn("denied", self.call("review", "shell", command="rm a.py", workdir="src"))
+        self.assertIn("denied", self.call("review", "shell", command="rm a.py", workdir=str(self.wt / "src")))
+        self.assertIsNone(self.call("review", "shell", command="rm a.md", workdir=str(self.evidence)))
+
+    def test_the_canary_command_is_denied_to_every_hat(self):
+        for hat in ("build", "review", "qa"):
+            for tool in ("shell", "Bash"):
+                self.assertIn("canary: `zed-deny-canary n1` is denied", self.call(hat, tool, command=" zed-deny-canary n1"))
+        self.assertIsNone(self.call("build", "shell", command="echo zed-deny-canary"))
 
     def test_claude_settings_deny_exactly_the_tools_given(self):
         self.assertEqual(zeddeny.claude_settings(HOME)["permissions"]["deny"], [])  # core names no vendor's tools
@@ -269,21 +286,50 @@ class OpenCodePluginTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name).resolve()
         (self.root / "wt").mkdir()
-        self.plugin = zeddeny.opencode_plugin(self.root / "cfg", HOME) / "plugins" / "zed-deny.js"
+        self.env = {"ZED_HAT": "review", "ZED_WORKTREE": str(self.root / "wt"), "ZED_PROFILE_DIR": str(self.root / "profile")}
+        stub = self.root / "cfg" / "node_modules" / "@opencode" / "plugin"  # OpenCode supplies this package itself
+        stub.mkdir(parents=True)
+        (stub / "package.json").write_text('{"name": "@opencode/plugin", "type": "module", "main": "index.js"}')
+        (stub / "index.js").write_text("export const Plugin = { define: (definition) => definition };\n")
+        (self.root / "cfg" / "package.json").write_text('{"type": "module"}')
 
-    def before(self, tool, args, hat="review"):
-        script = (f'import {{ ZedDeny }} from {json.dumps(self.plugin.as_uri())};\n'
-                  f'const h = await ZedDeny({{ directory: {json.dumps(str(self.root / "wt"))} }});\n'
-                  f'try {{ await h["tool.execute.before"]({{ tool: {json.dumps(tool)} }}, {{ args: {json.dumps(args)} }}); console.log("allowed"); }}\n'
+    def before(self, tool, tool_input, env=None, deny_tools=(), hook=HOME):
+        """What the V2 `execute.before` hook does with one tool call: the plugin is set up with the context OpenCode
+        v2.2.7 gives it (`ctx.tool.hook`, `ctx.location.directory`) and called with that version's event shape."""
+        plugin = zeddeny.opencode_plugin(self.root / "cfg", hook, self.env if env is None else env, deny_tools)
+        plugin = plugin / "plugins" / "zed-deny" / "index.js"
+        script = (f'import plugin from {json.dumps(plugin.as_uri())};\n'
+                  f'const hooks = {{}};\n'
+                  f'await plugin.setup({{ location: {{ directory: {json.dumps(str(self.root / "wt"))} }}, '
+                  f'tool: {{ hook: async (name, callback) => {{ hooks[name] = callback; }} }} }});\n'
+                  f'try {{ await hooks["execute.before"]({{ tool: {json.dumps(tool)}, sessionID: "ses_1", agent: "build", '
+                  f'input: {json.dumps(tool_input)} }}); console.log(plugin.id + " allowed"); }}\n'
                   f'catch (e) {{ console.log("blocked: " + e.message); }}\n')
-        env = {**os.environ, "ZED_HAT": hat, "ZED_WORKTREE": str(self.root / "wt"), "ZED_PROFILE_DIR": str(self.root / "profile")}
-        return subprocess.run(["node", "--input-type=module", "-e", script], env=env, capture_output=True, text=True).stdout.strip()
+        env = {k: v for k, v in os.environ.items() if not k.startswith("ZED_")}  # the server's own environment names no hat
+        r = subprocess.run(["node", "--input-type=module", "-e", script], env=env, capture_output=True, text=True)
+        return r.stdout.strip() or r.stderr.strip()
 
     def test_a_denied_call_throws_the_reason_and_an_allowed_one_passes(self):
-        self.assertIn("blocked: zed-deny: editing", self.before("edit", {"filePath": str(self.root / "wt" / "a.py")}))
-        self.assertIn("blocked: zed-deny: `gh pr comment` is denied", self.before("bash", {"command": "gh pr comment 1"}))
-        self.assertEqual(self.before("bash", {"command": "ls"}), "allowed")
-        self.assertEqual(self.before("edit", {"filePath": str(self.root / "wt" / "a.py")}, hat="build"), "allowed")
+        self.assertIn("blocked: zed-deny: editing", self.before("edit", {"path": str(self.root / "wt" / "a.py")}))
+        self.assertIn("blocked: zed-deny: editing", self.before("write", {"path": "a.py", "content": "x"}))
+        self.assertIn("blocked: zed-deny: `gh pr comment` is denied", self.before("shell", {"command": "gh pr comment 1"}))
+        self.assertIn("blocked: zed-deny: canary: `zed-deny-canary n1`", self.before("shell", {"command": "zed-deny-canary n1"}))
+        self.assertEqual(self.before("shell", {"command": "ls"}), "zed.deny allowed")
+        self.assertEqual(self.before("edit", {"path": str(self.root / "wt" / "a.py")}, env={**self.env, "ZED_HAT": "build"}),
+                         "zed.deny allowed")
+
+    def test_tools_no_worker_may_call_are_denied_by_name(self):
+        self.assertEqual(self.before("tracker_createIssue", {}, deny_tools=["tracker_createIssue"]),
+                         "blocked: zed-deny: the tool tracker_createIssue is denied to a worker")
+        self.assertEqual(self.before("read", {"path": "a.py"}, deny_tools=["tracker_createIssue"]), "zed.deny allowed")
+
+    def test_a_guard_that_cannot_run_denies(self):
+        self.assertIn("blocked: ", self.before("shell", {"command": "ls"}, hook=self.root / "no-such-zed-home"))
+
+    def test_the_v1_export_is_gone(self):
+        text = (zeddeny.opencode_plugin(self.root / "cfg", HOME, self.env) / "plugins" / "zed-deny" / "index.js").read_text()
+        self.assertNotIn("tool.execute.before", text)  # V2 ignores it; V1 servers are not supported
+        self.assertFalse((self.root / "cfg" / "plugins" / "zed-deny.js").exists())
 
 
 class HookScriptTests(unittest.TestCase):
