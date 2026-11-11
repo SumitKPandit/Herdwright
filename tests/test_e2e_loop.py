@@ -12,12 +12,14 @@ One named test per claim:
 | A worker starts in its own worktree and is handed its brief once  | Spawn.test_a_worker_starts_in_its_own_worktree_with_its_brief        |
 | The folder-trust dialog of a new worktree does not stop the start | Spawn.test_the_trust_dialog_of_a_new_worktree_is_accepted            |
 | The watcher reports a question once, until acknowledged           | Watch.test_a_question_is_reported_once_until_acknowledged            |
-| ... also one a new worker has only on its screen                  | Watch.test_a_question_on_the_screen_of_a_new_worker_is_reported      |
-|                                                                   | (expected failure: a defect, see the test)                           |
+| ... also one a new worker has only on its screen                  | Watch.test_a_question_on_the_screen_of_a_new_worker_is_reported_once |
+| A new worker that is idle without a report raises nothing         | Watch.test_a_new_worker_idle_without_a_report_raises_nothing         |
+| ... and is nudged once it is no longer new                        | Watch.test_a_worker_idle_without_a_report_is_nudged_once_it_is_no_   |
+|                                                                   | longer_new                                                           |
 | The watcher reports a block once                                  | Watch.test_a_block_is_reported_once                                  |
 | The watcher reports a DONE once and closes the finished session   | Watch.test_a_done_is_reported_once_and_the_session_closed            |
-| The watcher reports a permission prompt and a vanished pane once  | Watch.test_a_permission_prompt_and_a_vanished_pane_are_each_         |
-|                                                                   | reported_once                                                        |
+| The watcher reports a permission prompt once                      | Watch.test_a_permission_prompt_is_reported_once                      |
+| The watcher reports a vanished pane once                          | Watch.test_a_vanished_pane_is_reported_once                          |
 | A DONE without QA is flagged                                      | Watch.test_a_done_without_qa_is_flagged                              |
 | An answer is relayed verbatim and recorded; a working worker is   | Relay.test_an_answer_is_relayed_verbatim_and_recorded_and_a_working_ |
 | not interrupted                                                   | worker_is_not_interrupted                                            |
@@ -30,10 +32,9 @@ One named test per claim:
 | A reviewer that changed the code gives no verdict                 | Merge.test_a_reviewer_that_changed_the_code_gives_no_verdict         |
 """
 import subprocess
-import sys
 import unittest
 
-from _e2e import BASE, REPO, ZED, LoopCase, ask, done
+from _e2e import BASE, REPO, RUN_ZED, LoopCase, ask, done
 
 BRANCH = "task/demo"
 FINISH = {"run": ["{bin}/zed-employee", "finish"]}
@@ -127,18 +128,18 @@ class Spawn(LoopCase):
 
 
 class Watch(LoopCase):
-    def reported_once(self, first, *needles, event=1):
-        """`first` is what the watcher printed for a new event. Checks that it is E<event> and holds `needles`, that a
-        later watcher shows the same event again and raises nothing new, and that it is gone once acknowledged."""
-        for needle in (f"[E{event}] ", *needles):
+    def reported_once(self, first, *needles):
+        """`first` is what the watcher printed for a new event. Checks that it is E1 and holds `needles`, that a later
+        watcher shows the same event again and raises nothing new, and that it is gone once acknowledged."""
+        for needle in ("[E1] ", *needles):
             self.assertIn(needle, first)
-        self.assertNotIn(f"[E{event + 1}]", first)
+        self.assertNotIn("[E2]", first)
         again = self.w.watch_ticks(2)
-        self.assertIn(f"[E{event}] (again, un-acked since", again)
-        self.assertNotIn(f"[E{event + 1}]", again)
-        self.assertIn("acked 1; 0 still un-acked", self.w.zed("ack", f"E{event}").stdout)
+        self.assertIn("[E1] (again, un-acked since", again)
+        self.assertNotIn("[E2]", again)
+        self.assertIn("acked 1; 0 still un-acked", self.w.zed("ack", "E1").stdout)
         self.assertNotIn("[E", self.w.watch_ticks(2))
-        self.assertEqual(len(self.w.wakes()), event)
+        self.assertEqual(len(self.w.wakes()), 1)
 
     def test_a_question_is_reported_once_until_acknowledged(self):
         s = self.w.started(BRANCH, turns=[ask("Red or blue? I recommend red.", "Round or square corners?")])
@@ -154,16 +155,40 @@ class Watch(LoopCase):
         self.assertEqual(self.w.rows("SELECT status FROM tasks"), [{"status": "waiting_user"}])
         self.assertIn("Q1 T1 S1", self.w.zed("q", "list").stdout)
 
-    @unittest.expectedFailure
-    def test_a_question_on_the_screen_of_a_new_worker_is_reported(self):
-        """DEFECT (bin/zed cmd_watch, the `young` branch): a worker that ends its turn within three minutes of its start
-        with a ZED block on its screen and no status-file line is skipped as "still reading its brief", and the skipped
-        state is remembered as seen, so the block is never reported, not even after the three minutes."""
+    def test_a_question_on_the_screen_of_a_new_worker_is_reported_once(self):
+        """A worker that ends its turn within three minutes of its start, with a ZED block on its screen and no
+        status-file line."""
         self.w.watch_ticks(1)  # a watcher has looked before the worker starts, as in any running coordinator
         self.w.started(BRANCH, turns=[[{"block": "QUESTION", "text": "1. Red or blue?"}]])
-        self.w.watch_ticks(2)
+        self.reported_once(self.w.watch_once().stdout, "ZED:QUESTION", "Q1: Red or blue?")
         self.w.age_sessions()  # the three minutes pass
-        self.assertIn("Q1: Red or blue?", self.w.watch_ticks(2))
+        self.assertNotIn("[E", self.w.watch_ticks(2))
+        self.assertEqual(len(self.w.rows("SELECT id FROM questions")), 1)
+
+    def new_idle_worker(self):
+        """A worker under three minutes old that is idle with nothing to report, as one that has not started on its
+        brief yet is; a watcher was already running when it started, and has seen it idle."""
+        self.w.watch_ticks(1)
+        s = self.w.started(BRANCH)
+        self.assertNotIn("[E", self.w.watch_ticks(2))
+        return s
+
+    def test_a_new_worker_idle_without_a_report_raises_nothing(self):
+        s = self.new_idle_worker()
+        self.w.age_lapses()  # idle for longer than the grace period of a lapse, and still new
+        self.assertNotIn("[E", self.w.watch_ticks(2))
+        self.assertEqual(self.w.wakes(), [])
+        self.assertEqual(self.w.events("auto"), [])
+        self.assertEqual(len(self.w.agent(s["agent"])["prompts"]), 1)  # the brief; no nudge
+
+    def test_a_worker_idle_without_a_report_is_nudged_once_it_is_no_longer_new(self):
+        s = self.new_idle_worker()
+        self.w.age_sessions()  # the three minutes pass
+        self.w.age_lapses()
+        self.assertNotIn("[E", self.w.watch_ticks(2))  # a first nudge does not wake the coordinator
+        self.assertEqual(self.w.events("auto"), ["S1 idle with no ZED block; sent the standard nudge"])
+        self.assertEqual(self.w.agent(s["agent"])["prompts"][1:],
+                         ["Continue, or end with ZED:QUESTION / ZED:DONE / ZED:BLOCKED."])
 
     def test_a_block_is_reported_once(self):
         reason = "No access to the staging database; I need a login."
@@ -184,15 +209,18 @@ class Watch(LoopCase):
         self.assertEqual(len(self.w.herdr_calls("workspace", "close")), 1)
         self.assertTrue((self.w.worktrees / REPO / "demo").is_dir())  # kept: review and QA read it
 
-    def test_a_permission_prompt_and_a_vanished_pane_are_each_reported_once(self):
+    def test_a_permission_prompt_is_reported_once(self):
         s = self.w.started(BRANCH, turns=[[{"pause": True}, {"dialog": PERMISSION_PROMPT}]])
         self.assertNotIn("[E", self.w.watch_ticks(2))  # working: nothing to report
         self.w.advance(s["agent"])
         self.reported_once(self.w.watch_once().stdout, "S1 T1 build-t1 → blocked", "Bash(rm -rf build)", "Do you want to proceed?")
         self.assertEqual(self.w.agent(s["agent"])["keys"], [])  # nothing was answered for the worker
 
+    def test_a_vanished_pane_is_reported_once(self):
+        s = self.w.started(BRANCH, turns=[[{"pause": True}]])
+        self.assertNotIn("[E", self.w.watch_ticks(2))
         self.w.kill_pane(s["agent"])
-        self.reported_once(self.w.watch_once().stdout, "S1 T1 build-t1 → gone", event=2)
+        self.reported_once(self.w.watch_once().stdout, "S1 T1 build-t1 → gone")
         self.assertIn("agent=GONE", self.w.zed("session", "list").stdout)
 
     def test_a_done_without_qa_is_flagged(self):
@@ -300,7 +328,7 @@ class Lock(LoopCase):
         self.w.zed("task", "add", "title=Mine now", coordinator=self.other)
 
     def test_a_watcher_stops_when_its_coordinator_loses_the_lock(self):
-        watcher = subprocess.Popen([sys.executable, ZED, "watch", "0.05"], env=self.w.env(), cwd=self.w.root,
+        watcher = subprocess.Popen([*RUN_ZED, "watch", "0.05"], env=self.w.env(), cwd=self.w.root,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         self.addCleanup(watcher.kill)
         self.w.watch_state_changes(1)
