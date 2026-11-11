@@ -123,6 +123,9 @@ def keys(pane_id, pressed):
         enter = bool(pressed) and pressed[-1] == "enter"
         unsent = None
         if agent["dialog"] and enter:
+            closed = agent["dialog"].splitlines()  # an answered dialog leaves the screen, as it does in the real CLI
+            if agent["screen"][-len(closed):] == closed:
+                del agent["screen"][-len(closed):]
             agent["dialog"] = None
             store.set_status(agent, "working" if agent["turn"] else "idle")
             resume = bool(agent["turn"])
