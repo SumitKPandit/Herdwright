@@ -192,6 +192,16 @@ class ZedTests(unittest.TestCase):
         self.z.cmd_task(["list"])
         self.assertIn("ABC-7", self.output.getvalue())
 
+    def test_task_add_and_set_store_the_ticket(self):
+        with patch.object(self.z, "require_lock"):
+            self.z.cmd_task(["add", "title=Add a label", "ticket=ABC-7"])
+            self.z.cmd_task(["set", "T1", "ticket=ABC-8"])
+            with self.assertRaises(SystemExit):
+                self.z.cmd_task(["set", "T1", "jira=ABC-9"])
+        conn = self.z.db()
+        self.addCleanup(conn.close)
+        self.assertEqual(conn.execute("SELECT ticket FROM tasks WHERE id=1").fetchone()["ticket"], "ABC-8")
+
     def test_hat_columns_default_to_none(self):
         conn = self.z.db()
         self.addCleanup(conn.close)
