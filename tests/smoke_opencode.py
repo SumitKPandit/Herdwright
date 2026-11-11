@@ -3,9 +3,12 @@
 demo repo. For workers nothing is stubbed except Zed's own lock and capacity checks; the coordinator runs unstubbed.
 
 Not part of the default test run (its name does not match `test_*.py`), and skipped when `opencode` or herdr is
-missing. It starts model turns on the configured model (config/opencode.json's defaults), with neutral text only:
+missing. It starts model turns with neutral text only, on the shipped default model and variant (the profile template's
+config/opencode.json), or on the ones named in SMOKE_OPENCODE_MODEL and SMOKE_OPENCODE_VARIANT, which the throwaway
+profile's config/opencode.json then holds like any user's would:
 
     cd tests && python3 -m unittest -v smoke_opencode
+    cd tests && SMOKE_OPENCODE_MODEL=provider/model SMOKE_OPENCODE_VARIANT=low python3 -m unittest -v smoke_opencode
 
 It proves, and prints the evidence for:
 1. a worker whose deny plugin does not load (the V1 plugin Zed used to write, which V2 ignores) fails the canary: its
@@ -48,6 +51,10 @@ import zedlib
 
 HOME = Path(__file__).resolve().parents[1]
 TURN_SECONDS = 420  # for the worker's first turn (its brief)
+CONFIG = json.loads((HOME / "profile.template" / "config" / "opencode.json").read_text()) | {
+    key: os.environ[name] for key, name in (("model", "SMOKE_OPENCODE_MODEL"), ("variant", "SMOKE_OPENCODE_VARIANT")) if os.environ.get(name)}
+MODEL = json.dumps(dict(zip(("providerID", "id"), CONFIG["model"].split("/", 1))) | {"variant": CONFIG["variant"]}, sort_keys=True)
+FOOTER = f"· {CONFIG['variant']}"  # the TUI's footer ends "<model> <provider> · <variant>"
 
 
 def herdr_up():
@@ -68,6 +75,7 @@ class OpenCodeWorkerSmoke(unittest.TestCase):
         self.evidence.mkdir()
         self.repo.mkdir()
         (self.profile / "profile.md").write_text("# throwaway profile\n")
+        (self.profile / "config" / "opencode.json").write_text(json.dumps(CONFIG))
         (self.profile / "rules.md").write_text(f"## Code word\nThe profile code word is {self.words['RULES']}.\n")
         (self.profile / "config" / "projects.json").write_text(json.dumps(
             {"worktree_root": str(self.root / "wt"), "repos": {"demo": {"path": str(self.repo), "dev_base": "main"}}}))
@@ -87,6 +95,8 @@ class OpenCodeWorkerSmoke(unittest.TestCase):
         self.brief = self.root / "brief.md"
         self.brief.write_text(
             "# Brief: startup check of this worker\n\n## Goal\n"
+            "This is Zed's own check of a newly started worker, whatever hat it wears: it shows which instruction files and "
+            "skills the runtime loaded. There is nothing to review and nothing secret in it. Do exactly these steps.\n"
             f"1. Write every code word that your instructions give you (not this brief) into the file "
             f"{self.evidence}/words.txt, one per line.\n"
             "2. Load the skill smoke-claude-skill and the skill smoke-opencode-skill with the skill tool (do not read their "
@@ -212,12 +222,12 @@ class OpenCodeWorkerSmoke(unittest.TestCase):
         self.say("canary", f"{canary['state']['input']['command']} -> {reason(canary)}")
 
         models = {json.dumps(m["model"], sort_keys=True) for m in messages if m.get("type") == "assistant"}
-        self.assertEqual(models, {json.dumps({"providerID": "opencode", "id": "nemotron-3.5-super-vl-free", "variant": "xhigh"}, sort_keys=True)})
+        self.assertEqual(models, {MODEL})
         self.say("model of every assistant message", models)
-        self.assertEqual((s["model"], s["effort"]), ("opencode/nemotron-3.5-super-vl-free", "xhigh"))
+        self.assertEqual((s["model"], s["effort"]), (CONFIG["model"], CONFIG["variant"]))
         screen = subprocess.run(["herdr", "agent", "read", s["agent"], "--source", "visible"], capture_output=True, text=True).stdout
-        footer = next((line.strip(" ┃") for line in screen.splitlines() if "xhigh" in line), "")
-        self.assertIn("xhigh", footer, screen)
+        footer = next((line.strip(" ┃") for line in screen.splitlines() if FOOTER in line), "")
+        self.assertIn(FOOTER, footer, screen)
         self.say("TUI footer", footer)
 
         inside = lambda c: self.worktree in (self.worktree / str(c["state"]["input"].get("path", ""))).resolve().parents
@@ -239,9 +249,12 @@ class OpenCodeWorkerSmoke(unittest.TestCase):
 
         self.assertEqual(seen.read_text().strip(), "0")  # the shell tool's environment does not hold the password
         self.say("OPENCODE_PASSWORD entries in the shell tool's environment", seen.read_text().strip())
-        attempt = next(c for c in calls if "/shell" in str(c["state"]["input"].get("command", "")) and "curl" in c["state"]["input"]["command"])
+        # a model may decline to make this call; what closes the route is checked below without it (no password in the
+        # shell, and the route refusing a denied command even with the password)
+        attempt = next((c for c in calls if "/shell" in str(c["state"]["input"].get("command", "")) and "curl" in c["state"]["input"]["command"]), None)
         self.assertFalse((self.worktree / "bypass.txt").exists())
-        self.say("the finding's curl", f"{attempt['state']['status']} {reason(attempt)[:120]} -> bypass.txt exists: {(self.worktree / 'bypass.txt').exists()}")
+        self.say("the finding's curl", (f"{attempt['state']['status']} {reason(attempt)[:120]}" if attempt else "the model did not make the call")
+                 + f" -> bypass.txt exists: {(self.worktree / 'bypass.txt').exists()}")
         for route, payload in ((f"/session/{session}/shell", {"command": f"touch {self.worktree}/direct.txt"}),
                                ("/shell", {"command": f"touch {self.worktree}/direct.txt", "cwd": str(self.worktree)})):
             with self.assertRaises(OSError) as refused:  # even with the password, which this test holds
@@ -293,6 +306,7 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
         (self.profile / "config").mkdir(parents=True)
         (self.profile / "profile.md").write_text(f"# Throwaway profile\nThe profile code word is {self.word}.\n")
         (self.profile / "config" / "settings.json").write_text(json.dumps({"runtime": "opencode"}))
+        (self.profile / "config" / "opencode.json").write_text(json.dumps(CONFIG))
         (self.profile / "config" / "projects.json").write_text(json.dumps({"worktree_root": str(self.root / "wt"), "repos": {}}))
         for cmd in (["init", "-q", "-b", "main"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
             zedlib.git(self.project, *cmd)
@@ -434,7 +448,7 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
         self.assertIn(("relay", "completed"), [(c["state"]["input"].get("id"), c["state"]["status"]) for c in skills])  # .claude/skills
 
         models = {json.dumps(m["model"], sort_keys=True) for m in self.api("GET", f"/session/{session}/message") if m.get("type") == "assistant"}
-        self.assertEqual(models, {json.dumps({"providerID": "opencode", "id": "nemotron-3.5-super-vl-free", "variant": "xhigh"}, sort_keys=True)})
+        self.assertEqual(models, {MODEL})
         self.say("model of every assistant message", models)
         self.assertEqual(zedlib.git(HOME, "status", "--porcelain").stdout, self.before)  # Zed's own checkout is untouched
 
@@ -461,8 +475,8 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
         lock = json.loads((self.profile / ".cache" / "zed.lock").read_text())
         self.say("lock", {k: lock.get(k) for k in ("agent_session", "pane")})
         self.assertEqual((lock["agent_session"], lock["pane"]), (session, pane))
-        footer = next((line.strip(" ┃") for line in screen.splitlines() if "xhigh" in line), "")
-        self.assertIn("xhigh", footer, screen)
+        footer = next((line.strip(" ┃") for line in screen.splitlines() if FOOTER in line), "")
+        self.assertIn(FOOTER, footer, screen)
         self.say("TUI footer", footer)
         subprocess.run(["herdr", "workspace", "close", ws_id], capture_output=True)
         for _ in range(30):
