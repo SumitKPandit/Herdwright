@@ -2469,6 +2469,8 @@ def cmd_coordinator(args):
     if not shutil.which("opencode"):
         die("`opencode` is not installed or not on PATH")
     kit = coordinator_kit()
+    for sig in (signal.SIGHUP, signal.SIGTERM):  # a closed terminal must not leave the server behind
+        signal.signal(sig, lambda number, frame: sys.exit(128 + number))
     print(f"starting the coordinator on {kit['model']} ({kit['variant']}) and proving its guard: one model turn …", flush=True)
     process, session, problem = open_coordinator(kit)
     try:
