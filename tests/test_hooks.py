@@ -39,7 +39,8 @@ def setUpModule():
     shutil.copy(HOME / ".gitignore", repo / ".gitignore")
     (repo / "profile.template").mkdir()
     (repo / "profile.template" / "profile.md").write_text("# Profile template\n")
-    (repo / "CLAUDE.md").write_text("# Operating manual\n")
+    (repo / "AGENTS.md").write_text("# Operating manual\n")
+    (repo / "CLAUDE.md").write_text("@AGENTS.md\n")
     git("init", "-q", "-b", "main")
     git("config", "core.hooksPath", "hooks")  # what bin/zed-setup does
     git("add", "-A")
@@ -111,7 +112,7 @@ class PreCommit(HookCase):
         self.write("profile/config/settings.json", json.dumps({"context_budget_words": 5}))
         self.commit("A budget of five words")  # touches no always-loaded file: not checked
         before = self.head()
-        self.write("CLAUDE.md", "# Operating manual\n" + "word " * 20)
+        self.write("AGENTS.md", "# Operating manual\n" + "word " * 20)
         r = self.commit("Grow the manual", check=False)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("OVER BUDGET", r.stderr)

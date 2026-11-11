@@ -1,10 +1,14 @@
 import json
+import os
+import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 import _load
+
+import zeddeny
 
 pt = _load.load("zed-pretool")
 ZED, PROFILE = Path("/zed-home"), Path("/zed-home/profile")
@@ -77,6 +81,29 @@ class PretoolTests(unittest.TestCase):
         self.assertIsNotNone(decide("Workflow"))
         self.assertIsNone(pt.decide({"session_id": COORD, "tool_name": "Agent", "tool_input": {}}, holder=COORD, roots=ROOTS, allow_subagents=True))
 
+    def test_opencode_tool_names_and_inputs_are_checked_like_claudes(self):
+        self.assertIn("spawn a worker", decide("edit", path="/code/proj/a.py", oldString="a", newString="b"))
+        self.assertIn("spawn a worker", decide("write", path="/code/proj/a.py", content="x"))
+        self.assertIsNone(decide("write", path="/zed-home/profile/briefs/T1.md", content="x"))
+        patch = "*** Begin Patch\n*** Update File: /zed-home/README.md\n*** Add File: /code/proj/new.py\n+x\n*** End Patch"
+        self.assertIn("/code/proj/new.py is outside", decide("patch", patchText=patch))
+        self.assertIsNone(decide("patch", patchText="*** Begin Patch\n*** Update File: /zed-home/README.md\n*** End Patch"))
+        self.assertIn("git commit", decide("shell", command="git commit -m x", workdir="/code/proj"))
+        self.assertIn("git commit", decide("shell", command="git commit -m x", workdir="../code/proj", cwd="/zed-home"))
+        self.assertIsNone(decide("shell", command="git commit -m x"))  # in Zed's own repo
+        self.assertIsNone(decide("shell", command="bin/zed status"))
+        self.assertIn("bin/zed spawn", decide("subagent", description="x", prompt="y"))
+        for tool in ("read", "grep", "glob", "skill"):
+            self.assertIsNone(decide(tool, path="/code/proj/a.py", pattern="x", id="relay"))
+        self.assertIsNone(decide("write", sid="ses_worker", path="/code/proj/a.py", content="x"))  # not the lock holder
+
+    def test_the_canary_is_denied_in_every_session(self):
+        for tool, sid, holder in (("shell", "ses_new", COORD), ("Bash", COORD, COORD), ("shell", "ses_new", None)):
+            reason = decide(tool, sid=sid, holder=holder, command=" zed-pretool-canary 1f2e3d4c")
+            self.assertIn("canary: `zed-pretool-canary 1f2e3d4c` is denied in every session", reason)
+        self.assertIsNone(decide("shell", sid="ses_new", command="echo zed-pretool-canary"))
+        self.assertIsNone(decide("read", sid="ses_new", path="zed-pretool-canary"))
+
     def test_hook_json_and_fail_open(self):
         with tempfile.TemporaryDirectory() as d:
             payload = json.dumps({"session_id": "s", "tool_name": "Write", "tool_input": {"file_path": "/code/x"}})
@@ -91,6 +118,51 @@ class PretoolTests(unittest.TestCase):
             self.assertIn("zed-pretool:", out["permissionDecisionReason"])
             bad = subprocess.run([str(_load.HOME / "bin" / "zed-pretool")], input="not json", capture_output=True, text=True)
             self.assertEqual((bad.returncode, bad.stdout), (0, ""))
+
+
+@unittest.skipUnless(shutil.which("node"), "node is needed to run the OpenCode plugin")
+class CoordinatorPluginTests(unittest.TestCase):
+    """The coordinator's generated plugin, run for real under node with the hook object OpenCode v2.2.7 calls it with."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        self.profile = self.root / "profile"
+        (self.profile / ".cache").mkdir(parents=True)
+        (self.profile / ".cache" / "zed.lock").write_text(json.dumps({"agent_session": "ses_coord"}))
+        stub = self.root / "cfg" / "node_modules" / "@opencode" / "plugin"  # OpenCode supplies this package itself
+        stub.mkdir(parents=True)
+        (stub / "package.json").write_text('{"name": "@opencode/plugin", "type": "module", "main": "index.js"}')
+        (stub / "index.js").write_text("export const Plugin = { define: (definition) => definition };\n")
+        (self.root / "cfg" / "package.json").write_text('{"type": "module"}')
+
+    def before(self, tool, tool_input, session="ses_coord", hook=_load.HOME):
+        plugin = zeddeny.coordinator_plugin(self.root / "cfg", hook, {"ZED_PROFILE_DIR": str(self.profile)})
+        plugin = plugin / "plugins" / "zed-pretool" / "index.js"
+        script = (f'import plugin from {json.dumps(plugin.as_uri())};\n'
+                  f'const hooks = {{}};\n'
+                  f'await plugin.setup({{ location: {{ directory: {json.dumps(str(_load.HOME))} }}, '
+                  f'tool: {{ hook: async (name, callback) => {{ hooks[name] = callback; }} }} }});\n'
+                  f'try {{ await hooks["execute.before"]({{ tool: {json.dumps(tool)}, sessionID: {json.dumps(session)}, agent: "build", '
+                  f'input: {json.dumps(tool_input)} }}); console.log(plugin.id + " allowed"); }}\n'
+                  f'catch (e) {{ console.log("blocked: " + e.message); }}\n')
+        env = {k: v for k, v in os.environ.items() if not k.startswith("ZED_")}
+        r = subprocess.run(["node", "--input-type=module", "-e", script], env=env, capture_output=True, text=True)
+        return r.stdout.strip() or r.stderr.strip()
+
+    def test_the_lock_holder_is_denied_an_edit_in_a_project_repo_and_allowed_its_own_work(self):
+        self.assertIn("blocked: zed-pretool: /code/proj/a.py is outside Zed's repo", self.before("write", {"path": "/code/proj/a.py", "content": "x"}))
+        self.assertIn("blocked: zed-pretool: `git push`", self.before("shell", {"command": "git -C /code/proj push"}))
+        self.assertEqual(self.before("shell", {"command": "bin/zed status"}), "zed.pretool allowed")
+        self.assertEqual(self.before("write", {"path": str(self.profile / "briefs" / "T1.md"), "content": "x"}), "zed.pretool allowed")
+
+    def test_another_session_passes_and_the_canary_is_denied_to_any(self):
+        self.assertEqual(self.before("write", {"path": "/code/proj/a.py", "content": "x"}, session="ses_worker"), "zed.pretool allowed")
+        self.assertIn("blocked: zed-pretool: canary: `zed-pretool-canary ab12`", self.before("shell", {"command": "zed-pretool-canary ab12"}, session="ses_new"))
+
+    def test_a_guard_that_cannot_run_denies(self):
+        self.assertIn("blocked: ", self.before("shell", {"command": "ls"}, hook=self.root / "no-such-zed-home"))
 
 
 if __name__ == "__main__":

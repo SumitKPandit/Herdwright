@@ -9,10 +9,15 @@ for tool in herdr git gh python3; do
     echo "MISSING  $tool"; missing=1
   fi
 done
-if command -v claude >/dev/null 2>&1; then
-  echo "ok       claude ($(claude --version 2>/dev/null | head -n 1))"
-else
-  echo "MISSING  claude (Claude Code)"; missing=1
+# An install runs on one runtime, Claude Code or OpenCode: one of them is enough.
+runtimes=0
+for runtime in claude opencode; do
+  if command -v "$runtime" >/dev/null 2>&1; then
+    echo "ok       $runtime ($("$runtime" --version 2>/dev/null | head -n 1))"; runtimes=$((runtimes + 1))
+  fi
+done
+if [ "$runtimes" -eq 0 ]; then
+  echo "MISSING  a runtime: claude (Claude Code) or opencode (OpenCode)"; missing=1
 fi
 
 current=$(git config --get core.hooksPath)
@@ -27,7 +32,9 @@ fi
 
 if [ -f profile/profile.md ]; then
   echo "ok       profile/ present (branch: $(git branch --show-current))"
+  echo "runtime  $(ZED_PROFILE_DIR="${ZED_PROFILE_DIR:-$PWD/profile}" bin/zed runtime --set-installed)"
 else
-  echo "note     no profile yet: start 'claude' here (inside herdr) and Zed will onboard you"
+  echo "note     no profile yet: start Zed here (inside herdr) and it will onboard you: 'claude' on Claude Code,"
+  echo "         'bin/zed coordinator' on OpenCode (now: $(ZED_PROFILE_DIR="${ZED_PROFILE_DIR:-$PWD/profile}" bin/zed runtime))"
 fi
 exit $missing

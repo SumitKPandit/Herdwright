@@ -282,13 +282,13 @@ class FakeOpenCodeServer:
         if path.endswith("/prompt"):
             return {"id": f"msg_{len(self.calls)}"}
         if path.endswith("/message"):
-            command = re.search(r"zed-deny-canary \w+", self.prompts()[0]).group(0)
+            command = re.search(r"zed-(deny|pretool)-canary \w+", self.prompts()[0]).group(0)
             if self.guard == "silent":
                 return [{"type": "assistant", "content": [{"type": "text", "text": "CHECKED"}]}]
             denied = self.guard == "live"
             state = {"status": "error" if denied else "completed", "input": {"command": command}}
             if denied:
-                state["error"] = {"type": "unknown", "message": f"zed-deny: canary: `{command}` is denied to every hat, so the guard is live"}
+                state["error"] = {"type": "unknown", "message": f"{command.rsplit('-', 1)[0]}: canary: `{command}` is denied, so the guard is live"}
             return [{"type": "user", "text": "x"}, {"type": "assistant", "content": [
                 {"type": "reasoning", "text": "x"}, {"type": "tool", "name": "shell", "executed": False, "state": state}]}]
         return {"version": "2.2.7"} if path == "/info" else None

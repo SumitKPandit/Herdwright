@@ -291,3 +291,35 @@ export default Plugin.define({{
 }});
 """)
     return Path(directory)
+
+
+def coordinator_plugin(directory, zed_home, env):
+    """The coordinator's OpenCode config directory gets a V2 plugin that runs bin/zed-pretool before every tool call,
+    with the call's session id, and throws its reason when the call is denied. zed-pretool acts only on the session
+    holding the profile lock (and on its canary), so the plugin is inert anywhere else. `env` (ZED_PROFILE_DIR) is
+    written into the plugin. A zed-pretool that cannot run denies: `bin/zed coordinator` proved it ran once (the
+    canary), so a later failure is a broken install, not a call to wave through."""
+    plugin = Path(directory) / "plugins" / "zed-pretool" / "index.js"
+    plugin.parent.mkdir(parents=True, exist_ok=True)
+    plugin.write_text(f"""import {{ Plugin }} from "@opencode/plugin";
+import {{ spawnSync }} from "node:child_process";
+
+const ENV = {json.dumps(dict(env))};
+
+export default Plugin.define({{
+  id: "zed.pretool",
+  async setup(ctx) {{
+    await ctx.tool.hook("execute.before", (event) => {{
+      const res = spawnSync({json.dumps(str(Path(zed_home) / "bin" / "zed-pretool"))}, [], {{
+        input: JSON.stringify({{ tool_name: event.tool, tool_input: event.input, cwd: ctx.location.directory, session_id: event.sessionID }}),
+        encoding: "utf-8",
+        env: {{ ...process.env, ...ENV }},
+      }});
+      if (res.status !== 0) throw new Error((res.stderr || "zed-pretool could not run").trim());
+      const decision = res.stdout.trim() ? JSON.parse(res.stdout).hookSpecificOutput : null;
+      if (decision && decision.permissionDecision === "deny") throw new Error(decision.permissionDecisionReason);
+    }});
+  }},
+}});
+""")
+    return Path(directory)

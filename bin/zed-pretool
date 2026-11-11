@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""zed-pretool — Claude Code PreToolUse hook that keeps the Zed coordinator from doing the work itself.
+"""zed-pretool — pre-tool check that keeps the Zed coordinator from doing the work itself. It runs as a Claude Code
+PreToolUse hook and, under OpenCode, from the coordinator's plugin (zeddeny.coordinator_plugin), which sends the same
+payload with OpenCode's own tool names (shell, edit, write, patch, subagent).
 
 Ported from firstmate's fm-subagent-pretool-check / fm-cd-pretool-check / fm-primary-scope-lib. Prime directive 1:
 engineering work is delegated to worker sessions; the coordinator only does bookkeeping in Zed's own repo.
@@ -15,7 +17,8 @@ For the coordinator it denies:
     a persistent top-level `cd` outside Zed's home (it silently changes where later commands run), writes
     (`>`, `>>`, rm, mv, cp, touch, mkdir, tee, sed -i, perl -i) to paths outside the allowed roots
   * Agent / Workflow tools (delegate with `bin/zed spawn`; pass --allow-subagents to permit them)
-Reads are never blocked.
+Reads are never blocked. One call is denied in every session: a shell command starting with `zed-pretool-canary`,
+which `bin/zed coordinator` uses to prove the OpenCode plugin is live before the session may act as Zed.
 
 Register in .claude/settings.json (hooks.PreToolUse, matcher "*") with command `bin/zed-pretool`.
 Test a payload:  echo '<json>' | zed-pretool --explain
@@ -29,6 +32,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import zeddeny  # noqa: E402
 import zedlib  # noqa: E402
 from zedshell import FILE_WRITERS, GIT_WRITE, REDIRECTS, git_target, inside, split_commands, tokens  # noqa: E402
 
@@ -71,20 +75,30 @@ def bash_problem(cmd, cwd, roots):
     return None
 
 
+CANARY_COMMAND = "zed-pretool-canary"  # no such program: the call exists only to be denied
+SUBAGENT_TOOLS = zeddeny.SUBAGENT_TOOLS | {"workflow"}
+
+
 def decide(payload, holder=None, roots=None, allow_subagents=False):
-    """Reason to deny this tool call, or None to allow it."""
+    """Reason to deny this tool call, or None to allow it. Tool names are compared in lower case, so Claude Code's
+    (`Bash`, `Edit`) and OpenCode's (`shell`, `edit`, `patch`) are checked alike."""
+    tool, inp, cwd = str(payload.get("tool_name", "")).lower(), payload.get("tool_input") or {}, payload.get("cwd") or os.getcwd()
+    shell = tool in zeddeny.SHELL_TOOLS and isinstance(inp, dict)
+    if shell and str(inp.get("command", "")).split()[:1] == [CANARY_COMMAND]:
+        return f"canary: `{inp['command'].strip()}` is denied in every session, so the coordinator guard is live"
     holder = holder if holder is not None else lock_holder_session()
     if not holder or payload.get("session_id") != holder:
         return None  # not the coordinator
     roots = roots or allowed_roots()
-    tool, inp, cwd = payload.get("tool_name"), payload.get("tool_input") or {}, payload.get("cwd") or os.getcwd()
-    if tool in ("Edit", "Write", "NotebookEdit", "MultiEdit"):
-        path = inp.get("file_path") or inp.get("notebook_path")
-        if path and not inside(path, roots, cwd):
-            return f"{path} is outside Zed's repo, profile and temp dirs. Zed does not edit project files: put it in a brief and spawn a worker (bin/zed spawn)."
-    elif tool == "Bash":
+    if tool in zeddeny.EDIT_TOOLS:
+        for path in zeddeny.edit_paths(inp):
+            if not inside(path, roots, cwd):
+                return f"{path} is outside Zed's repo, profile and temp dirs. Zed does not edit project files: put it in a brief and spawn a worker (bin/zed spawn)."
+    elif shell:
+        if inp.get("workdir"):  # OpenCode's shell runs in `workdir`, relative to the session's directory
+            cwd = os.path.join(cwd, os.path.expanduser(inp["workdir"]))
         return bash_problem(inp.get("command", ""), cwd, roots)
-    elif tool in ("Agent", "Task", "Workflow") and not allow_subagents:
+    elif tool in SUBAGENT_TOOLS and not allow_subagents:
         return "Zed delegates engineering work to worker sessions in herdr (bin/zed spawn), not to in-process subagents."
     return None
 

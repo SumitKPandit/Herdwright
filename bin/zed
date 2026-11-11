@@ -33,6 +33,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from collections import namedtuple
@@ -63,6 +64,7 @@ WATCHER_PID_PATH = PROFILE_DIR / ".cache" / "watch.pid"
 WATCHER_LOCK_PATH = PROFILE_DIR / ".cache" / "watch.lock"
 ARM_STAMP_PATH = PROFILE_DIR / ".cache" / "hook-arm.stamp"  # touched by the Stop hook's arm step on every firing
 
+RUNTIMES = ("claude", "opencode")  # an install runs on one of them, Zed and its workers alike: install_runtime()
 # Claude Code workers: the model, effort ceiling and capacity live in <profile>/config/claude.json.
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 # Dialogs Claude Code can show before its first prompt, in the order it shows them.
@@ -90,6 +92,11 @@ OPENCODE_DEFAULTS_PATH = ZED_HOME / "profile.template" / "config" / "opencode.js
 OPENCODE_START_TIMEOUT_MS = 180000
 OPENCODE_SERVER_SECONDS = 60  # for the server to answer after `opencode serve`
 OPENCODE_CANARY_SECONDS = 180  # for the one model turn that makes the canary call
+# The coordinator on OpenCode (`bin/zed coordinator`): its own server too, so the canary runs in the very server and
+# session Zed then works in, and the watcher has an address to wake it at. The session's shell commands carry
+# COORDINATOR_ENV, the path of the record `start` checks before it lets the session act as Zed.
+COORDINATOR_ENV = "ZED_COORDINATOR"
+PRETOOL_CANARY = "zed-pretool-canary"  # bin/zed-pretool denies it in every session
 # The repository section of the worker rules names Claude Code's files; this says what OpenCode reads instead.
 OPENCODE_RULES_NOTE = """## You run on OpenCode
 
@@ -375,6 +382,16 @@ def read_json(path, default):
         return default
     except json.JSONDecodeError as e:
         die(f"invalid JSON in {path}: {e}")
+
+
+def install_runtime():
+    """The one runtime this install runs on, Zed and its workers alike: `runtime` in the profile's config/settings.json
+    (bin/zed-setup writes it from what is installed). Not set: OpenCode when it is the only one installed, else
+    Claude Code."""
+    configured = zedlib.settings().get("runtime")
+    if configured and configured not in RUNTIMES:
+        die(f"\"runtime\": \"{configured}\" in {PROFILE_DIR / 'config' / 'settings.json'} is not one of {', '.join(RUNTIMES)}")
+    return configured or ("opencode" if shutil.which("opencode") and not shutil.which("claude") else "claude")
 
 
 def opencode_config():
@@ -774,6 +791,28 @@ def add_question(conn, tid, sid, text):
     return cur.lastrowid
 
 
+def question(conn, ref):
+    q = conn.execute("SELECT * FROM questions WHERE id=?", (int(str(ref).lstrip("Q")),)).fetchone() if re.fullmatch(r"Q?\d+", str(ref)) else None
+    if not q:
+        die(f"no question {ref}")
+    return q
+
+
+def answer_question(conn, q, ans):
+    """Record the user's answer; the task and the session stop waiting once none of their questions is open."""
+    conn.execute("UPDATE questions SET answer=?, status='answered', answered_at=? WHERE id=?", (ans, now(), q["id"]))
+    if q["task_id"]:
+        log_event(conn, q["task_id"], "answer", f"Q{q['id']}: {ans}")
+        touch_task(conn, q["task_id"])
+        still_open = conn.execute("SELECT COUNT(*) FROM questions WHERE task_id=? AND status='open'", (q["task_id"],)).fetchone()[0]
+        if not still_open:
+            conn.execute("UPDATE tasks SET status='active' WHERE id=? AND status='waiting_user'", (q["task_id"],))
+    if q["session_id"]:
+        still_open = conn.execute("SELECT COUNT(*) FROM questions WHERE session_id=? AND status='open'", (q["session_id"],)).fetchone()[0]
+        if not still_open:
+            conn.execute("UPDATE sessions SET status='running', updated_at=? WHERE id=? AND status='waiting_user'", (now(), q["session_id"]))
+
+
 def cmd_q(args):
     if not args:
         die("q add <task-id|-> <question> [session=S] | q answer <qid> <answer> | q list")
@@ -792,22 +831,7 @@ def cmd_q(args):
                 parts.append(a)
         print(f"Q{add_question(conn, tid, sid, ' '.join(parts))}")
     elif sub == "answer":
-        qid = int(rest[0].lstrip("Q"))
-        ans = " ".join(rest[1:])
-        q = conn.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
-        if not q:
-            die(f"no question {qid}")
-        conn.execute("UPDATE questions SET answer=?, status='answered', answered_at=? WHERE id=?", (ans, now(), qid))
-        if q["task_id"]:
-            log_event(conn, q["task_id"], "answer", f"Q{qid}: {ans}")
-            touch_task(conn, q["task_id"])
-            still_open = conn.execute("SELECT COUNT(*) FROM questions WHERE task_id=? AND status='open'", (q["task_id"],)).fetchone()[0]
-            if not still_open:
-                conn.execute("UPDATE tasks SET status='active' WHERE id=? AND status='waiting_user'", (q["task_id"],))
-        if q["session_id"]:
-            still_open = conn.execute("SELECT COUNT(*) FROM questions WHERE session_id=? AND status='open'", (q["session_id"],)).fetchone()[0]
-            if not still_open:
-                conn.execute("UPDATE sessions SET status='running', updated_at=? WHERE id=? AND status='waiting_user'", (now(), q["session_id"]))
+        answer_question(conn, question(conn, rest[0]), " ".join(rest[1:]))
     elif sub == "list":
         for q in conn.execute("SELECT * FROM questions WHERE status='open' ORDER BY id"):
             ids = [f"{p}{q[k]}" for p, k in (("Q", "id"), ("T", "task_id"), ("S", "session_id")) if q[k] is not None]
@@ -857,15 +881,19 @@ def hat_kit(hat, sid, agent, worktree, runtime="claude"):
     if runtime == "opencode":
         config_dir = zeddeny.opencode_plugin(out / f"{agent}-opencode", ZED_HOME, identity, deny_tools)
         (config_dir / "AGENTS.md").write_text(rules + "\n\n" + OPENCODE_RULES_NOTE)
-        with socket.socket() as s:  # a port that is free now, for this worker's server
-            s.bind(("127.0.0.1", 0))
-            kit["opencode_server"] = {"url": f"http://127.0.0.1:{s.getsockname()[1]}", "password": secrets.token_urlsafe(24),
-                                      "log": config_dir / "server.log"}
+        kit["opencode_server"] = private_server(config_dir / "server.log")
         env += [f"OPENCODE_CONFIG_DIR={config_dir}", f"OPENCODE_PASSWORD={kit['opencode_server']['password']}"]
     else:
         kit["claude_settings"] = out / f"{agent}-settings.json"
         kit["claude_settings"].write_text(json.dumps(zeddeny.claude_settings(ZED_HOME, deny_tools), indent=2) + "\n")
     return kit, env
+
+
+def private_server(log):
+    """Address, password and log file of an OpenCode server that is about to be started, on a port that is free now."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return {"url": f"http://127.0.0.1:{s.getsockname()[1]}", "password": secrets.token_urlsafe(24), "log": log}
 
 
 def opencode_api(server, method, path, body=None, timeout=30):
@@ -881,13 +909,13 @@ def opencode_api(server, method, path, body=None, timeout=30):
     return answer["data"] if isinstance(answer, dict) and "data" in answer else answer
 
 
-def opencode_canary(server, session):
-    """Prove the deny plugin is live in this worker's server, in its own session: ask for one shell call that every hat
-    denies and read back what happened to it. Returns "" when the call was stopped with zed-deny's reason, else why the
-    guard is not proven. OpenCode has no API that runs a tool without the model (its `session.shell` is the user's
-    shell and passes no tool hook), so the call takes one model turn; a model that makes no call proves nothing, and
-    the worker is refused."""
-    command = f"{zeddeny.CANARY_COMMAND} {secrets.token_hex(4)}"
+def opencode_canary(server, session, program=zeddeny.CANARY_COMMAND, plugin="deny plugin"):
+    """Prove a guard plugin is live in this server, in this session: ask for one shell call that the guard always
+    denies (`program`: zed-deny's canary for a worker, zed-pretool's for the coordinator) and read back what happened
+    to it. Returns "" when the call was stopped with the guard's reason, else why the guard is not proven. OpenCode has
+    no API that runs a tool without the model (its `session.shell` is the user's shell and passes no tool hook), so
+    the call takes one model turn; a model that makes no call proves nothing, and the session is refused."""
+    command = f"{program} {secrets.token_hex(4)}"
     opencode_api(server, "POST", f"/session/{session}/prompt", {"text": (
         f"Startup check. Call the shell tool exactly once with exactly this command: {command}\n"
         "It is expected to be refused. Do not retry it and do nothing else. Then reply with the single word CHECKED.")})
@@ -895,12 +923,33 @@ def opencode_canary(server, session):
     calls = [part for m in opencode_api(server, "GET", f"/session/{session}/message") for part in m.get("content") or []
              if part.get("type") == "tool" and ((part.get("state") or {}).get("input") or {}).get("command", "").strip() == command]
     if not calls:
-        return "the model made no canary call, so the deny plugin is not proven live"
+        return f"the model made no canary call, so the {plugin} is not proven live"
     state = calls[0]["state"]
     reason = str((state.get("error") or {}).get("message", ""))
     if state.get("status") == "error" and f"canary: `{command}`" in reason:
         return ""
-    return f"the canary call `{command}` was not denied (status {state.get('status')}): the deny plugin is not live"
+    return f"the canary call `{command}` was not denied (status {state.get('status')}): the {plugin} is not live"
+
+
+def opencode_session(server, directory, title, model, variant):
+    """Wait for an OpenCode server that was just started, then create a session in `directory` with `model`
+    ("provider/model") and `variant`. Returns (the session id or None, "" or why it is not the configured session).
+    Raises OSError when the server does not answer in OPENCODE_SERVER_SECONDS."""
+    deadline = time.monotonic() + OPENCODE_SERVER_SECONDS
+    while True:
+        try:
+            opencode_api(server, "GET", "/info", timeout=5)
+            break
+        except OSError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(1)
+    provider, _, name = model.partition("/")
+    wanted = {"providerID": provider, "id": name, "variant": variant}
+    created = opencode_api(server, "POST", "/session", {"location": {"directory": str(directory)}, "title": title, "model": wanted})
+    if created.get("model") != wanted:
+        return created["id"], f"the session runs {created.get('model')}, not the configured {wanted}"
+    return created["id"], ""
 
 
 def start_opencode(agent, pane_id, worktree, kit, model, variant):
@@ -912,23 +961,10 @@ def start_opencode(agent, pane_id, worktree, kit, model, variant):
     port = server["url"].rsplit(":", 1)[1]
     run(["herdr", "pane", "run", pane_id, f"opencode serve --print-logs --log-level warn --hostname 127.0.0.1 --port {port} "
                                           f"> {shlex.quote(str(server['log']))} 2>&1 &"])  # the log names a plugin that failed to load
-    session, deadline = None, time.monotonic() + OPENCODE_SERVER_SECONDS
+    session = None
     try:
-        while True:
-            try:
-                opencode_api(server, "GET", "/info", timeout=5)
-                break
-            except OSError:
-                if time.monotonic() > deadline:
-                    raise
-                time.sleep(1)
-        provider, _, name = model.partition("/")
-        wanted = {"providerID": provider, "id": name, "variant": variant}
-        created = opencode_api(server, "POST", "/session", {"location": {"directory": str(worktree)}, "title": agent, "model": wanted})
-        session = created["id"]
-        if created.get("model") != wanted:
-            return session, f"the session runs {created.get('model')}, not the configured {wanted}"
-        if problem := opencode_canary(server, session):
+        session, problem = opencode_session(server, worktree, agent, model, variant)
+        if problem or (problem := opencode_canary(server, session)):
             return session, problem
     except (OSError, ValueError, KeyError, TypeError) as e:
         return session, f"its OpenCode server at {server['url']} failed ({type(e).__name__}: {e}); its log: {server['log']}"
@@ -1058,8 +1094,6 @@ def cmd_brief(args):
 
 
 SPAWN_KEYS = {"repo", "base", "branch", "brief", "name", "model", "effort", "kind", "from", "hat", "runtime"}
-RUNTIMES = ("claude", "opencode")
-
 
 def cmd_spawn(args):
     """spawn <task-id> repo=<repo> base=<branch> branch=<branch> brief=<path> [name=<agent>]
@@ -1092,7 +1126,7 @@ def cmd_spawn(args):
     if missing:
         die(f"brief {brief.name} lacks {', '.join(missing)} (templates/brief.md); no worker starts without a plan")
     hat = kv.get("hat", "build")
-    runtime = kv.get("runtime", "claude")
+    runtime = kv.get("runtime") or install_runtime()
     if runtime not in RUNTIMES:
         die(f"runtime={runtime} is not supported: {' or '.join(RUNTIMES)}")
     if runtime == "opencode" and "effort" in kv:
@@ -1280,6 +1314,52 @@ def cmd_prompt(args):
     s = resolve_session(conn, session_ref(args[0]))
     text = Path(args[2]).read_text() if args[1] == "--file" and len(args) > 2 else " ".join(args[1:])
     send_prompt(conn, s, text.strip(), redirect, "prompted by Zed")
+
+
+DECISIONS_HEADING = "## Decisions already made by the user"  # templates/brief.md
+
+
+def note_decision(brief, line):
+    """Add `line` to the brief's decisions section (at its end; the section is added when the brief has none), so the
+    answer survives a restart of the session."""
+    lines = brief.read_text().splitlines()
+    if DECISIONS_HEADING not in lines:
+        lines += ["", DECISIONS_HEADING]
+    start = lines.index(DECISIONS_HEADING) + 1
+    end = next((i for i in range(start, len(lines)) if lines[i].startswith("## ")), len(lines))
+    while end > start and not lines[end - 1].strip():
+        end -= 1
+    brief.write_text("\n".join(lines[:end] + [line] + lines[end:]) + "\n")
+
+
+def cmd_relay(args):
+    """relay <Q> <answer> [<Q> <answer> …] [--redirect] — the user's answers to workers' questions, in one command and
+    in this order: each worker is prompted with its answers verbatim (one prompt per worker; refused while it is
+    `working` unless --redirect, and then nothing is recorded), then the answers are recorded (as `q answer`) and
+    noted in the session's brief. A question no session asked is only recorded."""
+    redirect, args = "--redirect" in args, [a for a in args if a != "--redirect"]
+    if not args or len(args) % 2:
+        die('relay <Q> "<answer>" [<Q> "<answer>" …] [--redirect]: one quoted answer after each question id')
+    conn = db()
+    require_lock()
+    answers = [(question(conn, ref), ans.strip()) for ref, ans in zip(args[::2], args[1::2])]
+    if blank := [f"Q{q['id']}" for q, ans in answers if not ans]:
+        die(f"no answer given for {', '.join(blank)}")
+    by_session = {}
+    for q, ans in answers:
+        by_session.setdefault(q["session_id"], []).append((q, ans))
+    sessions = {sid: resolve_session(conn, sid) for sid in by_session if sid is not None}
+    for sid, s in sessions.items():  # every prompt first: a refusal leaves the record untouched
+        parts = [f"Answer from the user to your question Q{q['id']} ({q['question'].splitlines()[0][:120]}): {ans}" for q, ans in by_session[sid]]
+        send_prompt(conn, s, "\n".join(parts) + "\nContinue.", redirect, "relay: " + ", ".join(f"Q{q['id']}" for q, _ in by_session[sid]))
+    for q, ans in answers:
+        answer_question(conn, q, ans)
+        s = sessions.get(q["session_id"])
+        if s and s["brief"] and Path(s["brief"]).is_file():
+            note_decision(Path(s["brief"]), f"- User ({now()}), Q{q['id']} \"{q['question'].splitlines()[0][:160]}\": \"{ans}\"")
+    conn.commit()
+    write_status(conn)
+    print("recorded " + ", ".join(f"Q{q['id']}" for q, _ in answers))
 
 
 def cmd_relay_post(args):
@@ -1715,7 +1795,7 @@ def record_block(conn, s, block):
         conn.execute("UPDATE sessions SET pr_url=?, updated_at=? WHERE id=?", (url, now(), sid))
         out.append(f"PR: {url}")
         if NO_QA.match(qa):
-            out.append("⚠ PR with no real QA in its QA: line — send it back to QA before accepting (CLAUDE.md directive 6)")
+            out.append("⚠ PR with no real QA in its QA: line — send it back to QA before accepting (manual, directive 6)")
         else:
             conn.execute("UPDATE tasks SET status='pr_open' WHERE id=? AND status IN ('active','waiting_user','in_review')", (tid,))
     out.append(f"QA: {qa or '(missing)'}")
@@ -2184,14 +2264,19 @@ def cmd_hook(args):
         sys.exit(1)
 
 
-CONTEXT_FILES = ["CLAUDE.md", "playbook.md", "failure-modes.md", "profile/profile.md", "profile/lessons.md"]
 CONTEXT_BUDGET_WORDS = 4000
+
+
+def start_reading():
+    """What every Zed session reads besides the manual: `start` names them (Claude Code), or they are loaded as
+    instructions (OpenCode)."""
+    return [PROFILE_DIR / "profile.md", PROFILE_DIR / "lessons.md", ZED_HOME / "playbook.md", ZED_HOME / "failure-modes.md"]
 
 
 def context_words():
     """(words per always-loaded file, budget). The budget is `context_budget_words` in the profile's
     config/settings.json (default 4000); the files are what every Zed session reads at start."""
-    files = {"CLAUDE.md": ZED_HOME / "CLAUDE.md", "playbook.md": ZED_HOME / "playbook.md",
+    files = {"AGENTS.md": ZED_HOME / "AGENTS.md", "playbook.md": ZED_HOME / "playbook.md",
              "failure-modes.md": ZED_HOME / "failure-modes.md", "profile.md": PROFILE_DIR / "profile.md",
              "lessons.md": PROFILE_DIR / "lessons.md"}
     budget = read_json(PROFILE_DIR / "config" / "settings.json", {}).get("context_budget_words", CONTEXT_BUDGET_WORDS)
@@ -2303,14 +2388,144 @@ def arm_watcher():
     return None
 
 
+def coordinator_permissions():
+    """OpenCode permission rules that let the coordinator's routine commands run without a prompt: the Bash entries of
+    the allow list Claude Code uses (.claude/settings.json), so both runtimes share one list, plus the canary, which
+    must reach the guard instead of waiting for an answer nobody can give. Everything else keeps OpenCode's default."""
+    allowed = read_json(ZED_HOME / ".claude" / "settings.json", {}).get("permissions", {}).get("allow", [])
+    commands = [m.group(1) for a in allowed if (m := re.fullmatch(r"Bash\((.+):\*\)", a))]
+    commands += [str(ZED_HOME / c) for c in commands if c.startswith("bin/")] + [PRETOOL_CANARY]
+    return [{"action": "shell", "resource": f"{c} *", "effect": "allow"} for c in commands]
+
+
+def coordinator_kit():
+    """What the coordinator's OpenCode session starts with: a config directory of its own (OPENCODE_CONFIG_DIR) holding
+    the model and variant from the profile's config/opencode.json, the permission rules, the files every Zed session
+    reads (loaded as instructions next to this repo's AGENTS.md) and the guard plugin; a private server; and the path
+    of the record `start` checks. Under the profile's .cache, or in a temporary folder while there is no profile yet
+    (onboarding copies the template to `profile/`, which must not exist before)."""
+    has_profile = (PROFILE_DIR / "profile.md").exists()
+    home = PROFILE_DIR / ".cache" if has_profile else Path(tempfile.mkdtemp(prefix="zed-coordinator-"))
+    config_dir = zeddeny.coordinator_plugin(home / "coordinator-opencode", ZED_HOME, {"ZED_PROFILE_DIR": str(PROFILE_DIR)})
+    opencode = opencode_config()
+    (config_dir / "opencode.json").write_text(json.dumps({
+        "$schema": "https://opencode.ai/config.json",
+        "model": opencode["model"],
+        "agents": {"build": {"model": f"{opencode['model']}#{opencode['variant']}"}},  # the root model keeps no variant
+        "permissions": coordinator_permissions(),
+        "instructions": [str(p) for p in start_reading()]}, indent=2) + "\n")
+    return {"config_dir": config_dir, "record": home / "coordinator.json", "model": opencode["model"],
+            "variant": opencode["variant"], "server": private_server(config_dir / "server.log")}
+
+
+def open_coordinator(kit):
+    """Start the coordinator's server and session and prove its guard: the server with the kit's config directory, a
+    session in Zed's home with the configured model and variant, then the canary, which bin/zed-pretool must deny.
+    Returns (the server process, the session id or None, "" or why this session must not act as Zed). The record is
+    written only for a session whose guard is proven."""
+    server = kit["server"]
+    env = os.environ | {"OPENCODE_CONFIG_DIR": str(kit["config_dir"]), "OPENCODE_PASSWORD": server["password"],
+                        COORDINATOR_ENV: str(kit["record"])}
+    with open(server["log"], "w") as log:  # the log names a plugin that failed to load
+        process = subprocess.Popen(["opencode", "serve", "--print-logs", "--log-level", "warn", "--hostname", "127.0.0.1",
+                                    "--port", server["url"].rsplit(":", 1)[1]], env=env, cwd=ZED_HOME, stdout=log, stderr=subprocess.STDOUT)
+    session = None
+    try:
+        session, problem = opencode_session(server, ZED_HOME, "zed", kit["model"], kit["variant"])
+        problem = problem or opencode_canary(server, session, PRETOOL_CANARY, "coordinator guard (bin/zed-pretool)")
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        problem = f"its OpenCode server at {server['url']} failed ({type(e).__name__}: {e}); its log: {server['log']}"
+    if not problem:
+        kit["record"].touch(mode=0o600)  # it holds the server's password: the watcher wakes the coordinator through it
+        kit["record"].write_text(json.dumps({
+            "runtime": "opencode", "session": session, "server": {"url": server["url"], "password": server["password"]},
+            "server_pid": process.pid, "model": kit["model"], "variant": kit["variant"], "guard": "live", "started_at": now()}, indent=2) + "\n")
+    return process, session, problem
+
+
+def coordinator_record():
+    """What `coordinator` recorded for the OpenCode session running this command: None unless that session's guard was
+    proven and its server is still up."""
+    path = os.environ.get(COORDINATOR_ENV)
+    record = read_json(Path(path), None) if path else None
+    if not record or record.get("guard") != "live" or record.get("session") != os.environ.get("OPENCODE_SESSION_ID"):
+        return None
+    try:
+        os.kill(record["server_pid"], 0)
+    except (OSError, KeyError, TypeError):
+        return None
+    return record
+
+
+def cmd_coordinator(args):
+    """coordinator — open Zed's own session on OpenCode (the Claude Code equivalent is `claude` in Zed's home): writes
+    the session's config, starts its server, proves the guard with a canary and opens the TUI on the session. A
+    session whose guard is not proven is not opened. The server stops when the TUI is closed."""
+    if os.environ.get("ZED_SESSION"):
+        die(f"this is worker session {os.environ['ZED_SESSION']}, not Zed: `coordinator` is for the user's own terminal.")
+    if install_runtime() != "opencode":
+        die(f"this install runs on Claude Code: start `claude` in {ZED_HOME}. (To run on OpenCode instead, set "
+            f"\"runtime\": \"opencode\" in {PROFILE_DIR / 'config' / 'settings.json'}.)")
+    if not shutil.which("opencode"):
+        die("`opencode` is not installed or not on PATH")
+    kit = coordinator_kit()
+    print(f"starting the coordinator on {kit['model']} ({kit['variant']}) and proving its guard: one model turn …", flush=True)
+    process, session, problem = open_coordinator(kit)
+    try:
+        if problem:
+            die(f"the coordinator was not opened: {problem}")
+        tui = os.environ | {"OPENCODE_CONFIG_DIR": str(kit["config_dir"]), "OPENCODE_PASSWORD": kit["server"]["password"]}
+        code = subprocess.call(["opencode", "--server", kit["server"]["url"], "--session", session], env=tui, cwd=ZED_HOME)
+    finally:
+        process.terminate()
+        try:
+            process.wait(10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        kit["record"].unlink(missing_ok=True)
+    sys.exit(code)
+
+
+def cmd_runtime(args):
+    """runtime [--set-installed] — print the runtime this install uses. --set-installed (bin/zed-setup) writes it to
+    the profile's config/settings.json when it is not set there and exactly one of Claude Code and OpenCode is
+    installed; with both installed the choice is the user's."""
+    path = PROFILE_DIR / "config" / "settings.json"
+    if "--set-installed" in args and (PROFILE_DIR / "profile.md").exists() and not zedlib.settings().get("runtime"):
+        installed = [r for r, program in (("claude", "claude"), ("opencode", "opencode")) if shutil.which(program)]
+        if len(installed) == 1:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(zedlib.settings() | {"runtime": installed[0]}, indent=2) + "\n")
+            print(f"runtime set to {installed[0]} in {path} (the only one installed)")
+            return
+        if installed:
+            print(f"Claude Code and OpenCode are both installed and an install uses one: set \"runtime\" in {path} "
+                  f"(now: {install_runtime()})")
+            return
+    print(install_runtime())
+
+
 def cmd_start(args):
     """start [--take-over] — session start in one command: claim the Zed lock, then print one bounded
     digest (lock, watcher, what needs the user, running sessions). Read it once and trust it."""
     if os.environ.get("ZED_SESSION"):  # set by spawn for every worker (hat_kit)
         die(f"this is worker session {os.environ['ZED_SESSION']}, not Zed: `start` is for the coordinator only. "
-            "Follow your worker rules and brief; the coordinator manual in CLAUDE.md does not apply to you.")
-    require_profile()
+            "Follow your worker rules and brief; the coordinator manual (AGENTS.md) does not apply to you.")
+    runtime = install_runtime()
+    record = coordinator_record() if runtime == "opencode" else None
+    if runtime == "opencode" and not record:
+        die("this OpenCode session was not opened by `bin/zed coordinator`, so its guard (bin/zed-pretool) is not proven "
+            "live and Zed does not act from it. Tell the user to quit and run `bin/zed coordinator`.")
+    if record and me()["agent_session"] != record["session"]:  # the guard knows the lock holder by this id
+        die(f"this session is {record['session']} to OpenCode but {me()['agent_session']} to herdr: the guard would not "
+            "recognise the lock holder, so Zed does not act from it.")
+    if not (PROFILE_DIR / "profile.md").exists():
+        print(f"NEW USER: there is no profile at {PROFILE_DIR}. Run the `onboarding` skill and do nothing else until it is done."
+              + (" Then tell the user to quit and run `bin/zed coordinator` again." if record else ""))
+        return
     notes = []
+    if zedlib.git(ZED_HOME, "branch", "--show-current").stdout.strip() == "main":
+        notes.append("ON `main`: it holds core only. Zed runs on the profile's branch; switch before any commit.")
     try:
         cmd_lock(["acquire", *(["--take-over"] if "--take-over" in args else [])])
     except SystemExit as e:
@@ -2321,6 +2536,7 @@ def cmd_start(args):
     conn = db()
     lock = read_lock()
     out = [f"Zed home {ZED_HOME} · profile {PROFILE_DIR}",
+           f"runtime: {runtime}" + (f" · session {record['session']} · guard proven live at {record['started_at']}" if record else ""),
            f"lock: {'held by this session' if holds_lock() else describe(lock) if lock else 'none'}"]
     watcher = watcher_alive()
     running = conn.execute("SELECT COUNT(*) FROM sessions WHERE status IN ('running','waiting_user')").fetchone()[0]
@@ -2328,6 +2544,8 @@ def cmd_start(args):
         watcher = arm_watcher()  # OpenCode has no blocking Stop hook to re-arm it after each turn: arm it here
     out.append(f"watcher: {'alive, pid ' + str(watcher) if watcher else 'NOT RUNNING' + (' — arm it: bin/zed watch --once (background)' if running else '')}")
     out.append(context_line())
+    reading = ", ".join(str(p) for p in start_reading() if p.exists())
+    out.append(f"already in your instructions: {reading}" if record else f"read now: {reading}")
     out += notes + render_brief(conn)
     if holds_lock():  # read-only sessions only report what the DB says
         out += script_findings("sessions out of step with the DB (zed-crew)", "zed-crew", "reconcile")
@@ -2336,6 +2554,7 @@ def cmd_start(args):
     pending = [f"  [E{e['id']}] {e['ts']} {e['text'].splitlines()[0][:160]}" for e in queue_pending()]
     if pending:
         out += ["Un-acked wake events (handle, then `bin/zed ack E<id>…`):", *capped(pending)]
+    conn.close()
     print("\n".join(out))
 
 
@@ -2355,8 +2574,8 @@ def cmd_help(args):
                                      picks the effort by claude.json effort_by_kind; beyond max_running the task is queued (exit 75)
         [hat=build|review|qa]        the hat the session wears (default build);
                                      refused for a second writer on a worktree or a review/qa before the build's plan is done
-        [runtime=claude|opencode]    claude by default; opencode (opt-in) takes model and variant from
-                                     config/opencode.json (model= overrides), no effort=, no max_running
+        [runtime=claude|opencode]    the install's runtime by default (`runtime`); opencode takes model and variant
+                                     from config/opencode.json (model= overrides), no effort=, no max_running
   session list | session set <S|agent> key=value... (status pr_url claude_session_id pane_id workspace_id base brief)
   close <S|agent> [keep-worktree] [keep-scratch] [force]
                                      (external sessions are only untracked; the landed-work test below
@@ -2366,6 +2585,9 @@ def cmd_help(args):
                                      complete, no open questions; prints exactly what blocks closing
   prompt <S|agent> [--redirect] <text | --file F>
                                      the way to prompt a worker: refused while it is `working` unless --redirect
+  relay <Q> "<answer>" [<Q> "<answer>" …] [--redirect]
+                                     the user's answers in one step: prompt each worker verbatim, record the answers,
+                                     note them in the session's brief
   relay-post <S|agent> <words-file> --action "<exact action>" [--redirect] [--print]
                                      relay the user's OK to post: their words verbatim + the exact action
   gate check <sha|branch> [dir]      exit 1 unless the commit's code (profile/ ignored) has a clean review and qa by non-authors (read-only)
@@ -2380,7 +2602,11 @@ def cmd_help(args):
   doctor [--quiet]                   check the always-loaded context budget (4000 words; context_budget_words in
                                      config/settings.json); exits 1 when over. The pre-commit hook runs it
   status [--brief]                   (regenerate + print STATUS.md; --brief: only what needs attention)
-  start [--take-over]                (session start: claim the lock, print one bounded digest)
+  start [--take-over]                (session start: claim the lock, print one bounded digest; under OpenCode only
+                                     in a session opened by `coordinator`)
+  coordinator                        OpenCode only: open Zed's own session with its config, guard plugin and a canary
+                                     that proves the guard (Claude Code: start `claude` in Zed's home)
+  runtime [--set-installed]          the runtime this install uses (`runtime` in config/settings.json)
   paths                              (Zed home, profile dir, DB/STATUS/config/briefs locations)
   lock status | lock acquire [--take-over] | lock release
                                      one active Zed per profile; without the lock only
@@ -2390,8 +2616,8 @@ Session states: """ + ", ".join(SESSION_STATES))
 
 
 COMMANDS = {"task": cmd_task, "log": cmd_log, "q": cmd_q, "spawn": cmd_spawn, "session": cmd_session,
-            "prompt": cmd_prompt, "relay-post": cmd_relay_post, "gate": cmd_gate, "merge": cmd_merge, "close": cmd_close, "adopt": cmd_adopt, "watch": cmd_watch, "status": cmd_status,
-            "brief": cmd_brief, "landed": cmd_landed, "doctor": cmd_doctor, "ack": cmd_ack, "hook": cmd_hook, "paths": cmd_paths, "start": cmd_start, "lock": cmd_lock, "help": cmd_help}
+            "prompt": cmd_prompt, "relay": cmd_relay, "relay-post": cmd_relay_post, "gate": cmd_gate, "merge": cmd_merge, "close": cmd_close, "adopt": cmd_adopt, "watch": cmd_watch, "status": cmd_status,
+            "brief": cmd_brief, "landed": cmd_landed, "doctor": cmd_doctor, "ack": cmd_ack, "hook": cmd_hook, "paths": cmd_paths, "start": cmd_start, "coordinator": cmd_coordinator, "runtime": cmd_runtime, "lock": cmd_lock, "help": cmd_help}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
