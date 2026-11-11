@@ -23,6 +23,7 @@ sys.path.insert(0, str(FAKES))
 import store  # noqa: E402
 
 ZED = str(HOME / "bin" / "zed")
+RUN_ZED = [sys.executable, str(FAKES / "no_wait.py"), ZED]  # the real `bin/zed`, its waits cut short
 REPO = "demo"
 BASE = "main"
 # never inherited from the shell that runs the tests: a worker session carries all of these
@@ -54,6 +55,29 @@ def clean_env(home, **extra):
                   "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.invalid"} | extra
 
 
+_template = None  # the folder every World copies its git repo and origin from, built once per test run
+
+
+def template():
+    """A folder with the demo repo (one commit on BASE, pushed) and its bare origin."""
+    global _template
+    if _template is None:
+        _template = tempfile.TemporaryDirectory()  # removed when the test run ends
+        root = Path(_template.name).resolve()
+
+        def git(*args, cwd):
+            subprocess.run(["git", *args], cwd=cwd, env=clean_env(root), check=True, capture_output=True)
+        (root / REPO).mkdir()
+        git("init", "-q", "-b", BASE, cwd=root / REPO)
+        (root / REPO / "README.md").write_text("demo\n")
+        git("add", "-A", cwd=root / REPO)
+        git("commit", "-q", "-m", "Start", cwd=root / REPO)
+        git("init", "-q", "--bare", "origin.git", cwd=root)
+        git("remote", "add", "origin", str(root / "origin.git"), cwd=root / REPO)
+        git("push", "-q", "origin", BASE, cwd=root / REPO)
+    return Path(_template.name).resolve()
+
+
 class World:
     def __init__(self, case):
         self.case = case
@@ -66,20 +90,14 @@ class World:
         self.worktrees = self.root / "worktrees"
         self.script_path = self.root / "agent-script.json"
         self.coordinators = {}
-        for d in (self.profile / "config", self.herdr, self.root / "home", self.repo):
+        for d in (self.profile / "config", self.herdr, self.root / "home"):
             d.mkdir(parents=True)
         (self.profile / "profile.md").write_text("# Throwaway test profile\n")
         (self.profile / "config" / "projects.json").write_text(json.dumps(
             {"worktree_root": str(self.worktrees), "repos": {REPO: {"path": str(self.repo), "role": "demo repo"}}}))
-        os.environ["FAKE_HERDR_DIR"] = str(self.herdr)  # for this process's own reads of the world (store.read)
-        case.addCleanup(os.environ.pop, "FAKE_HERDR_DIR", None)
-        self.git("init", "-q", "-b", BASE, cwd=self.repo)
-        (self.repo / "README.md").write_text("demo\n")
-        self.git("add", "-A", cwd=self.repo)
-        self.git("commit", "-q", "-m", "Start", cwd=self.repo)
-        self.git("init", "-q", "--bare", str(self.root / "origin.git"), cwd=self.root)
-        self.git("remote", "add", "origin", str(self.root / "origin.git"), cwd=self.repo)
-        self.git("push", "-q", "origin", BASE, cwd=self.repo)
+        shutil.copytree(template() / REPO, self.repo)
+        shutil.copytree(template() / "origin.git", self.root / "origin.git")
+        self.git("remote", "set-url", "origin", str(self.root / "origin.git"))
         self.me = self.coordinator("zed")
         case.assertEqual(shutil.which("herdr", path=self.env()["PATH"]), str(FAKES / "bin" / "herdr"))
 
@@ -98,7 +116,7 @@ class World:
 
     def zed(self, *args, coordinator=None, check=True, timeout=90):
         """Run `bin/zed <args>` as a coordinator session. With check, a failure fails the test with the output."""
-        r = subprocess.run([sys.executable, ZED, *args], env=self.env(coordinator), capture_output=True, text=True,
+        r = subprocess.run([*RUN_ZED, *args], env=self.env(coordinator), capture_output=True, text=True,
                            timeout=timeout, cwd=self.root)
         if check:
             self.case.assertEqual(r.returncode, 0, f"bin/zed {' '.join(args)}\n{r.stdout}{r.stderr}")
@@ -107,7 +125,7 @@ class World:
     def coordinator(self, name):
         """A coordinator session in its own pane of the fake herdr. Returns the environment that identifies it, as
         Claude Code and herdr set it in a real pane."""
-        with store.locked() as state:
+        with store.locked(self.herdr) as state:
             _, pane = store.new_pane(state, HOME, label=name, shell_pid=os.getpid())
             agent = store.new_agent(name, "claude", [])
             agent["status"] = "working"
@@ -163,7 +181,10 @@ class World:
     def watch_once(self):
         """`bin/zed watch --once`: returns when the watcher has something for the coordinator (the process result).
         A watcher with nothing to say never returns: that fails the test at the time limit."""
-        return self.zed("watch", "--once", "0.05", timeout=30)
+        try:
+            return self.zed("watch", "--once", "0.05", timeout=30)
+        except subprocess.TimeoutExpired as e:
+            self.case.fail(f"the watcher reported nothing in {e.timeout} s; it printed:\n{e.stdout or ''}{e.stderr or ''}")
 
     def watch_state_changes(self, count, running=None, timeout=30):
         """Wait until the watcher has finished `count` more looks at the sessions (it saves its state after each)."""
@@ -178,7 +199,7 @@ class World:
 
     def watch_ticks(self, ticks=3, coordinator=None):
         """Let a watcher look at every session `ticks` times, then stop it. Returns what it printed."""
-        p = subprocess.Popen([sys.executable, ZED, "watch", "0.05"], env=self.env(coordinator), cwd=self.root,
+        p = subprocess.Popen([*RUN_ZED, "watch", "0.05"], env=self.env(coordinator), cwd=self.root,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         try:
             self.watch_state_changes(ticks, running=p)
@@ -214,24 +235,23 @@ class World:
 
     def agent(self, name):
         """The fake agent's state (None once its pane is gone or the CLI quit)."""
-        _, pane = store.find_agent(store.read(), name)
+        _, pane = store.find_agent(store.read(self.herdr), name)
         return pane["agent"] if pane else None
 
     def herdr_calls(self, *prefix):
         """The herdr commands received so far that start with `prefix`."""
-        return [c for c in store.read()["calls"] if c[:len(prefix)] == list(prefix)]
+        return [c for c in store.read(self.herdr)["calls"] if c[:len(prefix)] == list(prefix)]
 
     # ------------------------------------------------------------ making things happen
 
     def advance(self, name):
         """Time passes for an agent paused mid-turn: it goes on with its script."""
-        pane_id, pane = store.find_agent(store.read(), name)
-        env = self.env() | pane["env"] | {"HERDR_PANE_ID": pane_id, "FAKE_AGENT_PANE": pane_id, "FAKE_AGENT_EVENT": "advance"}
-        subprocess.run([pane["agent"]["kind"], *pane["agent"]["argv"]], cwd=pane["cwd"], env=env, check=True)
+        pane_id, _ = store.find_agent(store.read(self.herdr), name)
+        store.agent_event(pane_id, "advance", env=self.env(), root=self.herdr)
 
     def kill_pane(self, name):
         """The agent's pane disappears (the user closed it, or herdr lost it)."""
-        with store.locked() as state:
+        with store.locked(self.herdr) as state:
             pane_id, pane = store.find_agent(state, name)
             del state["panes"][pane_id]
             del state["workspaces"][pane["workspace_id"]]
@@ -242,6 +262,16 @@ class World:
         with conn:
             conn.execute("UPDATE sessions SET created_at = strftime('%Y-%m-%d %H:%M', created_at, ?)", (f"-{minutes} minutes",))
         conn.close()
+
+    def age_lapses(self, seconds=60):
+        """Stand in for waiting: the watcher nudges a worker that stays idle with no report for half a minute. Call it
+        while no watcher runs (the watcher keeps this file between its runs)."""
+        path = self.profile / ".cache" / "watch-alerts.json"
+        alerts = json.loads(path.read_text())
+        for seen in alerts.values():
+            if isinstance(seen, dict) and "lapse" in seen:
+                seen["lapse"]["since"] -= seconds
+        path.write_text(json.dumps(alerts))
 
 
 class LoopCase(unittest.TestCase):

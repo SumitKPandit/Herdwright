@@ -12,16 +12,11 @@ events reach the same executable (see agent.py). Nothing here waits: an agent is
 """
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import store  # noqa: E402
-
-# what a hat session must not inherit from the coordinator's shell: herdr starts a pane with its own identity
-COORDINATOR_ONLY = ("HERDR_PANE_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID", "OPENCODE_SESSION_ID", "OPENCODE_PID")
-FOOTER = ["─" * 40, "❯ ", "─" * 40, "  ⏵⏵ auto mode on (shift+tab to cycle)"]
 
 
 def ok(result):
@@ -40,17 +35,6 @@ def option(args, name, default=None):
 
 def options(args, name):
     return [args[i + 1] for i, a in enumerate(args[:-1]) if a == name]
-
-
-def agent_event(pane_id, event, payload=""):
-    """Let the agent CLI in a pane react to `event`: its own executable runs in the pane's folder and environment."""
-    state = store.read()
-    pane = state["panes"][pane_id]
-    agent = pane["agent"]
-    env = {k: v for k, v in os.environ.items() if k not in COORDINATOR_ONLY}
-    env |= pane["env"] | {"HERDR_PANE_ID": pane_id, "FAKE_AGENT_PANE": pane_id, "FAKE_AGENT_EVENT": event,
-                          "FAKE_AGENT_PAYLOAD": payload}
-    subprocess.run([agent["kind"], *agent["argv"]], cwd=pane["cwd"], env=env, check=True)
 
 
 def workspace(args):
@@ -96,7 +80,7 @@ def agent(args):
             if pane_id not in state["panes"]:
                 return fail("pane_not_found")
             state["panes"][pane_id]["agent"] = store.new_agent(name, option(args, "--kind"), args[args.index("--") + 1:])
-        agent_event(pane_id, "start")
+        store.agent_event(pane_id, "start")
         return ready(name, "idle")
     pane_id, found = store.find_agent(store.read(), args[1])
     if not found:
@@ -104,7 +88,7 @@ def agent(args):
     if sub == "get":
         return ok({"type": "agent", "agent": store.agent_record(pane_id, found)})
     if sub == "read":
-        screen = found["agent"]["screen"] + ([] if found["agent"]["dialog"] else FOOTER)
+        screen = found["agent"]["screen"] + ([] if found["agent"]["dialog"] else found["agent"]["launch"].get("footer", []))
         if option(args, "--source", "visible") == "visible":
             screen = screen[-store.VISIBLE_LINES:]
         if lines := option(args, "--lines"):
@@ -112,13 +96,13 @@ def agent(args):
         print("\n".join(screen))
         return 0
     if sub == "prompt":
-        agent_event(pane_id, "prompt", args[2])
+        store.agent_event(pane_id, "prompt", args[2])
         after = store.find_agent(store.read(), args[1])[1]
         if "--wait" in args and after and after["agent"]["unsent"] is not None:
             return fail("agent_prompt_stalled", "no activity after the prompt was submitted")
         return ok({"type": "agent_prompted"})
     if sub == "send-keys":
-        agent_event(pane_id, "keys", json.dumps(args[2:]))
+        store.agent_event(pane_id, "keys", json.dumps(args[2:]))
         return ok({"type": "keys_sent"})
     if sub == "wait":
         return ready(args[1], *options(args, "--until"))

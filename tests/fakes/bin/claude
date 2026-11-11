@@ -10,6 +10,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import agent  # noqa: E402
 
 VERSION = "9.9.9 (fake Claude Code)"
+# the screen: what is printed before a message and before the echo of a prompt, and the input box under an idle CLI
+SCREEN = {"bullet": "⏺ ", "prompt_echo": "> ",
+          "footer": ["─" * 40, "❯ ", "─" * 40, "  ⏵⏵ auto mode on (shift+tab to cycle)"]}
 
 
 def launch(argv):
@@ -22,7 +25,7 @@ def launch(argv):
     p.add_argument("--model")
     p.add_argument("--effort")
     p.add_argument("--settings")
-    return vars(p.parse_args(argv)) | {"runtime": "claude", "bullet": "⏺ "}
+    return vars(p.parse_args(argv)) | {"runtime": "claude"} | SCREEN
 
 
 if __name__ == "__main__":

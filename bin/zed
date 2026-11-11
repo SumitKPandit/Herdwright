@@ -1456,6 +1456,11 @@ NO_QA = re.compile(r"^\W*(none|n/?a|not (run|done|tested)|skipped|no qa|-)?\W*$"
 WORKING_SCAN = 10              # seconds between looks at a working worker's screen for a new ZED block
 LAPSE_GRACE = 30               # seconds a worker must stay idle without a ZED block before it is nudged
 LAPSE_NUDGE = "Continue, or end with ZED:QUESTION / ZED:DONE / ZED:BLOCKED."
+YOUNG_SECONDS = 180            # a worker this new may be idle only because it has not started on its brief yet
+
+
+def is_young(s):
+    return (datetime.now() - datetime.strptime(s["created_at"], "%Y-%m-%d %H:%M")).total_seconds() < YOUNG_SECONDS
 
 
 def parse_block(screen):
@@ -1592,7 +1597,9 @@ def record_block(conn, s, block):
 
 def settle_turn(conn, s, screen, alerts, line, seq):
     """A worker's turn ended (idle/done). Returns the event text for Zed, or None when the watcher
-    dealt with it: a new ZED block is recorded and surfaced; a usage limit wakes Zed once; no block at all is a protocol lapse, nudged by `lapse_tick` after a grace period."""
+    dealt with it: a new ZED block is recorded and surfaced; a usage limit wakes Zed once; no block at all is a
+    protocol lapse, nudged by `lapse_tick` after a grace period (so a just-spawned worker that is idle only until it
+    reads its brief raises nothing)."""
     seen = alerts.setdefault(s["id"], {})
     block = parse_block(read_screen(s["agent"], "recent-unwrapped", 150) or screen)
     if block and seen.get("block") != block["fingerprint"]:
@@ -1607,9 +1614,7 @@ def settle_turn(conn, s, screen, alerts, line, seq):
             return None
         seen["limit"] = hit
         return f"{line} · USAGE LIMIT: {hit} · the worker is paused until it resets; tell the user"
-    young = (datetime.now() - datetime.strptime(s["created_at"], "%Y-%m-%d %H:%M")).total_seconds() < 180
-    if not young:
-        seen["lapse"] = {"seq": seq, "since": time.time()}
+    seen["lapse"] = {"seq": seq, "since": time.time()}
     return None
 
 
@@ -1671,7 +1676,8 @@ def pr_events(conn, s, alerts):
 
 def lapse_tick(s, state, seq, alerts):
     """Protocol lapse: idle with no ZED block. The first one is nudged with the standard prompt without
-    waking Zed; one after a nudge is returned as an event line."""
+    waking Zed; one after a nudge is returned as an event line. A young worker's lapse is kept, not dropped: it is
+    nudged once the worker is no longer young, if it is still idle in the same turn."""
     seen = alerts.setdefault(s["id"], {})
     lapse = seen.get("lapse")
     if not lapse:
@@ -1679,7 +1685,7 @@ def lapse_tick(s, state, seq, alerts):
     if state not in ("idle", "done") or lapse["seq"] != seq:
         seen.pop("lapse")
         return None
-    if time.time() - lapse["since"] < LAPSE_GRACE:
+    if is_young(s) or time.time() - lapse["since"] < LAPSE_GRACE:
         return None
     seen.pop("lapse")
     if not seen.get("nudges"):
@@ -1835,10 +1841,7 @@ def cmd_watch(args):
                 snapshot = {"state": state, "sequence": a.get("state_change_seq") if a else None}
                 if prev.get(key) != snapshot:
                     line = None
-                    young = (datetime.now() - datetime.strptime(s["created_at"], "%Y-%m-%d %H:%M")).total_seconds() < 180
-                    if not first and young and state in ("idle", "done"):
-                        pass  # a just-spawned worker flickers idle before it reads its brief; not an event
-                    elif not first and state in ("idle", "done", "blocked", "unknown", "gone"):
+                    if not first and state in ("idle", "done", "blocked", "unknown", "gone"):
                         line = f"S{s['id']} T{s['task_id']} {s['agent']} → {state}"
                     elif first and state in ("idle", "done", "blocked", "gone"):
                         line = f"S{s['id']} T{s['task_id']} {s['agent']} is {state} (at watch start)"
