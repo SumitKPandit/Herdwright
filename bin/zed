@@ -815,7 +815,8 @@ def hat_kit(hat, sid, agent, worktree, runtime="claude"):
         env.append(f"OPENCODE_CONFIG_DIR={zeddeny.opencode_plugin(out / f'{agent}-opencode', ZED_HOME)}")
     else:
         kit["claude_settings"] = out / f"{agent}-settings.json"
-        kit["claude_settings"].write_text(json.dumps(zeddeny.claude_settings(ZED_HOME), indent=2) + "\n")
+        deny_tools = (zedlib.settings().get("worker") or {}).get("deny_tools") or []
+        kit["claude_settings"].write_text(json.dumps(zeddeny.claude_settings(ZED_HOME, deny_tools), indent=2) + "\n")
     return kit, env
 
 

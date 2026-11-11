@@ -45,9 +45,10 @@ The no-assumption rule applies in full: write down only what the user said or wh
      their plan, so ask first; if login is needed they run `claude` themselves).
    - GitHub: `gh auth status` (if needed the user runs `! gh auth login`); check `gh api user` matches
      their handle.
-   - Tools exposed as MCP servers (e.g. Atlassian, Slack, Google): find their tools with ToolSearch;
+   - Tools exposed as MCP servers (e.g. a ticket tracker, a wiki, chat): find their tools with ToolSearch;
      if a server needs auth, call its `authenticate` tool and let the user finish in the browser;
-     then make one read-only call that proves it works (e.g. the current user's profile).
+     then make one read-only call that proves it works (e.g. the current user's profile). List the
+     server's write tools under `worker.deny_tools` in `config/settings.json`: workers may read, only Zed posts.
    - Repos: for each, check the path is a git repo and `git -C <path> remote -v` matches what they
      said; offer to clone missing ones (with their OK).
    - Record each account in `profile.md` with how it's connected, how to verify it, and the date

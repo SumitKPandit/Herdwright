@@ -247,11 +247,10 @@ class DecideTests(unittest.TestCase):
         self.assertIsNone(self.call("build", "apply_patch", patchText=f"*** Update File: {src}\n"))
         self.assertIn("denied", self.call("review", "bash", command="gh pr comment 1"))
 
-    def test_claude_settings_deny_exactly_the_nine_atlassian_write_tools(self):
-        prefix = "mcp__claude_ai_Atlassian_MCP__"
-        self.assertEqual(sorted(zeddeny.claude_settings(HOME)["permissions"]["deny"]), sorted(prefix + n for n in (
-            "addGraphContext", "addOrEditJiraIssueComment", "createConfluenceContent", "createJiraIssue", "editJiraIssue",
-            "executeDestructive", "executeWrite", "transitionJiraIssue", "updateConfluenceContent")))  # no get*, search*, executeRead, discover
+    def test_claude_settings_deny_exactly_the_tools_given(self):
+        self.assertEqual(zeddeny.claude_settings(HOME)["permissions"]["deny"], [])  # core names no vendor's tools
+        tools = ["mcp__tracker__createIssue", "mcp__wiki__updatePage"]
+        self.assertEqual(zeddeny.claude_settings(HOME, tools)["permissions"]["deny"], tools)
 
     def test_glob_regex(self):
         self.assertTrue(zeddeny.glob_regex("**").match("a/b/c.py"))

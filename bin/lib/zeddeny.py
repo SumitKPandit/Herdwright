@@ -19,11 +19,6 @@ PATH_KEYS = ("file_path", "path", "notebook_path", "filePath")
 # OpenCode's apply_patch names its files in marker lines of `patchText` (verified in opencode.ai/docs/plugins, 2026-11-03)
 PATCH_FILE = re.compile(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$", re.M)
 SUBAGENT_TOOLS = {"agent", "task"}
-# A hat session may read Atlassian but not write: only Zed, with the user present, posts. Claude Code `permissions.deny` entries
-# for the Atlassian connector's write tools, as listed in a session on 2026-11-03 (written into the per-session settings).
-MCP_WRITE_TOOLS = [f"mcp__claude_ai_Atlassian_MCP__{n}" for n in (
-    "addGraphContext", "addOrEditJiraIssueComment", "createConfluenceContent", "createJiraIssue", "editJiraIssue",
-    "executeDestructive", "executeWrite", "transitionJiraIssue", "updateConfluenceContent")]
 # What a hat session's identity rests on (`zedemployee.caller_session`): a Bash command may not set or unset them
 IDENTITY_VARS = ("ZED_SESSION", "ZED_HAT", "ZED_PROFILE_DIR", "HERDR_PANE_ID")
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
@@ -243,9 +238,11 @@ def stop_command(zed_home):
     return f"{Path(zed_home) / 'bin' / 'zed-employee'} stop-guard"
 
 
-def claude_settings(zed_home):
-    """Contents of the per-session `claude --settings` file (additive to the project's own settings)."""
-    return {"permissions": {"deny": list(MCP_WRITE_TOOLS)},
+def claude_settings(zed_home, deny_tools=()):
+    """Contents of the per-session `claude --settings` file (additive to the project's own settings). `deny_tools` are the
+    tool names a hat session may not call (`worker.deny_tools` in the profile's config/settings.json), e.g. a connector's
+    write tools: only Zed, with the user present, posts."""
+    return {"permissions": {"deny": list(deny_tools)},
             "hooks": {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": hook_command(zed_home), "timeout": 10}]}],
                       "Stop": [{"hooks": [{"type": "command", "command": stop_command(zed_home), "timeout": 10}]}]}}
 
