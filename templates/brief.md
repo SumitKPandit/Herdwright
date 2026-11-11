@@ -1,4 +1,4 @@
-# Brief — T{{TASK}} · {{JIRA}} · {{TITLE}}
+# Brief — T{{TASK}} · {{TICKET_ID}} · {{TITLE}}
 
 ## Goal
 <FILL: what the user wants, in their words where possible>

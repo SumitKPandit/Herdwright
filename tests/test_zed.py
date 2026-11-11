@@ -171,6 +171,27 @@ class ZedTests(unittest.TestCase):
         self.assertFalse({"employee", "origin", "verdict_sha"} & columns)  # a new DB has no column for a removed identity
         self.z.db().close()  # migrating twice is harmless
 
+    def test_schema_renames_the_jira_column_to_ticket_and_keeps_its_rows(self):
+        self.z.DB_PATH.parent.mkdir()
+        conn = sqlite3.connect(self.z.DB_PATH)
+        conn.execute("CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL, jira TEXT, worktype TEXT, description TEXT, "
+                     "status TEXT NOT NULL DEFAULT 'intake', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        conn.executemany("INSERT INTO tasks(id,title,jira,worktype,status,created_at,updated_at) VALUES (?,?,?,'story','active','t0','t1')",
+                         [(1, "With a ticket", "ABC-7"), (2, "Without one", None)])
+        conn.commit()
+        conn.close()
+        conn = self.z.db()
+        self.addCleanup(conn.close)
+        columns = [r["name"] for r in conn.execute("PRAGMA table_info(tasks)")]
+        self.assertIn("ticket", columns)
+        self.assertNotIn("jira", columns)
+        rows = [tuple(r) for r in conn.execute("SELECT id,title,ticket,worktype,status,created_at,updated_at FROM tasks ORDER BY id")]
+        self.assertEqual(rows, [(1, "With a ticket", "ABC-7", "story", "active", "t0", "t1"),
+                                (2, "Without one", None, "story", "active", "t0", "t1")])
+        self.z.db().close()  # migrating twice is harmless
+        self.z.cmd_task(["list"])
+        self.assertIn("ABC-7", self.output.getvalue())
+
     def test_hat_columns_default_to_none(self):
         conn = self.z.db()
         self.addCleanup(conn.close)
@@ -396,7 +417,7 @@ class ZedTests(unittest.TestCase):
 
     def test_brief_scaffold_and_spawn_refuses_placeholders(self):
         conn = self.session()
-        conn.execute("UPDATE tasks SET jira='MENT-9', description='Add a label'")
+        conn.execute("UPDATE tasks SET ticket='MENT-9', description='Add a label'")
         conn.commit()
         (self.root / "config").mkdir(exist_ok=True)
         (self.root / "config" / "projects.json").write_text(json.dumps({

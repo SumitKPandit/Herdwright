@@ -327,7 +327,7 @@ class PushGateTests(GateCase):
         bare = self.root / "remote.git"
         self.assertTrue(zedlib.git(self.root, "init", "-q", "--bare", str(bare)).ok)
         install = subprocess.run([str(HOME / "bin/zed-guard"), "install", str(self.worktree),
-                                  "--base", "main", "--gate", "--jira", "MENT-20"],
+                                  "--base", "main", "--gate", "--ticket", "MENT-20"],
                                  capture_output=True, text=True, env=env)
         self.assertEqual(install.returncode, 0, install.stderr)
         config = Path(zedlib.git(self.worktree, "rev-parse", "--absolute-git-dir").stdout.strip()) / "zed-hooks/config.json"

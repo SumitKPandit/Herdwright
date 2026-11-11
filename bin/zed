@@ -6,7 +6,7 @@ and <profile>/STATUS.md is regenerated from it on every write. The profile is `p
 home, or $ZED_PROFILE_DIR if set (e.g. a throwaway profile for testing).
 
 Concepts
-  task     a unit of work the user asked for (usually one Jira ticket)
+  task     a unit of work the user asked for (usually one ticket)
   session  one Claude Code worker running in herdr, in its own git worktree, on one repo
   question something a worker (or Zed) needs the user to decide
   event    timestamped log line attached to a task (or global if no task)
@@ -77,7 +77,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
   id INTEGER PRIMARY KEY,
   title TEXT NOT NULL,
-  jira TEXT,
+  ticket TEXT,  -- the tracker's id for this work, if it has one
   worktype TEXT,
   description TEXT,
   status TEXT NOT NULL DEFAULT 'intake',
@@ -142,6 +142,9 @@ def db():
     conn = sqlite3.connect(DB_PATH, timeout=10)  # waits up to 10s if another process is writing
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    task_cols = [r["name"] for r in conn.execute("PRAGMA table_info(tasks)")]
+    if "jira" in task_cols and "ticket" not in task_cols:  # the ticket id was once stored under one tracker's name
+        conn.execute("ALTER TABLE tasks RENAME COLUMN jira TO ticket")
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(sessions)")]
     # migrate DBs created before these columns existed
     for col, decl in [("external", "INTEGER NOT NULL DEFAULT 0"), ("model", "TEXT"), ("effort", "TEXT"), ("brief", "TEXT"), ("pr_state", "TEXT"),
@@ -568,20 +571,20 @@ def render_status(conn, live=None):
     lines = ["# Zed status", "", f"_Generated {now()} from the task DB (`bin/zed status`). Do not edit by hand._", ""]
 
     open_q = conn.execute(
-        "SELECT q.*, t.jira, t.title FROM questions q LEFT JOIN tasks t ON t.id=q.task_id "
+        "SELECT q.*, t.ticket, t.title FROM questions q LEFT JOIN tasks t ON t.id=q.task_id "
         "WHERE q.status='open' ORDER BY q.id").fetchall()
     lines.append("## Waiting on you")
     lines.append("")
     if open_q:
         for q in open_q:
-            tag = f"T{q['task_id']} {q['jira'] or ''}".strip() if q["task_id"] else "general"
+            tag = f"T{q['task_id']} {q['ticket'] or ''}".strip() if q["task_id"] else "general"
             lines.append(f"- **Q{q['id']}** ({tag}, asked {q['asked_at']}): {q['question']}")
     else:
         lines.append("- Nothing.")
     lines.append("")
 
     def task_block(t):
-        out = [f"### T{t['id']} · {t['jira'] or 'no-jira'} · {t['title']}",
+        out = [f"### T{t['id']} · {t['ticket'] or 'no-ticket'} · {t['title']}",
                f"- status: **{t['status']}** · worktype: {t['worktype'] or '-'} · updated {t['updated_at']}"]
         if t["description"]:
             out.append(f"- {t['description']}")
@@ -630,7 +633,7 @@ def render_status(conn, live=None):
         lines.append("- None.")
     for t in done:
         prs = [s["pr_url"] for s in conn.execute("SELECT pr_url FROM sessions WHERE task_id=? AND pr_url IS NOT NULL", (t["id"],))]
-        lines.append(f"- T{t['id']} {t['jira'] or ''} {t['title']} — {t['status']} {t['updated_at']}"
+        lines.append(f"- T{t['id']} {t['ticket'] or ''} {t['title']} — {t['status']} {t['updated_at']}"
                      + (f" — {', '.join(prs)}" if prs else ""))
     lines.append("")
     return "\n".join(lines)
@@ -653,18 +656,18 @@ def cmd_task(args):
     if sub == "add":
         kv = parse_kv(rest)
         if "title" not in kv:
-            die("task add title=... [jira=<ticket-id>] [worktype=<e.g. story>] [description=...] [status=intake]")
+            die("task add title=... [ticket=<ticket-id>] [worktype=<e.g. story>] [description=...] [status=intake]")
         ts = now()
         cur = conn.execute(
-            "INSERT INTO tasks(title,jira,worktype,description,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
-            (kv["title"], kv.get("jira"), kv.get("worktype"), kv.get("description"), kv.get("status", "intake"), ts, ts))
+            "INSERT INTO tasks(title,ticket,worktype,description,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+            (kv["title"], kv.get("ticket"), kv.get("worktype"), kv.get("description"), kv.get("status", "intake"), ts, ts))
         log_event(conn, cur.lastrowid, "created", kv["title"])
         print(f"T{cur.lastrowid}")
     elif sub == "set":
         tid, kv = int(rest[0].lstrip("T")), parse_kv(rest[1:])
         get_task(conn, tid)
         for k, v in kv.items():
-            if k not in ("title", "jira", "worktype", "description", "status"):
+            if k not in ("title", "ticket", "worktype", "description", "status"):
                 die(f"cannot set '{k}' on a task")
             if k == "status" and v not in TASK_STATES:
                 die(f"status must be one of {TASK_STATES}")
@@ -688,7 +691,7 @@ def cmd_task(args):
         allrows = "--all" in rest
         q = "SELECT * FROM tasks" + ("" if allrows else f" WHERE status IN ({','.join('?'*len(OPEN_TASK_STATES))})") + " ORDER BY id"
         for t in conn.execute(q, () if allrows else OPEN_TASK_STATES):
-            print(f"T{t['id']:<4} {t['status']:<13} {t['jira'] or '-':<10} {t['title']}")
+            print(f"T{t['id']:<4} {t['status']:<13} {t['ticket'] or '-':<10} {t['title']}")
     else:
         die(f"unknown task subcommand {sub}")
     conn.commit()
@@ -889,9 +892,9 @@ def cmd_brief(args):
     if out.exists() and "force" not in args:
         die(f"{out} exists; pass `force` to overwrite it")
     worktree = expand(p["path"]) if p.get("worktrees") is False else worktree_path(kv["repo"], kv["branch"])
-    values = {"TASK": tid, "JIRA": t["jira"] or "no ticket", "TITLE": t["title"], "REPO": kv["repo"],
+    values = {"TASK": tid, "TICKET_ID": t["ticket"] or "no ticket", "TITLE": t["title"], "REPO": kv["repo"],
               "ROLE": p.get("role", "-"), "WORKTREE": worktree, "BRANCH": kv["branch"], "BASE": kv["base"],
-              "TICKET": f"{t['jira']} — read it for full details; ask Zed if you can't reach it" if t["jira"] else "none",
+              "TICKET": f"{t['ticket']} — read it for full details; ask Zed if you can't reach it" if t["ticket"] else "none",
               "QA_ENV": knowledge_qa_notes(kv["repo"]), "PLAN_FILE": PROFILE_DIR / "briefs" / f"T{tid}-{kv['repo']}-plan.md"}
     text = (ZED_HOME / "templates" / "brief.md").read_text()
     for k, v in values.items():
@@ -996,7 +999,7 @@ def cmd_spawn(args):
         if actual != kv["branch"]:
             die(f"worktree {worktree} is on '{actual}', not '{kv['branch']}'; left untouched")
         guard = run([sys.executable, str(ZED_HOME / "bin" / "zed-guard"), "install", str(worktree), "--repo", kv["repo"],
-                     "--base", kv["base"], "--gate", *(["--jira", t["jira"]] if t["jira"] else ["--no-commit-format"])], check=False)
+                     "--base", kv["base"], "--gate", *(["--ticket", t["ticket"]] if t["ticket"] else ["--no-commit-format"])], check=False)
         if guard.returncode and "already pointing" not in guard.stderr:  # a reused worktree keeps its guard
             die(f"could not install the git guard in {worktree}; no worker started:\n{guard.stderr.strip() or guard.stdout.strip()}")
 
@@ -1009,7 +1012,7 @@ def cmd_spawn(args):
     require_lock()
     kit, env = hat_kit(hat, sid, agent, worktree, runtime)
     cli_args = opencode_launch(model) if runtime == "opencode" else claude_launch(agent, model, effort, kit)
-    label = f"T{tid} {t['jira'] or ''} {kv['repo']}".strip()
+    label = f"T{tid} {t['ticket'] or ''} {kv['repo']}".strip()
     ws = herdr_json(["workspace", "create", "--cwd", str(worktree), "--label", label, "--no-focus",
                      *[a for e in env for a in ("--env", e)]])["result"]
     ws_id, pane_id = ws["workspace"]["workspace_id"], ws["root_pane"]["pane_id"]
@@ -2076,7 +2079,7 @@ def render_brief(conn, live=None):
         note = f" · {s['hat'] or 'build'} {done}/{done + todo}{awaiting_note(plans)}" if plans else ""
         sess.append(f"  S{s['id']} T{s['task_id']} {s['agent']} {s['status']}/{state}{note}")
     out += ["Sessions running:", *(capped(sess) or ["  none"])]
-    other = [f"  T{t['id']} {t['status']} {t['jira'] or '-'} {t['title']}" for t in conn.execute(
+    other = [f"  T{t['id']} {t['status']} {t['ticket'] or '-'} {t['title']}" for t in conn.execute(
         "SELECT * FROM tasks WHERE status IN ('pr_open','intake','parked') ORDER BY id")]
     out += ["PR open / not started / parked:", *(capped(other) or ["  none"])]
     return out
@@ -2166,8 +2169,8 @@ def cmd_start(args):
 def cmd_help(args):
     print(__doc__)
     print("""Commands
-  task add title=... [jira=] [worktype=] [description=] [status=]
-  task set <T> key=value...          (title jira worktype description status)
+  task add title=... [ticket=] [worktype=] [description=] [status=]
+  task set <T> key=value...          (title ticket worktype description status)
   task show <T> | task list [--all]
   log <T|-> <text...> [kind=note]
   q add <T|-> <question...> [session=S] | q answer <Q> <answer...> | q list

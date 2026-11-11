@@ -3,10 +3,10 @@
 
 Ported from firstmate's fm-git-push-guard / fm-tangle-lib / fm-lock-lib / fm-guard. The rules (profile rules.md):
 never commit to, push to, or rebase base/release/deploy branches; never force-push; commits follow
-the user's format (default `JIRA-ID | Description`). Everything here is local; nothing is sent anywhere.
+the user's format (default `TICKET-ID | Description`). Everything here is local; nothing is sent anywhere.
 
 Usage
-  zed-guard install <worktree> [--jira ABC-123 | --no-commit-format] [--protected a,b,...] [--repo NAME --base BRANCH]
+  zed-guard install <worktree> [--ticket ABC-123 | --no-commit-format] [--protected a,b,...] [--repo NAME --base BRANCH]
       writes pre-commit, commit-msg and pre-push hooks into the worktree only (per-worktree core.hooksPath),
       chaining to whatever hooks the repo already uses (husky, Zed's own hooks/). Protected branches are the
       defaults (main master releases/*) plus --protected, plus `guard.protected` in the profile's config/settings.json, plus the
@@ -14,7 +14,7 @@ Usage
       same file replace the default `ABC-123 | Description` format.
       Sets `extensions.worktreeConfig true` in the repo's shared config (needed for a per-worktree core.hooksPath).
       pre-commit   refuses a commit while a protected branch is checked out
-      commit-msg   refuses a message not starting `<JIRA-ID> | ` (the given --jira), or not matching the format (default `ABC-123 | `)
+      commit-msg   refuses a message not starting `<TICKET-ID> | ` (the given --ticket), or not matching the format (default `ABC-123 | `)
       pre-push     refuses pushes to protected branches, force-pushes (non-fast-forward) and branch deletion; with --gate
                    also any push of a head that lacks a clean review and qa by non-authors (`bin/zed gate check`)
   zed-guard remove <worktree>        undo install
@@ -54,12 +54,12 @@ def is_protected(branch, patterns):
     return any(fnmatch.fnmatchcase(branch, p) for p in patterns)
 
 
-def commit_message_problem(first_line, jira=None, enforce=True, pattern=None, example=None):
+def commit_message_problem(first_line, ticket=None, enforce=True, pattern=None, example=None):
     if not enforce or SKIP_COMMIT.match(first_line):
         return None
-    prefix = f"{jira} | " if jira else None
+    prefix = f"{ticket} | " if ticket else None
     if prefix and not first_line.startswith(prefix):
-        return f"commit message must start with '{prefix}' (rule: `JIRA-ID | Description`), got: {first_line!r}"
+        return f"commit message must start with '{prefix}' (rule: `TICKET-ID | Description`), got: {first_line!r}"
     if not prefix and not re.match(pattern or GENERIC_COMMIT, first_line):
         return f"commit message must match the commit format (e.g. {example or 'ABC-123 | Add the thing'}), got: {first_line!r}"
     return None
@@ -157,7 +157,7 @@ def cmd_install(a):
         f.write_text(HOOK_TEMPLATE.format(guard=guard, name=name, chain=Path(prev) / name))
         f.chmod(f.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     (d / "config.json").write_text(json.dumps(
-        {"protected": patterns, "jira": a.jira, "commit_format": not a.no_commit_format,
+        {"protected": patterns, "ticket": a.ticket, "commit_format": not a.no_commit_format,
          "commit_pattern": rules.get("commit_format"), "commit_example": rules.get("commit_example"), "chain": prev, "gate": a.gate}))
     worktree_git(wt, "config", "extensions.worktreeConfig", "true")  # shared repo config: set for every guarded worktree
     r = worktree_git(wt, "config", "--worktree", "core.hooksPath", str(d))
@@ -196,7 +196,7 @@ def cmd_hook(a):
             return 1
     elif a.name == "commit-msg":
         lines = Path(a.args[0]).read_text().splitlines() if a.args and Path(a.args[0]).exists() else []
-        msg = commit_message_problem((lines or [""])[0].strip(), cfg.get("jira"), cfg.get("commit_format", True),
+        msg = commit_message_problem((lines or [""])[0].strip(), cfg.get("ticket"), cfg.get("commit_format", True),
                                      cfg.get("commit_pattern"), cfg.get("commit_example"))
         if msg:
             print(f"zed-guard: {msg}", file=sys.stderr)
@@ -273,7 +273,7 @@ def main(argv=None):
     i = sub.add_parser("install")
     i.add_argument("worktree")
     g = i.add_mutually_exclusive_group()
-    g.add_argument("--jira")
+    g.add_argument("--ticket")
     g.add_argument("--no-commit-format", action="store_true")
     i.add_argument("--protected")
     i.add_argument("--repo")

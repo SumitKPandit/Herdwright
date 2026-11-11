@@ -29,7 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 import zedlib  # noqa: E402
 
-TITLE_PATTERN = r"^[A-Z][A-Z0-9]*-\d+ \| \S.*"   # the user's rule: `JIRA-ID | Description`
+TITLE_PATTERN = r"^[A-Z][A-Z0-9]*-\d+ \| \S.*"   # default title rule: `TICKET-ID | Description`
 PASS_CONCLUSIONS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 GH_STATUS_PASS = {"SUCCESS"}
 GH_STATUS_PENDING = {"PENDING", "EXPECTED"}
