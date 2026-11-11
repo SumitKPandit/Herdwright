@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""zed-pr — read-only PR state, blocking CI wait and ready-for-review check (GitHub and Bitbucket).
+"""zed-pr — read-only PR state, blocking CI wait and ready-for-review check (GitHub, through `gh`).
 
 Ported from firstmate's fm-pr-state / fm-pr-health / fm-pr-poll. It never posts, approves, marks ready or merges:
 outward actions stay with the worker or the user.
@@ -16,7 +16,7 @@ Usage
       and that the user's reviewers were requested (default list: GitHub handles in profile knowledge/people.md).
       exit 0 ready · 1 problems listed · 2 lookup error
 
-GitHub uses `gh`; Bitbucket reuses bin/bb's Keychain credentials. Waiting never exceeds the Bash tool's 600 s limit
+Waiting never exceeds the Bash tool's 600 s limit
 with the default --timeout.
 """
 import argparse
@@ -24,7 +24,6 @@ import json
 import re
 import sys
 import time
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
@@ -34,9 +33,7 @@ TITLE_PATTERN = r"^[A-Z][A-Z0-9]*-\d+ \| \S.*"   # the user's rule: `JIRA-ID | D
 PASS_CONCLUSIONS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 GH_STATUS_PASS = {"SUCCESS"}
 GH_STATUS_PENDING = {"PENDING", "EXPECTED"}
-BB_FAIL = {"FAILED", "STOPPED"}
 GH_URL = re.compile(r"^https://github\.com/([^/]+/[^/]+)/pull/(\d+)")
-BB_URL = re.compile(r"^https://bitbucket\.org/([^/]+/[^/]+)/pull-requests/(\d+)")
 
 
 class PrLookupError(Exception):
@@ -44,11 +41,10 @@ class PrLookupError(Exception):
 
 
 def parse_url(url):
-    for forge, rx in (("github", GH_URL), ("bitbucket", BB_URL)):
-        m = rx.match(url)
-        if m:
-            return forge, m.group(1), int(m.group(2))
-    raise PrLookupError(f"not a GitHub or Bitbucket PR URL: {url}")
+    m = GH_URL.match(url)
+    if not m:
+        raise PrLookupError(f"not a GitHub PR URL: {url}")
+    return m.group(1), int(m.group(2))
 
 
 def summarize_github_checks(rollup):
@@ -74,7 +70,8 @@ def summarize_github_checks(rollup):
     return {"passing": passing, "failing": sorted(failing), "pending": sorted(pending)}
 
 
-def fetch_github(url, repo, number):
+def fetch(url):
+    parse_url(url)
     fields = "state,isDraft,title,baseRefName,headRefOid,mergeable,reviewDecision,statusCheckRollup,reviewRequests,latestReviews,author"
     r = zedlib.run_bounded(["gh", "pr", "view", url, "--json", fields], timeout=60)
     if not r.ok:
@@ -82,42 +79,12 @@ def fetch_github(url, repo, number):
     j = json.loads(r.stdout)
     requested = [(x.get("login") or x.get("slug") or "").lower() for x in j.get("reviewRequests") or []]
     reviewed = [(x.get("author") or {}).get("login", "").lower() for x in j.get("latestReviews") or []]
-    return {"forge": "github", "url": url, "state": j["state"], "draft": j["isDraft"], "title": j["title"],
+    return {"url": url, "state": j["state"], "draft": j["isDraft"], "title": j["title"],
             "base": j["baseRefName"], "head": j["headRefOid"], "author": ((j.get("author") or {}).get("login") or "").lower(),
             "conflicts": {"CONFLICTING": True, "MERGEABLE": False}.get(j.get("mergeable")),
             "changes_requested": j.get("reviewDecision") == "CHANGES_REQUESTED",
             "checks": summarize_github_checks(j.get("statusCheckRollup")),
             "reviewers": sorted(set(requested + reviewed) - {""})}
-
-
-def fetch_bitbucket(url, repo, number):
-    bb = SourceFileLoader("zed_bb", str(Path(__file__).resolve().parent / "bb")).load_module()
-    try:
-        pr = bb.call("GET", f"/repositories/{repo}/pullrequests/{number}")
-        st = bb.call("GET", f"/repositories/{repo}/pullrequests/{number}/statuses?pagelen=50")
-    except SystemExit as e:  # bb.die() exits; keep the script's own error path
-        raise PrLookupError("bin/bb request failed (run `bin/bb check`)") from e
-    failing, pending, passing = [], [], 0
-    for s in st.get("values", []):
-        if s.get("state") == "SUCCESSFUL":
-            passing += 1
-        elif s.get("state") in BB_FAIL:
-            failing.append(s.get("name") or s.get("key") or "?")
-        else:
-            pending.append(s.get("name") or s.get("key") or "?")
-    people = [p for p in pr.get("participants", []) if p.get("role") == "REVIEWER" or p.get("state")]
-    state = {"OPEN": "OPEN", "MERGED": "MERGED"}.get(pr["state"], "CLOSED")
-    return {"forge": "bitbucket", "url": url, "state": state, "draft": bool(pr.get("draft")), "title": pr["title"],
-            "base": pr["destination"]["branch"]["name"], "head": (pr.get("source", {}).get("commit") or {}).get("hash"),
-            "author": (pr.get("author") or {}).get("uuid", ""), "conflicts": None,
-            "changes_requested": any(p.get("state") == "changes_requested" for p in people),
-            "checks": {"passing": passing, "failing": sorted(failing), "pending": sorted(pending)},
-            "reviewers": sorted({(r.get("uuid") or "").lower() for r in pr.get("reviewers", [])} - {""})}
-
-
-def fetch(url):
-    forge, repo, number = parse_url(url)
-    return (fetch_github if forge == "github" else fetch_bitbucket)(url, repo, number)
 
 
 def verdict(pr):
@@ -227,7 +194,7 @@ def ready_problems(pr, title_pattern, base, reviewers):
 def cmd_ready(a, fetcher=fetch, handles=people_github_handles):
     pr = fetcher(a.url)
     reviewers = [r.strip().lower() for r in a.reviewers.split(",") if r.strip()] if a.reviewers is not None else (
-        handles() if pr["forge"] == "github" else [])
+        handles())
     problems = ready_problems(pr, a.title_pattern, a.base, reviewers)
     out = {"url": a.url, "ready": not problems, "problems": problems}
     zedlib.emit(out, a.json, lambda d: [("ready: " if d["ready"] else "NOT ready: ") + d["url"]] + ["  - " + p for p in d["problems"]])

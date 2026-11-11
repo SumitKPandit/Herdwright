@@ -730,20 +730,18 @@ class ZedTests(unittest.TestCase):
         close_ws.assert_called_once()
         self.assertTrue(work.exists())
 
-    def test_pr_snapshot_for_github_and_bitbucket(self):
+    def test_pr_snapshot_reads_github_only(self):
         gh = json.dumps({"state": "OPEN", "reviews": [{}], "comments": [{}, {}],
                          "statusCheckRollup": [{"conclusion": "SUCCESS"}, {"conclusion": "FAILURE"}]})
         with patch.object(self.z, "run", return_value=subprocess.CompletedProcess([], 0, gh, "")):
             self.assertEqual(self.z.pr_snapshot("https://github.com/o/r/pull/1"),
                              {"state": "open", "reviews": 3, "checks": "failing"})
-        bb = json.dumps({"state": "MERGED", "comment_count": 2, "approvals": 1, "build_failed": False})
-        with patch.object(self.z, "run", return_value=subprocess.CompletedProcess([], 0, bb, "")) as run:
-            self.assertEqual(self.z.pr_snapshot("https://bitbucket.org/ws/repo/pull-requests/7"),
-                             {"state": "merged", "reviews": 3, "checks": None})
-            self.assertEqual(run.call_args.args[0][-4:], ["view", "7", "--repo", "ws/repo"])
         with patch.object(self.z, "run", return_value=subprocess.CompletedProcess([], 1, "", "no")):
             self.assertIsNone(self.z.pr_snapshot("https://github.com/o/r/pull/1"))
-        self.assertIsNone(self.z.pr_snapshot("https://example.com/x"))
+        with patch.object(self.z, "run") as run:
+            for other in ("https://example.com/x", "https://bitbucket.org/ws/repo/pull-requests/7"):
+                self.assertIsNone(self.z.pr_snapshot(other))
+            run.assert_not_called()
 
     def test_pr_polling_reports_merge_new_reviews_and_failing_checks_only(self):
         conn = self.session()

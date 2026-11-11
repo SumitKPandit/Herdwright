@@ -9,7 +9,7 @@ pr = _load.load("zed-pr")
 
 
 def make(**kw):
-    base = {"forge": "github", "url": "https://github.com/o/r/pull/1", "state": "OPEN", "draft": True,
+    base = {"url": "https://github.com/o/r/pull/1", "state": "OPEN", "draft": True,
             "title": "MENT-1 | Add thing", "base": "main", "head": "abc", "author": "me", "conflicts": False,
             "changes_requested": False, "checks": {"passing": 2, "failing": [], "pending": []}, "reviewers": ["a", "b"]}
     base.update(kw)
@@ -18,10 +18,10 @@ def make(**kw):
 
 class PrTests(unittest.TestCase):
     def test_parse_url(self):
-        self.assertEqual(pr.parse_url("https://github.com/o/r/pull/7/files"), ("github", "o/r", 7))
-        self.assertEqual(pr.parse_url("https://bitbucket.org/ws/s/pull-requests/3"), ("bitbucket", "ws/s", 3))
-        with self.assertRaises(pr.PrLookupError):
-            pr.parse_url("https://example.com/x")
+        self.assertEqual(pr.parse_url("https://github.com/o/r/pull/7/files"), ("o/r", 7))
+        for other in ("https://example.com/x", "https://bitbucket.org/ws/s/pull-requests/3"):
+            with self.assertRaises(pr.PrLookupError):
+                pr.parse_url(other)
 
     def test_github_check_summary(self):
         s = pr.summarize_github_checks([

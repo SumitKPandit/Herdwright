@@ -1227,7 +1227,7 @@ def close_workspace(ws_id):
 
 def pr_snapshot(url):
     """State of a PR as {"state": open|merged|closed, "reviews": n (reviews + comments), "checks": failing|passing|pending|None},
-    or None if it can't be read. GitHub through `gh`, Bitbucket through bin/bb; no model tokens."""
+    or None if it can't be read. GitHub through `gh`; no model tokens."""
     try:
         if "github.com" in url:
             r = run(["gh", "pr", "view", url, "--json", "state,reviews,comments,statusCheckRollup"], check=False)
@@ -1241,15 +1241,6 @@ def pr_snapshot(url):
                       "pending" if any(x in ("", "PENDING", "IN_PROGRESS", "QUEUED", "EXPECTED") for x in results) else "passing")
             return {"state": d["state"].lower(), "reviews": len(d.get("reviews") or []) + len(d.get("comments") or []),
                     "checks": checks}
-        m = re.match(r"https://bitbucket\.org/([^/]+/[^/]+)/pull-requests/(\d+)", url)
-        if m:
-            r = run([str(ZED_HOME / "bin" / "bb"), "pr", "view", m.group(2), "--repo", m.group(1)], check=False)
-            if r.returncode:
-                return None
-            d = json.loads(r.stdout)
-            state = {"OPEN": "open", "MERGED": "merged"}.get(d.get("state"), "closed")
-            return {"state": state, "reviews": (d.get("comment_count") or 0) + (d.get("approvals") or 0),
-                    "checks": "failing" if d.get("build_failed") else None}
     except (ValueError, KeyError, OSError):
         pass
     return None
@@ -1609,7 +1600,7 @@ def scan_working(conn, s, alerts):
     return f"S{s['id']} T{s['task_id']} {s['agent']} · new ZED:{block['kind']} while still working\n{record_block(conn, s, block)}"
 
 
-PR_POLL_SECONDS = 300  # how often the watcher looks at a session's open PR (gh / bin/bb: no model tokens)
+PR_POLL_SECONDS = 300  # how often the watcher looks at a session's open PR (gh: no model tokens)
 OPEN_PRS = ("SELECT * FROM sessions WHERE pr_url IS NOT NULL AND status!='closed' AND external=0 "
             "AND COALESCE(pr_state,'open')='open'")
 

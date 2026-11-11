@@ -12,7 +12,7 @@
 <!-- One line per account Zed or its workers use: what it is, the handle, how it's connected,
      how to verify it, and when it was last verified. Never put secrets here. -->
 - GitHub: `<handle>` via `gh` (verify: `gh auth status`). Verified <date>.
-- <Bitbucket / GitLab / Jira / Confluence / Linear / Slack / ...>: <handle>, connected via <MCP server /
+- <ticket tracker / wiki / chat / ...>: <handle>, connected via <MCP server /
   CLI / Keychain item `<service>`>, verify with <command>. Verified <date>.
 
 ## How they work

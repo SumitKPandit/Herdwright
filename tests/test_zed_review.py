@@ -178,7 +178,7 @@ class DraftTests(unittest.TestCase):
         self.assertIn("verdict is blockers but no finding is a blocker", self.problems(GOOD_DRAFT.replace("[blocker]", "[should-fix]")))
 
     def test_anything_addressed_to_a_pr_is_refused(self):
-        for line in ("Run: gh pr review 12 --approve", "bb pr comment 3 'hi'", "curl https://api.bitbucket.org/2.0/repositories/a/b/pullrequests/9/comments", "/approve"):
+        for line in ("Run: gh pr review 12 --approve", "gh pr comment 3 -b 'hi'", "curl https://api.github.com/repos/a/b/pulls/9/comments", "/approve"):
             self.assertTrue([p for p in self.problems(GOOD_DRAFT + line + "\n") if "never posted" in p], line)
 
     def test_cli(self):

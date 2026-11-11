@@ -67,7 +67,7 @@ class PlanGateTests(unittest.TestCase):
             self.assertTrue(zedlib.step_exempt(self.steps(f"- [ ] 1. {title}")[0]), title)
         for title in ("Re-run M1-M3, all tests, commit (no push), zed-employee finish", "Commit (no push), zed-employee finish",
                       "Merge profile/sumit (keep both COMMANDS entries) and run full suite", "Merge hook: refuses unvetted merge, accepts vetted (~10m)",
-                      "Push/PR gate: gh/bb/zed-pr and `git push` in a worker worktree"):
+                      "Push/PR gate: gh/zed-pr and `git push` in a worker worktree"):
             self.assertFalse(zedlib.step_exempt(self.steps(f"- [ ] 1. {title}")[0]), title)
 
     def test_open_steps_split_into_blocking_and_exempt(self):

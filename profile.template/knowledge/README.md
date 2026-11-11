@@ -12,4 +12,4 @@
 | `people.md` | Team members, reviewers, account handles | Zed + workers raising PRs |
 | `repos/<repo>.md` | Practical how-to per repo: setup, running, test logins, QA paths, gotchas | Workers on that repo |
 | `../config/projects.json` | Machine-readable repo list: paths, base branches, worktree root | `bin/zed` |
-| `../config/settings.json` | Tool settings (e.g. Bitbucket Keychain item) | `bin/bb` |
+| `../config/settings.json` | Tool settings (git guard: protected branches, commit format) | `bin/zed-guard` |
