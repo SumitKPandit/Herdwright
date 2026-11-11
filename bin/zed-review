@@ -190,8 +190,17 @@ def render_facts(d):
     return zedlib.cap_lines(lines, limit=100)
 
 
+def load_zed_pr():
+    return SourceFileLoader("zed_pr", str(BIN / "zed-pr")).load_module()
+
+
 def fetch_diff(url):
     """The PR's diff text, through `gh`."""
+    zed_pr = load_zed_pr()
+    try:
+        zed_pr.require_github_pr_url(url)
+    except zed_pr.PrLookupError as e:
+        raise RuntimeError(str(e))
     r = zedlib.run_bounded(["gh", "pr", "diff", url], timeout=90)
     if not r.ok:
         raise RuntimeError(f"gh pr diff failed: {(r.stderr or r.stdout).strip()[:300]}")
@@ -199,7 +208,7 @@ def fetch_diff(url):
 
 
 def ci_line(url):
-    zed_pr = SourceFileLoader("zed_pr", str(BIN / "zed-pr")).load_module()
+    zed_pr = load_zed_pr()
     try:
         return zed_pr.render_state(zed_pr.fetch(url))[0]
     except Exception as e:  # CI is one fact among many; a failed lookup must not hide the rest

@@ -11,7 +11,7 @@ import _load
 
 qa = _load.load("zed-qa")
 
-BRIEF = """# Brief — T9 · MENT-9 · Export
+BRIEF = """# Brief — T9 · ABC-9 · Export
 
 ## Goal
 Export the table.

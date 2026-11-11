@@ -3,6 +3,7 @@
 
 Ported from firstmate's fm-pr-state / fm-pr-health / fm-pr-poll. It never posts, approves, marks ready or merges:
 outward actions stay with the worker or the user.
+firstmate: Copyright (c) 2026 Kun Chen, MIT licence, see THIRD_PARTY_LICENSES.md.
 
 Usage
   zed-pr state <pr-url> [--json]
@@ -16,8 +17,7 @@ Usage
       and that the user's reviewers were requested (default list: GitHub handles in profile knowledge/people.md).
       exit 0 ready · 1 problems listed · 2 lookup error
 
-Waiting never exceeds the Bash tool's 600 s limit
-with the default --timeout.
+Waiting never exceeds the Bash tool's 600 s limit with the default --timeout.
 """
 import argparse
 import json
@@ -40,11 +40,9 @@ class PrLookupError(Exception):
     pass
 
 
-def parse_url(url):
-    m = GH_URL.match(url)
-    if not m:
+def require_github_pr_url(url):
+    if not GH_URL.match(url):
         raise PrLookupError(f"not a GitHub PR URL: {url}")
-    return m.group(1), int(m.group(2))
 
 
 def summarize_github_checks(rollup):
@@ -71,7 +69,7 @@ def summarize_github_checks(rollup):
 
 
 def fetch(url):
-    parse_url(url)
+    require_github_pr_url(url)
     fields = "state,isDraft,title,baseRefName,headRefOid,mergeable,reviewDecision,statusCheckRollup,reviewRequests,latestReviews,author"
     r = zedlib.run_bounded(["gh", "pr", "view", url, "--json", fields], timeout=60)
     if not r.ok:
@@ -193,8 +191,7 @@ def ready_problems(pr, title_pattern, base, reviewers):
 
 def cmd_ready(a, fetcher=fetch, handles=people_github_handles):
     pr = fetcher(a.url)
-    reviewers = [r.strip().lower() for r in a.reviewers.split(",") if r.strip()] if a.reviewers is not None else (
-        handles())
+    reviewers = [r.strip().lower() for r in a.reviewers.split(",") if r.strip()] if a.reviewers is not None else handles()
     problems = ready_problems(pr, a.title_pattern, a.base, reviewers)
     out = {"url": a.url, "ready": not problems, "problems": problems}
     zedlib.emit(out, a.json, lambda d: [("ready: " if d["ready"] else "NOT ready: ") + d["url"]] + ["  - " + p for p in d["problems"]])

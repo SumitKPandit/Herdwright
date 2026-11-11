@@ -5,6 +5,16 @@
     "commit_example": null
   },
   "worker": {
-    "deny_tools": []
+    "deny_tools": [
+      "mcp__claude_ai_Atlassian_MCP__addGraphContext",
+      "mcp__claude_ai_Atlassian_MCP__addOrEditJiraIssueComment",
+      "mcp__claude_ai_Atlassian_MCP__createConfluenceContent",
+      "mcp__claude_ai_Atlassian_MCP__createJiraIssue",
+      "mcp__claude_ai_Atlassian_MCP__editJiraIssue",
+      "mcp__claude_ai_Atlassian_MCP__executeDestructive",
+      "mcp__claude_ai_Atlassian_MCP__executeWrite",
+      "mcp__claude_ai_Atlassian_MCP__transitionJiraIssue",
+      "mcp__claude_ai_Atlassian_MCP__updateConfluenceContent"
+    ]
   }
 }

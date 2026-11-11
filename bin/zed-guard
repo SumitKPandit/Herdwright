@@ -4,6 +4,7 @@
 Ported from firstmate's fm-git-push-guard / fm-tangle-lib / fm-lock-lib / fm-guard. The rules (profile rules.md):
 never commit to, push to, or rebase base/release/deploy branches; never force-push; commits follow
 the user's format (default `TICKET-ID | Description`). Everything here is local; nothing is sent anywhere.
+firstmate: Copyright (c) 2026 Kun Chen, MIT licence, see THIRD_PARTY_LICENSES.md.
 
 Usage
   zed-guard install <worktree> [--ticket ABC-123 | --no-commit-format] [--protected a,b,...] [--repo NAME --base BRANCH]
@@ -196,7 +197,8 @@ def cmd_hook(a):
             return 1
     elif a.name == "commit-msg":
         lines = Path(a.args[0]).read_text().splitlines() if a.args and Path(a.args[0]).exists() else []
-        msg = commit_message_problem((lines or [""])[0].strip(), cfg.get("ticket"), cfg.get("commit_format", True),
+        ticket = cfg.get("ticket") or cfg.get("jira")  # "jira": the key a guard installed before the rename wrote
+        msg = commit_message_problem((lines or [""])[0].strip(), ticket, cfg.get("commit_format", True),
                                      cfg.get("commit_pattern"), cfg.get("commit_example"))
         if msg:
             print(f"zed-guard: {msg}", file=sys.stderr)

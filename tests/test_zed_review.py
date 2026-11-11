@@ -142,6 +142,13 @@ class PrepTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("gh pr diff failed", err)
 
+    def test_cli_names_a_url_that_is_not_a_github_pr_without_asking_gh(self):
+        with patch.object(review.zedlib, "run_bounded") as gh:
+            code, _, err = self.run_main("prep", "https://bitbucket.org/ws/s/pull-requests/3")
+        self.assertEqual(code, 2)
+        self.assertIn("not a GitHub PR URL: https://bitbucket.org/ws/s/pull-requests/3", err)
+        gh.assert_not_called()
+
 
 GOOD_DRAFT = """# Review of PR 12
 

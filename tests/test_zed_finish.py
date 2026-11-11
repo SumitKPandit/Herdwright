@@ -56,7 +56,7 @@ class AssignDb(ProfileCase):
         with self.zed_shell():
             return run("finish", "--as-zed", *argv)
 
-    def seed(self, hat, status="running", tid=20, branch="story/ment-20-guard", repo="api", verdict=None,
+    def seed(self, hat, status="running", tid=20, branch="story/abc-20-guard", repo="api", verdict=None,
              pr=None, pr_state=None, plan=None, core_start=None):
         """`plan` is the session's own plan file name under briefs/ (what spawn records from the brief)."""
         self.n += 1

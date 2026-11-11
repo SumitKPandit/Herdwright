@@ -6,7 +6,7 @@
 ## Context
 - Repo: {{REPO}} ({{ROLE}})
 - Worktree: {{WORKTREE}}   Branch: {{BRANCH}}   Base / PR target: {{BASE}}
-- Ticket: {{TICKET}}
+- Ticket: {{TICKET_LINE}}
 - Related repos / sessions: <FILL: other repos or sessions this work depends on or feeds into, or "none">
 
 ## Decisions already made by the user

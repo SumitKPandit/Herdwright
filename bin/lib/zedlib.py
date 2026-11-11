@@ -1,4 +1,5 @@
-"""Shared helpers for the bin/zed-<name> scripts (ported from firstmate's fm-timeout-lib, fm-line-cap-lib).
+"""Shared helpers for the bin/zed-<name> scripts. Ported from firstmate's fm-timeout-lib / fm-line-cap-lib.
+firstmate: Copyright (c) 2026 Kun Chen, MIT licence, see THIRD_PARTY_LICENSES.md.
 
 Each script puts this folder on sys.path itself and imports what it needs.
 Nothing here touches the task DB for writing; the scripts are read-only unless they say otherwise.
@@ -196,7 +197,7 @@ def parse_plan_steps(text):
 
 
 # A step is exempt from the completion gate when what it does is merge, push or raise a PR: those happen after review
-# and QA (user, 2026-10-27). Say so explicitly with the marker `[after-review]` in the step's title, or start the title
+# and QA. Say so explicitly with the marker `[after-review]` in the step's title, or start the title
 # with the action itself ("Merge the branch", "Push to origin", "Raise a draft PR against main"). A bare word anywhere
 # in the title ("Push notification handler", "Implement merge logic") never exempts a step.
 AFTER_REVIEW_MARKER = "[after-review]"

@@ -10,18 +10,18 @@ pr = _load.load("zed-pr")
 
 def make(**kw):
     base = {"url": "https://github.com/o/r/pull/1", "state": "OPEN", "draft": True,
-            "title": "MENT-1 | Add thing", "base": "main", "head": "abc", "author": "me", "conflicts": False,
+            "title": "ABC-1 | Add thing", "base": "main", "head": "abc", "author": "me", "conflicts": False,
             "changes_requested": False, "checks": {"passing": 2, "failing": [], "pending": []}, "reviewers": ["a", "b"]}
     base.update(kw)
     return base
 
 
 class PrTests(unittest.TestCase):
-    def test_parse_url(self):
-        self.assertEqual(pr.parse_url("https://github.com/o/r/pull/7/files"), ("o/r", 7))
+    def test_only_a_github_pr_url_is_accepted(self):
+        pr.require_github_pr_url("https://github.com/o/r/pull/7/files")
         for other in ("https://example.com/x", "https://bitbucket.org/ws/s/pull-requests/3"):
             with self.assertRaises(pr.PrLookupError):
-                pr.parse_url(other)
+                pr.require_github_pr_url(other)
 
     def test_github_check_summary(self):
         s = pr.summarize_github_checks([
@@ -100,8 +100,8 @@ class PrTests(unittest.TestCase):
         from pathlib import Path
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "people.md"
-            p.write_text("## PR reviewers\nGitHub handles to request on every PR once ready:\n`dgavey`, `Madhu-864`\n")
-            self.assertEqual(pr.people_github_handles(p), ["dgavey", "madhu-864"])
+            p.write_text("## PR reviewers\nGitHub handles to request on every PR once ready:\n`octo-a`, `Octo-B`\n")
+            self.assertEqual(pr.people_github_handles(p), ["octo-a", "octo-b"])
             self.assertEqual(pr.people_github_handles(Path(d) / "missing.md"), [])
 
 
