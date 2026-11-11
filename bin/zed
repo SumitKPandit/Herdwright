@@ -19,17 +19,23 @@ Run `zed help` for commands.
 """
 import argparse
 import atexit
+import base64
 import contextlib
 import fcntl
 import json
 import os
 import re
+import secrets
+import shlex
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
 import time
+import urllib.request
+from collections import namedtuple
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -49,6 +55,7 @@ CORE_WORKER_RULES = ZED_HOME / "templates" / "worker-rules.md"
 PROFILE_RULES = PROFILE_DIR / "rules.md"
 LOCK_PATH = PROFILE_DIR / ".cache" / "zed.lock"
 CLAUDE_CONFIG_PATH = PROFILE_DIR / "config" / "claude.json"
+OPENCODE_CONFIG_PATH = PROFILE_DIR / "config" / "opencode.json"
 WATCH_STATE_PATH = PROFILE_DIR / ".cache" / "watch-state.json"
 SPEND_LEDGER_PATH = PROFILE_DIR / "db" / "spend.jsonl"
 WAKE_QUEUE_PATH = PROFILE_DIR / ".cache" / "wake-queue.json"
@@ -56,28 +63,42 @@ WATCHER_PID_PATH = PROFILE_DIR / ".cache" / "watch.pid"
 WATCHER_LOCK_PATH = PROFILE_DIR / ".cache" / "watch.lock"
 ARM_STAMP_PATH = PROFILE_DIR / ".cache" / "hook-arm.stamp"  # touched by the Stop hook's arm step on every firing
 
-# Claude Code is the only runtime. The model, effort ceiling and capacity live in <profile>/config/claude.json.
+# Claude Code workers: the model, effort ceiling and capacity live in <profile>/config/claude.json.
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
-# Dialogs Claude Code can show before its first prompt, in the order it shows them: (name, text on screen, keys, note).
+# Dialogs Claude Code can show before its first prompt, in the order it shows them.
 # Claude Code documents no flag or setting that answers either one in advance (code.claude.com/docs/en/memory and
 # /cli-reference, read 2026-11-11; dialogs observed on v2.1.322), so spawn answers them with key presses.
 # - Folder trust: Zed created the worktree from a configured repo, so it accepts ("No, exit" is preselected).
 # - External imports: a CLAUDE.md, here or in a parent folder, imports a file from outside the worktree. Zed declines
 #   ("No, disable external imports" is preselected): the worktree's own instructions and their imports still load, only
 #   files outside it are refused, so a folder the user never delegated cannot instruct the worker.
+StartDialog = namedtuple("StartDialog", "name text keys note")  # text: what the screen shows; keys: the answer
 START_DIALOGS = [
-    ("folder trust", "Yes, I trust this folder", ["down", "enter"], "accepted"),
-    ("external CLAUDE.md imports", "No, disable external imports", ["enter"],
-     "declined: instructions imported from outside the worktree are not loaded"),
+    StartDialog("folder trust", "Yes, I trust this folder", ["down", "enter"], "accepted"),
+    StartDialog("external CLAUDE.md imports", "No, disable external imports", ["enter"],
+                "declined: instructions imported from outside the worktree are not loaded"),
 ]
 # e.g. "You've hit your session limit · resets 3pm", "Usage limit reached · continuing automatically at …"
 LIMIT_PATTERNS = [r"hit your \w+ limit", r"usage limit reached", r"limit reached\b.*\breset"]
-# OpenCode is an opt-in worker runtime (`spawn runtime=opencode`) and a possible host for Zed itself. Its TUI takes --model and
-# --auto but no effort or session-name flag, and shows no trust dialog (opencode.ai/docs/cli, 2026-11-03).
+# OpenCode V2 workers (`spawn runtime=opencode`), observed on v2.2.7. Each worker has its own server (`opencode serve`),
+# because only a server started with the worker's OPENCODE_CONFIG_DIR loads its deny plugin and rules, and a `--standalone`
+# TUI opens no port spawn could reach. The server is a background job of the worker's pane: OpenCode runs the worker's
+# shell commands in the server, and a hat session is known by the pane that hosts its processes (zedemployee.process_pane).
+# The TUI takes no model flag, so spawn creates the session through the server's API with the model and variant from
+# <profile>/config/opencode.json and attaches the TUI to it. The TUI showed no dialog at start.
+OPENCODE_DEFAULTS = {"model": "opencode/nemotron-3.5-super-vl-free", "variant": "xhigh"}
 OPENCODE_START_TIMEOUT_MS = 180000
+OPENCODE_SERVER_SECONDS = 60  # for the server to answer after `opencode serve`
+OPENCODE_CANARY_SECONDS = 180  # for the one model turn that makes the canary call
+# The repository section of the worker rules names Claude Code's files; this says what OpenCode reads instead.
+OPENCODE_RULES_NOTE = """## You run on OpenCode
+
+Where these rules name `CLAUDE.md`, `.claude/rules` or Claude Code settings: OpenCode reads the repository's `AGENTS.md`
+files and its skills (`.opencode/skills`, `.claude/skills`) instead, and does not read `CLAUDE.md`.
+"""
 
 TASK_STATES = ["intake", "active", "waiting_user", "in_review", "pr_open", "parked", "done", "cancelled"]
-SESSION_STATES = ["running", "waiting_user", "finished", "closed"]
+SESSION_STATES = ["running", "waiting_user", "finished", "failed", "closed"]  # failed: never briefed (start checks)
 OPEN_TASK_STATES = ["intake", "active", "waiting_user", "in_review", "pr_open", "parked"]
 # How STATUS.md groups the open tasks; finished ones (done, cancelled) follow separately.
 TASK_GROUPS = [("In progress", ["active", "waiting_user", "in_review"]),
@@ -104,7 +125,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   agent TEXT NOT NULL,
   workspace_id TEXT,
   pane_id TEXT,
-  claude_session_id TEXT,  -- Claude Code's own session id
+  claude_session_id TEXT,  -- the runtime's own session id (Claude Code's, or OpenCode's `ses_…`)
   pr_url TEXT,
   status TEXT NOT NULL DEFAULT 'running',
   external INTEGER NOT NULL DEFAULT 0,
@@ -354,6 +375,11 @@ def read_json(path, default):
         return default
     except json.JSONDecodeError as e:
         die(f"invalid JSON in {path}: {e}")
+
+
+def opencode_config():
+    """The profile's config/opencode.json: {"model" ("provider/model"), "variant"}; a missing key takes OPENCODE_DEFAULTS."""
+    return OPENCODE_DEFAULTS | read_json(OPENCODE_CONFIG_PATH, {})
 
 
 def pick_model(kind):
@@ -811,46 +837,130 @@ def claude_launch(agent, model, effort, kit):
             "--settings", str(kit["claude_settings"])]
 
 
-def opencode_launch(model):
-    """CLI arguments to start an OpenCode worker: --auto approves whatever its config does not deny; the rules reach it
-    through the brief prompt (it has no system-prompt flag) and the deny policy through its plugin (hat_kit)."""
-    return [*(["--model", model] if model else []), "--auto"]
-
-
 def hat_kit(hat, sid, agent, worktree, runtime="claude"):
     """What a hat session starts with, written under profile/.cache/hats/: the rules (worker rules and the hat's
     charter) and the hat's deny policy (bin/zed-deny as a Claude hook, or as an OpenCode plugin when `runtime` is
-    opencode). Returns the kit for claude_launch, plus the env that identifies the session to its hooks and scripts."""
+    opencode). Returns the kit for claude_launch or start_opencode, plus the env that identifies the session to its
+    hooks and scripts.
+    OpenCode: the kit's directory is the OPENCODE_CONFIG_DIR of the worker's own server. Its AGENTS.md (the rules) is
+    loaded as OpenCode's global instruction file, next to the repository's own AGENTS.md, which is never touched."""
     out = PROFILE_DIR / ".cache" / "hats"
     out.mkdir(parents=True, exist_ok=True)
     kit = {"rules": out / f"{agent}-rules.md"}
-    kit["rules"].write_text(worker_rules_text() + "\n\n" + emp.hat_charter(hat))
-    env = [f"ZED_HAT={hat}", f"ZED_SESSION=S{sid}", f"ZED_WORKTREE={worktree}",
-           f"ZED_PROFILE_DIR={PROFILE_DIR}"]  # so zed-employee and zed-deny find this profile, wherever it is
+    rules = worker_rules_text() + "\n\n" + emp.hat_charter(hat)
+    kit["rules"].write_text(rules)
+    identity = {"ZED_HAT": hat, "ZED_SESSION": f"S{sid}", "ZED_WORKTREE": str(worktree),
+                "ZED_PROFILE_DIR": str(PROFILE_DIR)}  # so zed-employee and zed-deny find this profile, wherever it is
+    env = [f"{k}={v}" for k, v in identity.items()]
+    deny_tools = (zedlib.settings().get("worker") or {}).get("deny_tools") or []
     if runtime == "opencode":
-        env.append(f"OPENCODE_CONFIG_DIR={zeddeny.opencode_plugin(out / f'{agent}-opencode', ZED_HOME)}")
+        config_dir = zeddeny.opencode_plugin(out / f"{agent}-opencode", ZED_HOME, identity, deny_tools)
+        (config_dir / "AGENTS.md").write_text(rules + "\n\n" + OPENCODE_RULES_NOTE)
+        with socket.socket() as s:  # a port that is free now, for this worker's server
+            s.bind(("127.0.0.1", 0))
+            kit["opencode_server"] = {"url": f"http://127.0.0.1:{s.getsockname()[1]}", "password": secrets.token_urlsafe(24),
+                                      "log": config_dir / "server.log"}
+        env += [f"OPENCODE_CONFIG_DIR={config_dir}", f"OPENCODE_PASSWORD={kit['opencode_server']['password']}"]
     else:
         kit["claude_settings"] = out / f"{agent}-settings.json"
-        deny_tools = (zedlib.settings().get("worker") or {}).get("deny_tools") or []
         kit["claude_settings"].write_text(json.dumps(zeddeny.claude_settings(ZED_HOME, deny_tools), indent=2) + "\n")
     return kit, env
 
 
-def answer_start_dialogs(agent, seconds=60):
-    """Answer each of START_DIALOGS the CLI shows at startup, once, until the agent is idle. Returns (the dialogs
-    answered, whether the agent became ready). A screen that shows none of them before any was answered is left
-    blocked for Zed to inspect. Herdr reports "blocked" for every dialog alike, so the screen tells them apart."""
-    answered = []
-    for _ in range(int(seconds / 0.5)):
-        screen = run(["herdr", "agent", "read", agent, "--source", "visible"], check=False).stdout
-        dialog = next((d for d in START_DIALOGS if d not in answered and d[1] in screen), None)
-        if dialog:
-            run(["herdr", "agent", "send-keys", agent, *dialog[2]], check=False)
+def opencode_api(server, method, path, body=None, timeout=30):
+    """One request to a worker's own OpenCode server (`server`: its url and password); returns the response's `data`.
+    Raises OSError when the server does not answer or refuses."""
+    token = base64.b64encode(f"opencode:{server['password']}".encode()).decode()
+    req = urllib.request.Request(f"{server['url']}/api{path}", method=method,
+                                 data=None if body is None else json.dumps(body).encode(),
+                                 headers={"content-type": "application/json", "authorization": f"Basic {token}"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        text = r.read().decode()
+    answer = json.loads(text) if text.strip() else None
+    return answer["data"] if isinstance(answer, dict) and "data" in answer else answer
+
+
+def opencode_canary(server, session):
+    """Prove the deny plugin is live in this worker's server, in its own session: ask for one shell call that every hat
+    denies and read back what happened to it. Returns "" when the call was stopped with zed-deny's reason, else why the
+    guard is not proven. OpenCode has no API that runs a tool without the model (its `session.shell` is the user's
+    shell and passes no tool hook), so the call takes one model turn; a model that makes no call proves nothing, and
+    the worker is refused."""
+    command = f"{zeddeny.CANARY_COMMAND} {secrets.token_hex(4)}"
+    opencode_api(server, "POST", f"/session/{session}/prompt", {"text": (
+        f"Startup check. Call the shell tool exactly once with exactly this command: {command}\n"
+        "It is expected to be refused. Do not retry it and do nothing else. Then reply with the single word CHECKED.")})
+    opencode_api(server, "POST", f"/experimental/session/{session}/wait", timeout=OPENCODE_CANARY_SECONDS)  # the turn's end
+    calls = [part for m in opencode_api(server, "GET", f"/session/{session}/message") for part in m.get("content") or []
+             if part.get("type") == "tool" and ((part.get("state") or {}).get("input") or {}).get("command", "").strip() == command]
+    if not calls:
+        return "the model made no canary call, so the deny plugin is not proven live"
+    state = calls[0]["state"]
+    reason = str((state.get("error") or {}).get("message", ""))
+    if state.get("status") == "error" and f"canary: `{command}`" in reason:
+        return ""
+    return f"the canary call `{command}` was not denied (status {state.get('status')}): the deny plugin is not live"
+
+
+def start_opencode(agent, pane_id, worktree, kit, model, variant):
+    """Start an OpenCode worker: its own server as a background job of its pane (it ends with the pane), a session
+    created with `model` and `variant`, the canary, then the TUI attached to that session. Returns (the OpenCode
+    session id or None, "" or why the worker must not get its brief). The TUI is not started for a worker whose guard
+    is not proven."""
+    server = kit["opencode_server"]
+    port = server["url"].rsplit(":", 1)[1]
+    run(["herdr", "pane", "run", pane_id, f"opencode serve --print-logs --log-level warn --hostname 127.0.0.1 --port {port} "
+                                          f"> {shlex.quote(str(server['log']))} 2>&1 &"])  # the log names a plugin that failed to load
+    session, deadline = None, time.monotonic() + OPENCODE_SERVER_SECONDS
+    try:
+        while True:
+            try:
+                opencode_api(server, "GET", "/info", timeout=5)
+                break
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(1)
+        provider, _, name = model.partition("/")
+        wanted = {"providerID": provider, "id": name, "variant": variant}
+        created = opencode_api(server, "POST", "/session", {"location": {"directory": str(worktree)}, "title": agent, "model": wanted})
+        session = created["id"]
+        if created.get("model") != wanted:
+            return session, f"the session runs {created.get('model')}, not the configured {wanted}"
+        if problem := opencode_canary(server, session):
+            return session, problem
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        return session, f"its OpenCode server at {server['url']} failed ({type(e).__name__}: {e}); its log: {server['log']}"
+    r = run(["herdr", "agent", "start", agent, "--kind", "opencode", "--pane", pane_id, "--timeout", str(OPENCODE_START_TIMEOUT_MS),
+             "--", "--server", server["url"], "--auto", "--session", session], check=False)
+    if r.returncode:
+        return session, f"agent start did not report ready (pane {pane_id}). Inspect with: herdr agent read {agent}\n{r.stderr}"
+    return session, ""
+
+
+def start_dialog_on_screen(agent):
+    """The one of START_DIALOGS the agent's screen shows, or None."""
+    screen = run(["herdr", "agent", "read", agent, "--source", "visible"], check=False).stdout
+    return next((d for d in START_DIALOGS if d.text in screen), None)
+
+
+def answer_start_dialogs(agent, started, seconds=60):
+    """Answer each of START_DIALOGS the CLI shows at startup, once, until the agent is ready for its brief. Returns
+    (the dialogs answered, whether it is ready). `started`: herdr's own start reported ready. Ready means herdr says
+    idle AND none of the dialogs is on screen, answered or not: herdr reports "blocked" for every dialog alike and may
+    report idle between two of them, so the screen has the last word. Herdr not ready and none of the dialogs on screen
+    before any was answered: left blocked for Zed to inspect. `seconds` bounds the wait by the clock."""
+    answered, deadline = [], time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        idle = herdr_json(["agent", "get", agent])["result"]["agent"]["agent_status"] == "idle"
+        dialog = start_dialog_on_screen(agent)  # read after the status: a dialog drawn since then still shows
+        if dialog and dialog not in answered:
+            run(["herdr", "agent", "send-keys", agent, *dialog.keys], check=False)
             answered.append(dialog)
-        elif not answered:
-            break
-        elif herdr_json(["agent", "get", agent])["result"]["agent"]["agent_status"] == "idle":
+        elif idle and not dialog:
             return answered, True
+        elif not (dialog or answered or started):
+            break
         time.sleep(0.5)
     return answered, False
 
@@ -954,7 +1064,8 @@ def cmd_spawn(args):
     """spawn <task-id> repo=<repo> base=<branch> branch=<branch> brief=<path> [name=<agent>]
     [model=] [effort=] [kind=<worktype|investigation|design…>] [from=<start point>]
     [hat=build|review|qa]   the hat the session wears (default build)
-    [runtime=claude|opencode]   claude (default); opencode takes model= only (no effort) and no claude.json policy"""
+    [runtime=claude|opencode]   claude (default); opencode takes its model and variant from config/opencode.json
+                                (model= overrides the model; no effort=, no claude.json policy)"""
     if not args or args[0] in ("-h", "--help"):
         print(cmd_spawn.__doc__)
         sys.exit(0 if args else 1)
@@ -984,7 +1095,7 @@ def cmd_spawn(args):
     if runtime not in RUNTIMES:
         die(f"runtime={runtime} is not supported: {' or '.join(RUNTIMES)}")
     if runtime == "opencode" and "effort" in kv:
-        die("runtime=opencode takes no effort= (its TUI has no effort flag)")
+        die("runtime=opencode takes no effort=: set \"variant\" in the profile's config/opencode.json")
     try:
         hat_kind = emp.load_manifest(hat)["kind"]
         zedgates.check_assignment(conn, hat, tid, kv["repo"], kv["branch"],
@@ -998,10 +1109,12 @@ def cmd_spawn(args):
     if runtime == "claude":
         require_capacity(conn, tid)
         model, effort, model_why = pick_model(kind)
-    else:  # claude.json names Claude models and efforts: an OpenCode worker gets only what spawn is given
-        model, effort, model_why = None, None, "OpenCode default"
+    else:  # claude.json names Claude models and efforts: an OpenCode worker's model and variant are in opencode.json
+        model, effort, model_why = opencode_config()["model"], opencode_config()["variant"], "opencode.json"
     if "model" in kv:
         model, model_why = kv["model"], "given to spawn"
+    if runtime == "opencode" and not re.fullmatch(r"[^/\s]+/\S+", model):
+        die(f"an OpenCode model is written provider/model, not '{model}'")
     if "effort" in kv:
         effort, model_why = kv["effort"], model_why + "; effort given to spawn"
     if effort and effort not in EFFORTS:
@@ -1047,45 +1160,56 @@ def cmd_spawn(args):
     # 2. herdr workspace + agent CLI
     require_lock()
     kit, env = hat_kit(hat, sid, agent, worktree, runtime)
-    cli_args = opencode_launch(model) if runtime == "opencode" else claude_launch(agent, model, effort, kit)
     label = f"T{tid} {t['ticket'] or ''} {kv['repo']}".strip()
     ws = herdr_json(["workspace", "create", "--cwd", str(worktree), "--label", label, "--no-focus",
                      *[a for e in env for a in ("--env", e)]])["result"]
     ws_id, pane_id = ws["workspace"]["workspace_id"], ws["root_pane"]["pane_id"]
     time.sleep(1.5)  # let the shell reach its prompt
-    r = run(["herdr", "agent", "start", agent, "--kind", runtime, "--pane", pane_id,
-             "--timeout", str(OPENCODE_START_TIMEOUT_MS if runtime == "opencode" else 60000), "--", *cli_args], check=False)
-    ready = r.returncode == 0
-    if not ready and "agent_not_ready" in r.stderr and runtime == "claude":
-        dialogs, ready = answer_start_dialogs(agent)
-        for name, _, _, note in dialogs:
-            print(f"startup dialog: {name}: {note}")
+    runtime_session = None
+    if runtime == "opencode":
+        runtime_session, failure = start_opencode(agent, pane_id, worktree, kit, model, effort)
+    else:
+        r = run(["herdr", "agent", "start", agent, "--kind", "claude", "--pane", pane_id, "--timeout", "60000",
+                 "--", *claude_launch(agent, model, effort, kit)], check=False)
+        dialogs, ready = [], False
+        if r.returncode == 0 or "agent_not_ready" in r.stderr:
+            dialogs, ready = answer_start_dialogs(agent, started=r.returncode == 0)
+        for dialog in dialogs:
+            print(f"startup dialog: {dialog.name}: {dialog.note}")
+        failure = "" if ready else f"agent start did not report ready (pane {pane_id}). Inspect with: herdr agent read {agent}\n{r.stderr}"
     ts = now()
     cur = conn.execute(
-        "INSERT INTO sessions(id,task_id,repo,base,branch,worktree,agent,workspace_id,pane_id,status,model,effort,"
-        "brief,scratch,hat,plan,core_start,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (sid, tid, kv["repo"], kv["base"], kv["branch"], str(worktree), agent, ws_id, pane_id, "running",
-         model, effort, str(brief), str(scratch) if scratch else None, hat,
+        "INSERT INTO sessions(id,task_id,repo,base,branch,worktree,agent,workspace_id,pane_id,claude_session_id,status,"
+        "model,effort,brief,scratch,hat,plan,core_start,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (sid, tid, kv["repo"], kv["base"], kv["branch"], str(worktree), agent, ws_id, pane_id, runtime_session,
+         # an OpenCode worker that failed its start checks is never briefed; a Claude one may wait on a dialog Zed answers
+         "failed" if failure and runtime == "opencode" else "running", model, effort, str(brief), str(scratch) if scratch else None, hat,
          str(zedlib.brief_plan_file(brief.read_text()) or PROFILE_DIR / "briefs" / f"T{tid}-{kv['repo']}-plan.md"),
          zedlib.core_tree(worktree) if hat in zedgates.GATE_HATS else None, ts, ts))
     sid = cur.lastrowid
     conn.execute("UPDATE tasks SET status='active' WHERE id=? AND status IN ('intake','parked')", (tid,))
     log_event(conn, tid, "spawn", f"S{sid} {agent} on {kv['repo']} {kv['branch']} ← {kv['base']} ({worktree}); "
-              f"model {model or 'default'} effort {effort or 'default'} ({model_why})"
-              + f"; wearing {hat}" + (f"; runtime {runtime}" if runtime != "claude" else ""))
+              f"model {model or 'default'} {'variant' if runtime == 'opencode' else 'effort'} {effort or 'default'} ({model_why})"
+              + f"; wearing {hat}" + (f"; runtime {runtime}, session {runtime_session}" if runtime == "opencode" else "")
+              + (f"; FAILED to start: {failure.splitlines()[0]}" if failure else ""))
     touch_task(conn, tid)
     conn.commit()
     write_status(conn)
-    if not ready:
-        die(f"S{sid}: agent start did not report ready (pane {pane_id}). Inspect with: herdr agent read {agent}\n{r.stderr}")
+    if failure:
+        die(f"S{sid}: {failure}" + (f"\nNo brief was handed over and S{sid} is marked failed; its workspace {ws_id} is left open "
+                                    f"to inspect (server log: {kit['opencode_server']['log']}). Remove it with: bin/zed close S{sid}"
+                                    if runtime == "opencode" else ""))
 
     # 3. hand over the brief
     require_lock()
     STATUS_DIR.mkdir(parents=True, exist_ok=True)
+    # OpenCode already loaded the rules as an instruction file (hat_kit): naming the file would load them twice
+    rules = ("Your worker rules are already in your instructions (they begin '# You are a Zed worker'). Read"
+             if runtime == "opencode" else f"Read your worker rules at {kit['rules']} and")
     text = (f"You are the engineering worker, NOT the Zed coordinator, for session S{sid} / task T{tid}. "
             f"Do not onboard, acquire the coordinator lock, or change the coordinator's task database. "
             f"Zed's home is {ZED_HOME}; the user's profile is {PROFILE_DIR}. "
-            f"Read your worker rules at {kit['rules']} and your brief at {brief}, then "
+            f"{rules} your brief at {brief}, then "
             f"{PROFILE_DIR}/knowledge/repos/{kv['repo']}.md if it exists. "
             f"Your status file is {STATUS_DIR}/S{sid}.log (see 'Report status' in your rules). ")
     text += hat_intro(conn, hat, tid)
@@ -1093,7 +1217,14 @@ def cmd_spawn(args):
         text += (f"Your scratch folder is {scratch}: keep every clone, download and temporary file there and nowhere "
                  f"else in the project; Zed deletes it when your session closes. ")
     text += "Then start."
-    prompt_ok, prompt_error = prompt_worker(agent, text)
+    if runtime == "opencode":  # admitted by the worker's server, not typed into its screen: the message id is the receipt
+        try:
+            admitted = opencode_api(kit["opencode_server"], "POST", f"/session/{runtime_session}/prompt", {"text": text})
+            prompt_ok, prompt_error = bool(admitted["id"]), ""
+        except (OSError, KeyError, TypeError) as e:
+            prompt_ok, prompt_error = False, f"{type(e).__name__}: {e}"
+    else:
+        prompt_ok, prompt_error = prompt_worker(agent, text)
     print(json.dumps({"task": f"T{tid}", "session": f"S{sid}", "agent": agent, "pane": pane_id,
                       "workspace": ws_id, "worktree": str(worktree), "model": model,
                       "effort": effort, "model_choice": model_why, "prompt_ok": prompt_ok}))
@@ -2222,7 +2353,8 @@ def cmd_help(args):
                                      picks the effort by claude.json effort_by_kind; beyond max_running the task is queued (exit 75)
         [hat=build|review|qa]        the hat the session wears (default build);
                                      refused for a second writer on a worktree or a review/qa before the build's plan is done
-        [runtime=claude|opencode]    claude by default; opencode (opt-in) takes model= only, no effort, no max_running
+        [runtime=claude|opencode]    claude by default; opencode (opt-in) takes model and variant from
+                                     config/opencode.json (model= overrides), no effort=, no max_running
   session list | session set <S|agent> key=value... (status pr_url claude_session_id pane_id workspace_id base brief)
   close <S|agent> [keep-worktree] [keep-scratch] [force]
                                      (external sessions are only untracked; the landed-work test below

@@ -40,7 +40,7 @@ about you lives in **`profile/`**, which exists only on your profile branch.
 | `bin/zed-employee`, `bin/zed-deny` | Hats for workers (build, review, qa): `zed spawn hat=`, `zed-employee finish`, each hat's deny policy |
 | `bin/zed-core-sync` | Carries core improvements from your profile branch to `main` |
 | `profile.template/` | The skeleton onboarding copies to `profile/` |
-| `profile/` | Yours: `profile.md`, `rules.md` (your rules for workers), `lessons.md`, `knowledge/`, `config/` (incl. `claude.json`: model, effort ceiling, max running sessions), `briefs/`, `db/`, `STATUS.md` |
+| `profile/` | Yours: `profile.md`, `rules.md` (your rules for workers), `lessons.md`, `knowledge/`, `config/` (incl. `claude.json`: model, effort ceiling, max running sessions; `opencode.json`: model and variant of OpenCode workers), `briefs/`, `db/`, `STATUS.md` |
 
 Only one Claude session per profile acts as Zed: it holds the profile's lock
 (`bin/zed lock`). Other sessions opened in the checkout are read-only, or can take over.
@@ -56,6 +56,17 @@ sessions, Zed's and yours included; `spawn` queues the rest). Without the file C
 `config/settings.json` holds `guard` (protected branches, commit format) and `worker.deny_tools`: the tool names workers
 may not call. The template lists the write tools of one tracker and wiki connector so a new profile's workers cannot
 post outward; replace them with your own connector's write tools.
+
+`profile.template/config/opencode.json` holds the `model` (`provider/model`) and `variant` an OpenCode worker runs
+(`spawn runtime=opencode`); without the file, or a key, the values in that template apply. `max_running` and the spend
+ledger do not cover OpenCode workers.
+
+An OpenCode worker (V2; tested on v2.2.7) gets its own server, a background job of its herdr pane, whose config
+directory holds Zed's rules (`AGENTS.md`) and the hat's deny plugin; spawn creates its session with the model and
+variant, and before the brief asks the worker for one call that every hat denies. A worker whose guard does not stop
+that call gets no brief and its session is marked `failed`. It reads the repository's `AGENTS.md` files and skills
+(`.opencode/skills`, `.claude/skills`); it does not read `CLAUDE.md`. `tests/smoke_opencode.py` runs the start, the
+canary, denied calls and the `AGENTS.md` pick-up against the installed `opencode` (not part of the default test run).
 
 Tests: `python3 -B -m unittest discover -s tests -v`.
 
@@ -80,7 +91,8 @@ you like. Merging `main` never edits your profile files; if you edited core file
 any merge.
 - **Runtimes.** If you cloned `main` while it supported Pi or Copilot: both are gone, and so is runtime selection
   (order, fallback, handoff, `runtimes.json`). Workers run on Claude Code with model and effort from
-  `config/claude.json`; `spawn runtime=opencode` (with `model=`, no effort) starts an OpenCode worker instead.
+  `config/claude.json`; `spawn runtime=opencode` starts an OpenCode worker instead (model and variant from
+  `config/opencode.json`, no effort).
   OpenCode has no blocking stop hook, so an OpenCode worker has no stop-guard: Zed's watcher flags a `done:` without `finish`.
 - **Hats, not names.** Workers wear a hat (`spawn hat=build|review|qa`, default build); `spawn employee=` is refused.
   Whether a reviewer or QA authored the code is checked when the session finishes, not when it is assigned. A hat session

@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import subprocess
 import tempfile
 import types
@@ -69,7 +70,8 @@ class AssignCase(unittest.TestCase):
 
         def fake_herdr_json(args):
             self.herdr_calls.append(["herdr", *args])
-            return {"result": {"workspace": {"workspace_id": "w1"}, "root_pane": {"pane_id": "p1"}}}
+            return {"result": {"workspace": {"workspace_id": "w1"}, "root_pane": {"pane_id": "p1"},
+                               "agent": {"agent_status": "idle"}}}
 
         for target, kwargs in (("run", {"side_effect": fake_run}), ("herdr_json", {"side_effect": fake_herdr_json}),
                                ("require_lock", {}), ("require_capacity", {}),
@@ -262,32 +264,172 @@ class WatcherAndStartTests(AssignCase):
                                   "git guard (zed-guard)"])
 
 
+class FakeOpenCodeServer:
+    """Stands in for `opencode_api`: a worker's server as OpenCode v2.2.7 answered in real runs (session creation echoes
+    the model; a tool call stopped by a plugin comes back with status `error` and the thrown text as the message, one
+    that ran with status `completed`; `executed` is false in both). `guard`: live (the deny plugin stops the canary), dead (the call runs) or silent (the model makes no call)."""
+
+    def __init__(self, case, guard="live", up=True, model=None):
+        self.case, self.guard, self.up, self.model, self.calls = case, guard, up, model, []
+
+    def __call__(self, server, method, path, body=None, timeout=30):
+        self.calls.append((method, path, body))
+        self.case.herdr_calls.append(["api", method, path])  # one timeline with the herdr calls
+        if not self.up:
+            raise ConnectionRefusedError("connection refused")
+        if (method, path) == ("POST", "/session"):
+            return {"id": "ses_test1", "model": self.model or body["model"]}
+        if path.endswith("/prompt"):
+            return {"id": f"msg_{len(self.calls)}"}
+        if path.endswith("/message"):
+            command = re.search(r"zed-deny-canary \w+", self.prompts()[0]).group(0)
+            if self.guard == "silent":
+                return [{"type": "assistant", "content": [{"type": "text", "text": "CHECKED"}]}]
+            denied = self.guard == "live"
+            state = {"status": "error" if denied else "completed", "input": {"command": command}}
+            if denied:
+                state["error"] = {"type": "unknown", "message": f"zed-deny: canary: `{command}` is denied to every hat, so the guard is live"}
+            return [{"type": "user", "text": "x"}, {"type": "assistant", "content": [
+                {"type": "reasoning", "text": "x"}, {"type": "tool", "name": "shell", "executed": False, "state": state}]}]
+        return {"version": "2.2.7"} if path == "/info" else None
+
+    def prompts(self):
+        return [body["text"] for method, path, body in self.calls if path.endswith("/prompt")]
+
+
 class OpenCodeTests(AssignCase):
+    def setUp(self):
+        super().setUp()
+        self.server = FakeOpenCodeServer(self)
+        patcher = patch.object(self.z, "opencode_api", side_effect=lambda *a, **k: self.server(*a, **k))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.kit_dir = self.profile / ".cache" / "hats" / "review-t20-opencode"
+
     def start_call(self):
         return next(c for c in self.herdr_calls if c[:3] == ["herdr", "agent", "start"])
+
+    def after_dashes(self, call):
+        return call[call.index("--") + 1:]
+
+    def refused_start(self, text, **extra):
+        """A spawn that created the session row but refused the worker: nothing started in its pane, no brief."""
+        self.refused("review", text, runtime="opencode", **extra)
+        s = self.conn.execute("SELECT * FROM sessions").fetchone()
+        self.assertEqual(s["status"], "failed")
+        self.assertNotIn(["herdr", "agent", "start"], [c[:3] for c in self.herdr_calls])
+        self.assertFalse([p for p in self.server.prompts() if "engineering worker" in p])
+        self.mock_prompt_worker.assert_not_called()
+        self.assertIn(f"No brief was handed over and S{s['id']} is marked failed", self.output.getvalue())
+        self.assertIn("FAILED to start", self.conn.execute("SELECT text FROM events WHERE kind='spawn'").fetchone()[0])
+        return s
 
     def test_claude_stays_the_default_and_other_runtimes_are_refused(self):
         self.spawn("build")
         start = self.start_call()
         self.assertEqual((start[start.index("--kind") + 1], start[start.index("--timeout") + 1]), ("claude", "60000"))
+        self.assertEqual(self.server.calls, [])
         self.refused("review", "runtime=pi is not supported: claude or opencode", runtime="pi")
-        self.refused("review", "takes no effort=", runtime="opencode", effort="high")
+        self.refused("review", 'takes no effort=: set "variant"', runtime="opencode", effort="high")
 
-    def test_runtime_opencode_starts_opencode_with_the_plugin_dir_and_no_claude_policy(self):
+    def test_runtime_opencode_starts_a_private_server_a_session_with_model_and_variant_and_the_tui(self):
         self.mock_require_capacity.reset_mock()
-        sid = self.spawn("review", runtime="opencode", model="anthropic/claude-sonnet-5-5")
+        sid = self.spawn("review", runtime="opencode")
+        workspace = next(c for c in self.herdr_calls if c[:3] == ["herdr", "workspace", "create"])
+        env = dict(workspace[i + 1].split("=", 1) for i, a in enumerate(workspace) if a == "--env")
+        self.assertEqual(env["OPENCODE_CONFIG_DIR"], str(self.kit_dir))
+        self.assertTrue(env["OPENCODE_PASSWORD"])
+        serve = next(c for c in self.herdr_calls if c[:3] == ["herdr", "pane", "run"])
+        # in the worker's own pane, in the background: its shell commands run in this server, and the pane is its identity
+        port = re.fullmatch(rf"opencode serve --print-logs --log-level warn --hostname 127\.0\.0\.1 --port (\d+) > {re.escape(str(self.kit_dir))}/server\.log 2>&1 &", serve[4]).group(1)
+        self.assertEqual(serve[3], "p1")
+        self.assertNotIn(["herdr", "pane", "split"], [c[:3] for c in self.herdr_calls])
+        url = f"http://127.0.0.1:{port}"
+        created = next(body for method, path, body in self.server.calls if (method, path) == ("POST", "/session"))
+        self.assertEqual(created, {"location": {"directory": str(self.worktree)}, "title": "review-t20",
+                                   "model": {"providerID": "opencode", "id": "nemotron-3.5-super-vl-free", "variant": "xhigh"}})
         start = self.start_call()
         self.assertEqual((start[start.index("--kind") + 1], start[start.index("--timeout") + 1]), ("opencode", "180000"))
-        self.assertEqual(start[start.index("--") + 1:], ["--model", "anthropic/claude-sonnet-5-5", "--auto"])  # no -n, no --settings
-        workspace = next(c for c in self.herdr_calls if c[:3] == ["herdr", "workspace", "create"])
-        env = [workspace[i + 1] for i, a in enumerate(workspace) if a == "--env"]
-        out = self.profile / ".cache" / "hats"
-        self.assertIn(f"OPENCODE_CONFIG_DIR={out / 'review-t20-opencode'}", env)
-        self.assertTrue((out / "review-t20-opencode" / "plugins" / "zed-deny.js").is_file())
-        self.assertFalse((out / "review-t20-settings.json").exists())
+        self.assertEqual(self.after_dashes(start), ["--server", url, "--auto", "--session", "ses_test1"])  # no --model: the TUI has none
+        s = self.session(sid)
+        self.assertEqual((s["status"], s["claude_session_id"], s["model"], s["effort"]),
+                         ("running", "ses_test1", "opencode/nemotron-3.5-super-vl-free", "xhigh"))
+        event = self.conn.execute("SELECT text FROM events WHERE kind='spawn'").fetchone()[0]
+        self.assertIn("model opencode/nemotron-3.5-super-vl-free variant xhigh (opencode.json)", event)
+        self.assertIn("runtime opencode, session ses_test1", event)
+        self.assertFalse((self.kit_dir.parent / "review-t20-settings.json").exists())
         self.mock_require_capacity.assert_not_called()  # claude.json's max_running counts Claude sessions
-        self.assertIn("runtime opencode", self.conn.execute("SELECT text FROM events WHERE kind='spawn'").fetchone()[0])
-        self.assertEqual(self.session(sid)["effort"], None)
+
+    def test_model_and_variant_come_from_the_profiles_opencode_json_and_model_can_be_given(self):
+        self.refused("review", "an OpenCode model is written provider/model, not 'nemotron'", runtime="opencode", model="nemotron")
+        (self.profile / "config" / "opencode.json").write_text(json.dumps({"model": "acme/m-1", "variant": "low"}))
+        self.spawn("review", runtime="opencode")
+        self.assertEqual(self.server.calls[1][2]["model"], {"providerID": "acme", "id": "m-1", "variant": "low"})
+        (self.profile / "config" / "opencode.json").write_text(json.dumps({"variant": "high"}))  # a missing key keeps its default
+        self.server.calls.clear()
+        sid = self.spawn("qa", runtime="opencode", model="acme/sub/m-2")
+        self.assertEqual(self.server.calls[1][2]["model"], {"providerID": "acme", "id": "sub/m-2", "variant": "high"})
+        self.assertIn("model acme/sub/m-2 variant high (given to spawn)",
+                      self.conn.execute("SELECT text FROM events WHERE kind='spawn' ORDER BY id DESC").fetchone()[0])
+        self.assertEqual(self.session(sid)["model"], "acme/sub/m-2")
+
+    def test_the_canary_is_denied_before_the_tui_starts_and_the_brief_goes_through_the_server(self):
+        sid = self.spawn("review", runtime="opencode")
+        canary, brief = self.server.prompts()
+        self.assertRegex(canary, r"exactly this command: zed-deny-canary [0-9a-f]{8}\n")
+        order = [c[:3] for c in self.herdr_calls]
+        self.assertLess(order.index(["api", "GET", "/session/ses_test1/message"]), order.index(["herdr", "agent", "start"]))
+        self.assertIn(["api", "POST", "/experimental/session/ses_test1/wait"], order)  # the canary's turn has ended
+        self.assertIn(f"You are the engineering worker, NOT the Zed coordinator, for session S{sid}", brief)
+        self.assertIn("Your worker rules are already in your instructions", brief)  # loaded from the config dir, not read twice
+        self.assertNotIn("review-t20-rules.md", brief)
+        self.assertLess(order.index(["herdr", "agent", "start"]), len(order) - 1 - order[::-1].index(["api", "POST", "/session/ses_test1/prompt"]))
+        self.mock_prompt_worker.assert_not_called()  # nothing is typed into the screen
+        self.assertIn('"prompt_ok": true', self.output.getvalue())
+
+    def test_a_worker_whose_guard_is_not_live_gets_no_brief_and_is_marked_failed(self):
+        self.server.guard = "dead"  # the plugin did not load: OpenCode runs the call
+        s = self.refused_start("was not denied (status completed): the deny plugin is not live")
+        self.assertEqual(s["claude_session_id"], "ses_test1")
+
+    def test_a_model_that_makes_no_canary_call_proves_nothing(self):
+        self.server.guard = "silent"
+        self.refused_start("the model made no canary call, so the deny plugin is not proven live")
+
+    def test_a_server_that_does_not_answer_fails_the_worker(self):
+        self.server.up = False
+        with patch.object(self.z, "OPENCODE_SERVER_SECONDS", 0):
+            s = self.refused_start("its OpenCode server at http://127.0.0.1:")
+        self.assertIsNone(s["claude_session_id"])
+
+    def test_a_session_on_another_model_fails_the_worker(self):
+        self.server.model = {"providerID": "opencode", "id": "something-else"}
+        self.refused_start("the session runs {'providerID': 'opencode', 'id': 'something-else'}, not the configured")
+
+    def test_a_tui_that_does_not_become_ready_fails_the_worker_after_the_canary(self):
+        stubbed = self.mock_run.side_effect
+        self.mock_run.side_effect = lambda cmd, **k: (subprocess.CompletedProcess(cmd, 1, "", "agent_not_ready")
+                                                      if cmd[:3] == ["herdr", "agent", "start"] else stubbed(cmd, **k))
+        self.refused("review", "agent start did not report ready", runtime="opencode")
+        self.assertEqual(self.conn.execute("SELECT status FROM sessions").fetchone()[0], "failed")
+        self.assertEqual(len(self.server.prompts()), 1)  # the canary only
+
+    def test_rules_reach_the_worker_through_its_config_dir_and_the_repos_agents_md_is_untouched(self):
+        (self.worktree / "AGENTS.md").write_text("# The repository's own instructions\n")
+        (self.profile / "config" / "settings.json").write_text(json.dumps({"worker": {"deny_tools": ["tracker_createIssue"]}}))
+        self.spawn("review", runtime="opencode")
+        rules = (self.kit_dir / "AGENTS.md").read_text()  # OpenCode loads <OPENCODE_CONFIG_DIR>/AGENTS.md as its global file
+        self.assertIn("# You are a Zed worker", rules)
+        self.assertIn("# Hat: review", rules)
+        self.assertIn("## You run on OpenCode", rules)
+        self.assertIn("does not read `CLAUDE.md`", rules)
+        self.assertTrue(rules.startswith((self.kit_dir.parent / "review-t20-rules.md").read_text()))
+        self.assertEqual((self.worktree / "AGENTS.md").read_text(), "# The repository's own instructions\n")
+        self.assertEqual(zedlib.git(self.worktree, "status", "--porcelain").stdout.strip(), "?? AGENTS.md")  # nothing else written
+        plugin = (self.kit_dir / "plugins" / "zed-deny" / "index.js").read_text()
+        self.assertIn('"ZED_HAT": "review"', plugin)
+        self.assertIn(f'"ZED_WORKTREE": "{self.worktree}"', plugin)
+        self.assertIn('const DENY_TOOLS = ["tracker_createIssue"];', plugin)
 
     def test_session_identity_and_the_auto_armed_watcher_follow_opencode_env(self):
         with patch.dict(os.environ, {"OPENCODE_SESSION_ID": "oc-1", "OPENCODE_PID": "4242"}, clear=False):

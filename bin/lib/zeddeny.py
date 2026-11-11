@@ -1,6 +1,6 @@
 """A hat's `deny` policy (templates/hats/<hat>/capabilities.json). The decision lives here; the hook script
 bin/zed-deny only feeds it a tool call. It runs as a PreToolUse command hook in a per-session settings file
-(`claude --settings`) or from an OpenCode plugin (`opencode_plugin`); git itself is guarded by bin/zed-guard, which spawn installs in the worktree.
+(`claude --settings`) or from an OpenCode V2 plugin (`opencode_plugin`); git itself is guarded by bin/zed-guard, which spawn installs in the worktree.
 """
 import json
 import os
@@ -14,11 +14,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import zedgates  # noqa: E402
 import zedshell  # noqa: E402
 
-EDIT_TOOLS = {"edit", "write", "notebookedit", "multiedit", "apply_patch"}
-PATH_KEYS = ("file_path", "path", "notebook_path", "filePath")
-# OpenCode's apply_patch names its files in marker lines of `patchText` (verified in opencode.ai/docs/plugins, 2026-11-03)
+# Tool names are compared in lower case. Claude Code: Edit, Write, NotebookEdit, MultiEdit, Bash, Agent, Task. OpenCode V2
+# (`ctx.tool.list()` on v2.2.7): edit and write (`path`), patch (`patchText`), shell (`command`, `workdir`), subagent.
+EDIT_TOOLS = {"edit", "write", "notebookedit", "multiedit", "patch"}
+PATH_KEYS = ("file_path", "path", "notebook_path")
+# OpenCode's patch names its files in marker lines of `patchText` (opencode.ai/docs/tools, read 2026-11-11)
 PATCH_FILE = re.compile(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$", re.M)
-SUBAGENT_TOOLS = {"agent", "task"}
+SHELL_TOOLS = {"bash", "shell"}
+SUBAGENT_TOOLS = {"agent", "task", "subagent"}
+# The shell command spawn asks a new OpenCode worker to run: every hat denies it, so a call that comes back denied with
+# this reason proves the guard is live in that worker's server (a plugin that fails to load blocks nothing).
+CANARY_COMMAND = "zed-deny-canary"
 # What a hat session's identity rests on (`zedemployee.caller_session`): a Bash command may not set or unset them
 IDENTITY_VARS = ("ZED_SESSION", "ZED_HAT", "ZED_PROFILE_DIR", "HERDR_PANE_ID")
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
@@ -191,7 +197,7 @@ def shell_problem(cmd, manifest, worktree, profile, cwd):
 
 
 def edit_paths(tool_input):
-    """The files an edit tool call touches: the path in its input, or the files named in an apply_patch's text."""
+    """The files an edit tool call touches: the path in its input, or the files named in a patch's text."""
     if not isinstance(tool_input, dict):
         return []
     if isinstance(tool_input.get("patchText"), str):
@@ -220,8 +226,14 @@ def _decide(payload, manifest, worktree, profile):
         for path in paths:
             if pattern := denied_path(path, manifest["deny"]["edit"], worktree, profile, cwd, manifest["deny"].get("except", [])):
                 return f"editing {path} is denied to this hat ({pattern})"
-    elif tool == "bash":
-        return shell_problem(inp.get("command", "") if isinstance(inp, dict) else "", manifest, worktree, profile, cwd)
+    elif tool in SHELL_TOOLS:
+        inp = inp if isinstance(inp, dict) else {}
+        cmd = inp.get("command", "")
+        if cmd.split()[:1] == [CANARY_COMMAND]:
+            return f"canary: `{cmd.strip()}` is denied to every hat, so the guard is live"
+        if inp.get("workdir"):  # OpenCode's shell runs in `workdir`, relative to the session's directory
+            cwd = os.path.join(cwd, os.path.expanduser(inp["workdir"]))
+        return shell_problem(cmd, manifest, worktree, profile, cwd)
     elif tool in SUBAGENT_TOOLS and manifest["subagents"] == "none":
         return "this hat starts no subagents"
     return None
@@ -247,23 +259,34 @@ def claude_settings(zed_home, deny_tools=()):
                       "Stop": [{"hooks": [{"type": "command", "command": stop_command(zed_home), "timeout": 10}]}]}}
 
 
-def opencode_plugin(directory, zed_home):
-    """A per-session OpenCode config directory (point OPENCODE_CONFIG_DIR at it) whose plugin runs bin/zed-deny before
-    every tool call and throws its reason when the call is denied. OpenCode has no blocking Stop hook (`session.idle`
-    cannot hold a turn open), so there is no stop-guard here; a finish that was skipped still shows up as `done:` without
-    a recorded finish."""
-    plugin = Path(directory) / "plugins" / "zed-deny.js"
+def opencode_plugin(directory, zed_home, env, deny_tools=()):
+    """A per-session OpenCode config directory (the worker's server runs with OPENCODE_CONFIG_DIR pointing at it) whose
+    V2 plugin runs bin/zed-deny before every tool call and throws its reason when the call is denied; a throw stops the
+    call. `env` (ZED_HAT, ZED_SESSION, ZED_WORKTREE, ZED_PROFILE_DIR) is written into the plugin, so the policy does
+    not depend on how the server was started; `deny_tools` are tool names no worker may call (see `claude_settings`).
+    A zed-deny that cannot run denies. OpenCode has no hook that can refuse a turn end, so there is no stop-guard here;
+    a finish that was skipped still shows up as `done:` without a recorded finish. V1 is not supported: a V1 server
+    ignores this file, and spawn's canary then refuses the worker."""
+    plugin = Path(directory) / "plugins" / "zed-deny" / "index.js"
     plugin.parent.mkdir(parents=True, exist_ok=True)
-    plugin.write_text(f"""import {{ spawnSync }} from "node:child_process";
+    plugin.write_text(f"""import {{ Plugin }} from "@opencode/plugin";
+import {{ spawnSync }} from "node:child_process";
 
-export const ZedDeny = async ({{ directory }}) => ({{
-  "tool.execute.before": async (input, output) => {{
-    const res = spawnSync({json.dumps(hook_command(zed_home))}, [], {{
-      input: JSON.stringify({{ tool_name: input.tool, tool_input: output.args, cwd: directory }}),
-      encoding: "utf-8",
-      env: process.env,
+const ENV = {json.dumps(dict(env))};
+const DENY_TOOLS = {json.dumps(list(deny_tools))};
+
+export default Plugin.define({{
+  id: "zed.deny",
+  async setup(ctx) {{
+    await ctx.tool.hook("execute.before", (event) => {{
+      if (DENY_TOOLS.includes(event.tool)) throw new Error(`zed-deny: the tool ${{event.tool}} is denied to a worker`);
+      const res = spawnSync({json.dumps(hook_command(zed_home))}, [], {{
+        input: JSON.stringify({{ tool_name: event.tool, tool_input: event.input, cwd: ctx.location.directory }}),
+        encoding: "utf-8",
+        env: {{ ...process.env, ...ENV }},
+      }});
+      if (res.status !== 0) throw new Error((res.stderr || res.stdout || "zed-deny could not run").trim());
     }});
-    if (res.status !== 0) throw new Error((res.stderr || res.stdout || "zed-deny could not run").trim());
   }},
 }});
 """)

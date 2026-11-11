@@ -50,7 +50,47 @@ class StartupDialogTests(AssignCase):
     def test_no_dialog_sends_no_keys(self):
         self.assertEqual(self.spawn_through(), [])
         self.assertNotIn("startup dialog", self.output.getvalue())
-        self.assertNotIn(["herdr", "agent", "read"], [c[:3] for c in self.herdr_calls])
+        self.assertIn(["herdr", "agent", "read"], [c[:3] for c in self.herdr_calls])  # idle alone is not ready: the screen is read
+        self.mock_prompt_worker.assert_called_once()
+
+    def idle_with(self, *screens):
+        """herdr reports the agent started and idle the whole time, whatever `screens` show in order before the prompt
+        (the gap the T99 review named: idle between two dialogs). Returns the keys sent, one list per press."""
+        screens, keys = [*screens, READY_SCREEN], []
+        stubbed_run = self.mock_run.side_effect
+
+        def run(cmd, check=True, cwd=None):
+            if cmd[:3] == ["herdr", "agent", "read"]:
+                return subprocess.CompletedProcess(cmd, 0, screens[0], "")
+            if cmd[:3] == ["herdr", "agent", "send-keys"]:
+                keys.append(cmd[4:])
+                screens.pop(0)
+            return stubbed_run(cmd, check=check, cwd=cwd)
+
+        self.mock_run.side_effect = run
+        self.mock_prompt_worker.side_effect = lambda agent, text: self.assertEqual(screens, [READY_SCREEN]) or (True, "")
+        return keys
+
+    def test_idle_with_a_dialog_on_screen_is_not_ready_the_dialog_is_answered_before_the_brief(self):
+        keys = self.idle_with(IMPORT_SCREEN)
+        self.spawn("build")
+        self.assertEqual(keys, [["enter"]])
+        self.assertIn("startup dialog: external CLAUDE.md imports: declined", self.output.getvalue())
+        self.mock_prompt_worker.assert_called_once()  # typed only once the prompt, not the dialog, was on screen
+
+    def test_idle_between_two_dialogs_answers_both_before_the_brief(self):
+        keys = self.idle_with(TRUST_SCREEN, IMPORT_SCREEN)
+        self.spawn("build")
+        self.assertEqual(keys, [["down", "enter"], ["enter"]])
+        self.mock_prompt_worker.assert_called_once()
+
+    def test_idle_with_a_dialog_that_never_closes_gets_no_brief(self):
+        keys = self.idle_with(IMPORT_SCREEN, IMPORT_SCREEN, IMPORT_SCREEN)  # the same dialog is still there after the answer
+        with patch.object(self.z.time, "monotonic", side_effect=iter(range(0, 10000, 10)).__next__), self.assertRaises(SystemExit):
+            self.spawn("build")
+        self.assertEqual(keys, [["enter"]])  # answered once, never pressed again
+        self.assertIn("agent start did not report ready", self.output.getvalue())
+        self.mock_prompt_worker.assert_not_called()
 
     def test_folder_trust_is_accepted(self):
         self.assertEqual(self.spawn_through(TRUST_SCREEN), [["down", "enter"]])
@@ -78,7 +118,8 @@ class StartupDialogTests(AssignCase):
 
         self.mock_run.side_effect = run
         self.mock_herdr_json.side_effect = lambda args: {"result": {"agent": {"agent_status": "blocked"}}}
-        self.assertEqual(self.z.answer_start_dialogs("build-t20", seconds=2), ([self.z.START_DIALOGS[1]], False))
+        with patch.object(self.z.time, "monotonic", side_effect=iter(range(0, 10000, 10)).__next__):  # 10 s a look
+            self.assertEqual(self.z.answer_start_dialogs("build-t20", started=False, seconds=60), ([self.z.START_DIALOGS[1]], False))
         self.assertEqual(keys, [["enter"]])
 
     def test_an_unknown_dialog_is_left_blocked_for_zed(self):
