@@ -282,13 +282,13 @@ class FakeOpenCodeServer:
         if path.endswith("/prompt"):
             return {"id": f"msg_{len(self.calls)}"}
         if path.endswith("/message"):
-            command = re.search(r"zed-deny-canary \w+", self.prompts()[0]).group(0)
+            command = re.search(r"zed-(deny|pretool)-canary \w+", self.prompts()[0]).group(0)
             if self.guard == "silent":
                 return [{"type": "assistant", "content": [{"type": "text", "text": "CHECKED"}]}]
             denied = self.guard == "live"
             state = {"status": "error" if denied else "completed", "input": {"command": command}}
             if denied:
-                state["error"] = {"type": "unknown", "message": f"zed-deny: canary: `{command}` is denied to every hat, so the guard is live"}
+                state["error"] = {"type": "unknown", "message": f"{command.rsplit('-', 1)[0]}: canary: `{command}` is denied, so the guard is live"}
             return [{"type": "user", "text": "x"}, {"type": "assistant", "content": [
                 {"type": "reasoning", "text": "x"}, {"type": "tool", "name": "shell", "executed": False, "state": state}]}]
         return {"version": "2.2.7"} if path == "/info" else None
@@ -372,6 +372,18 @@ class OpenCodeTests(AssignCase):
         self.assertIn("model acme/sub/m-2 variant high (given to spawn)",
                       self.conn.execute("SELECT text FROM events WHERE kind='spawn' ORDER BY id DESC").fetchone()[0])
         self.assertEqual(self.session(sid)["model"], "acme/sub/m-2")
+
+    def test_a_variant_outside_claudes_effort_list_is_passed_on_and_claude_still_refuses_it(self):
+        (self.profile / "config" / "opencode.json").write_text(json.dumps({"model": "acme/m-1", "variant": "minimal"}))
+        sid = self.spawn("review", runtime="opencode")
+        self.assertEqual(self.server.calls[1][2]["model"], {"providerID": "acme", "id": "m-1", "variant": "minimal"})
+        self.assertEqual(self.session(sid)["effort"], "minimal")
+        self.refused("qa", "invalid effort 'minimal'", effort="minimal")  # Claude Code's own list still applies to it
+
+    def test_the_default_model_and_variant_are_the_profile_templates(self):
+        template = json.loads((_load.HOME / "profile.template" / "config" / "opencode.json").read_text())
+        self.assertEqual(self.z.opencode_config(), template)  # no opencode.json in this profile
+        self.assertEqual(set(template), {"model", "variant"})
 
     def test_the_canary_is_denied_before_the_tui_starts_and_the_brief_goes_through_the_server(self):
         sid = self.spawn("review", runtime="opencode")

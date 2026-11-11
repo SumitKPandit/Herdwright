@@ -44,6 +44,6 @@ description: Intake a new piece of work from the user, record it, write a brief 
    `<FILL …>` left.
 4. `bin/zed spawn <T> repo=<repo> base=<base> branch=<branch per profile/rules.md> brief=profile/briefs/T<id>-<repo>.md`
    (branch description: short kebab-case; confirm with the user if it isn't obvious). It picks the
-   model/effort from `config/claude.json`; its output says which and why.
-5. Make sure the watcher is running (see CLAUDE.md, Lifecycle step 3). Tell the user: T-id, session(s),
+   model from the runtime's config file; its output says which and why.
+5. Make sure the watcher is running (see the manual, "Runtime differences"). Tell the user: T-id, session(s),
    worktree, branch and model. Commit the profile.

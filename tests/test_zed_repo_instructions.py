@@ -170,9 +170,30 @@ class ToolInsideItselfTests(AssignCase):
             self.assertEqual([p.name for p in Path(tmp).rglob("*") if p.is_file()], ["profile.md"])  # no lock, no DB
 
     def test_the_manual_says_who_it_is_for_before_it_says_you_are_zed(self):
-        manual = (HOME / "CLAUDE.md").read_text()
+        manual = (HOME / "AGENTS.md").read_text()
         self.assertLess(manual.index("If `ZED_SESSION` is set"), manual.index("You are **Zed**"))
         self.assertLess(manual.index("nothing below applies to you"), manual.index("You are **Zed**"))
+
+    def test_one_manual_serves_both_runtimes(self):
+        # OpenCode reads AGENTS.md and never CLAUDE.md; Claude Code reads CLAUDE.md, which only imports the manual from
+        # inside the repo (an import from inside the repo raises no dialog; tests/smoke_opencode.py and a Claude Code
+        # run prove the loading itself)
+        self.assertEqual((HOME / "CLAUDE.md").read_text(), "@AGENTS.md\n")
+        manual = (HOME / "AGENTS.md").read_text()
+        differences = manual[manual.index("## Runtime differences"):manual.index("## Talking to the user")]
+        for part in ("**Claude Code.**", "**OpenCode.**", "`bin/zed coordinator`", "Stop\n  hooks", "`.claude/settings.json`"):
+            self.assertIn(part, differences)
+        rest = manual.replace(differences, "")
+        for runtime_only in ("Stop hook", "run_in_background", "PreToolUse", "bin/zed coordinator", "claude.json", "opencode.json"):
+            self.assertNotIn(runtime_only, rest, "runtime-specific text belongs under Runtime differences")
+        self.assertIn("Skills in `.claude/skills/` (both runtimes load them from there)", manual)
+
+    def test_the_manual_gives_one_command_per_ordered_routine(self):
+        manual = (HOME / "AGENTS.md").read_text()
+        start = manual[manual.index("**At the start of every session**"):manual.index("## One active Zed per profile")]
+        self.assertIn("run `bin/zed start` and do what it prints, nothing before it", start)
+        self.assertNotRegex(start, r"(?m)^\d+\. ")  # no numbered steps for the model to keep in order
+        self.assertIn('`bin/zed relay Q<id> "<the user\'s answer, verbatim>"`', manual)
 
 
 class LaunchTests(AssignCase):

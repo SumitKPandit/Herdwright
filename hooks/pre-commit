@@ -3,7 +3,7 @@
 # profile/. Also runs as pre-merge-commit, which catches merging a profile branch into main.
 # The always-loaded files (what every Zed session reads at start) have a word budget: a commit that touches
 # one of them fails when the total is over it. Prune, or move content into a skill (`learn` skill).
-if git diff --cached --name-only | grep -qE '^(CLAUDE\.md|playbook\.md|failure-modes\.md|profile/profile\.md|profile/lessons\.md)$'; then
+if git diff --cached --name-only | grep -qE '^(AGENTS\.md|playbook\.md|failure-modes\.md|profile/profile\.md|profile/lessons\.md)$'; then
   top=$(git rev-parse --show-toplevel)
   if [ -x "$top/bin/zed" ] && ! "$top/bin/zed" doctor --quiet; then
     echo "zed guard: always-loaded context is over its word budget (see above); prune before committing." >&2

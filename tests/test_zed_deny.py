@@ -258,6 +258,16 @@ class DecideTests(unittest.TestCase):
         self.assertIn("denied", self.call("review", "shell", command="rm a.py", workdir=str(self.wt / "src")))
         self.assertIsNone(self.call("review", "shell", command="rm a.md", workdir=str(self.evidence)))
 
+    def test_a_cd_in_a_subshell_a_pipe_or_the_background_does_not_move_the_commands_after_it(self):
+        for command in (f"(cd {self.evidence}) && touch x", f"(cd {self.evidence}; ls); rm src/a.py", f"cd {self.evidence} | touch x",
+                        f"cd {self.evidence} & touch x", f"(cd {self.evidence} && (cd /tmp)) ; echo y > x", "(cd /tmp); (touch x)"):
+            self.assertIn("denied", self.bash("review", command), command)
+        for command in (f"(cd {self.evidence} && touch x)", f"(cd {self.evidence}; (cd /tmp; ls); touch x)",
+                        f"cd {self.evidence} && (cd {self.wt}; ls) && touch x", f"ls | (cd {self.evidence} && tee x)"):
+            self.assertIsNone(self.bash("review", command), command)
+        self.assertIn("denied", self.bash("review", f"cd {self.evidence} && (cd {self.wt} && touch x)"))
+        self.assertIn("denied", self.call("review", "shell", command="(cd /tmp) && touch a.py", workdir="src"))  # OpenCode
+
     def test_the_canary_command_is_denied_to_every_hat(self):
         for hat in ("build", "review", "qa"):
             for tool in ("shell", "Bash"):
@@ -301,10 +311,15 @@ class OpenCodePluginTests(unittest.TestCase):
         script = (f'import plugin from {json.dumps(plugin.as_uri())};\n'
                   f'const hooks = {{}};\n'
                   f'await plugin.setup({{ location: {{ directory: {json.dumps(str(self.root / "wt"))} }}, '
-                  f'tool: {{ hook: async (name, callback) => {{ hooks[name] = callback; }} }} }});\n'
-                  f'try {{ await hooks["execute.before"]({{ tool: {json.dumps(tool)}, sessionID: "ses_1", agent: "build", '
-                  f'input: {json.dumps(tool_input)} }}); console.log(plugin.id + " allowed"); }}\n'
-                  f'catch (e) {{ console.log("blocked: " + e.message); }}\n')
+                  f'tool: {{ hook: async (name, callback) => {{ hooks[name] = callback; }} }}, '
+                  f'shell: {{ hook: async (name, callback) => {{ hooks["shell." + name] = callback; }} }} }});\n'
+                  + (f'const event = {{ command: {json.dumps(tool_input.get("command", ""))}, cwd: {json.dumps(tool_input.get("cwd", str(self.root / "wt")))}, '
+                     f'timeout: 1, shell: "/bin/zsh", env: {{ OPENCODE_PASSWORD: "secret", KEPT: "1" }} }};\n'
+                     f'try {{ await hooks["shell.create.before"](event); console.log(plugin.id + " allowed " + JSON.stringify(event.env)); }}\n'
+                     if tool == "(server shell)" else
+                     f'try {{ await hooks["execute.before"]({{ tool: {json.dumps(tool)}, sessionID: "ses_1", agent: "build", '
+                     f'input: {json.dumps(tool_input)} }}); console.log(plugin.id + " allowed"); }}\n')
+                  + f'catch (e) {{ console.log("blocked: " + e.message); }}\n')
         env = {k: v for k, v in os.environ.items() if not k.startswith("ZED_")}  # the server's own environment names no hat
         r = subprocess.run(["node", "--input-type=module", "-e", script], env=env, capture_output=True, text=True)
         return r.stdout.strip() or r.stderr.strip()
@@ -317,6 +332,16 @@ class OpenCodePluginTests(unittest.TestCase):
         self.assertEqual(self.before("shell", {"command": "ls"}), "zed.deny allowed")
         self.assertEqual(self.before("edit", {"path": str(self.root / "wt" / "a.py")}, env={**self.env, "ZED_HAT": "build"}),
                          "zed.deny allowed")
+
+    def test_a_shell_the_server_starts_for_any_caller_is_checked_and_never_holds_the_password(self):
+        # OpenCode v2.2.7: `POST /api/session/<id>/shell` and `POST /api/shell` pass this hook and no tool hook
+        self.assertEqual(self.before("(server shell)", {"command": "ls"}), 'zed.deny allowed {"KEPT":"1"}')
+        self.assertIn("blocked: zed-deny: `gh pr comment` is denied", self.before("(server shell)", {"command": "gh pr comment 1"}))
+        inside = self.before("(server shell)", {"command": "touch bypass.txt"})
+        self.assertIn("blocked: zed-deny:", inside)
+        self.assertIn("bypass.txt", inside)
+        self.assertIn("blocked: zed-deny:", self.before("(server shell)", {"command": "touch x", "cwd": str(self.root / "wt" / "sub")}))
+        self.assertEqual(self.before("(server shell)", {"command": "touch /tmp/x-outside"}), 'zed.deny allowed {"KEPT":"1"}')
 
     def test_tools_no_worker_may_call_are_denied_by_name(self):
         self.assertEqual(self.before("tracker_createIssue", {}, deny_tools=["tracker_createIssue"]),

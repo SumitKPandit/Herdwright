@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import zedgates  # noqa: E402
 import zedshell  # noqa: E402
+from zedshell import unresolved  # noqa: E402
 
 # Tool names are compared in lower case. Claude Code: Edit, Write, NotebookEdit, MultiEdit, Bash, Agent, Task. OpenCode V2
 # (`ctx.tool.list()` on v2.2.7): edit and write (`path`), patch (`patchText`), shell (`command`, `workdir`), subagent.
@@ -25,6 +26,7 @@ SUBAGENT_TOOLS = {"agent", "task", "subagent"}
 # The shell command spawn asks a new OpenCode worker to run: every hat denies it, so a call that comes back denied with
 # this reason proves the guard is live in that worker's server (a plugin that fails to load blocks nothing).
 CANARY_COMMAND = "zed-deny-canary"
+PRETOOL_CANARY = "zed-pretool-canary"  # the coordinator's: bin/zed-pretool denies it in every session
 # What a hat session's identity rests on (`zedemployee.caller_session`): a Bash command may not set or unset them
 IDENTITY_VARS = ("ZED_SESSION", "ZED_HAT", "ZED_PROFILE_DIR", "HERDR_PANE_ID")
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
@@ -77,14 +79,6 @@ def holds_profile(repo, profile, cwd):
         return True
     top = lambda d: subprocess.run(["git", "-C", str(d), "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip()
     return p.is_dir() and top(p) != "" and os.path.realpath(top(p)) == os.path.realpath(top(profile))
-
-
-UNRESOLVED = re.compile(r"[$`]|^~[^/]")
-
-
-def unresolved(path):
-    """True when the shell would expand `path` (variable, command substitution, `~user`), which a hook cannot follow."""
-    return bool(UNRESOLVED.search(str(path)))
 
 
 def command_denied(words, prefixes):
@@ -144,11 +138,13 @@ def shell_problem(cmd, manifest, worktree, profile, cwd):
     deny = manifest["deny"]
     patterns, exceptions = deny["edit"], deny.get("except", [])
     try:
-        cmds = zedshell.split_commands(zedshell.tokens(cmd))
+        cmds = zedshell.scoped_commands(zedshell.tokens(cmd))
     except ValueError:
         return None  # unbalanced quotes: fail open, like the other hooks
     read_only = "**" in deny["edit"]  # a hat that may not edit at all may not commit either
-    for words, _ in cmds:
+    dirs = {(): cwd}  # where each shell of the command line stands: a `cd` in a subshell or a pipe does not move the others
+    for words, scope in cmds:
+        cwd = zedshell.scope_dir(dirs, scope)
         if problem := identity_tampering(words):
             return problem
         words_before = [w for w in words if re.fullmatch(r"CDPATH=.*", w)] if words else []
@@ -157,20 +153,15 @@ def shell_problem(cmd, manifest, worktree, profile, cwd):
         if not words:
             continue
         if re.fullmatch(r"CDPATH=.*", words_before[0] if words_before else ""):
-            cwd = None  # `CDPATH=x cd y` may land anywhere
+            cwd = dirs[scope] = None  # `CDPATH=x cd y` may land anywhere
         while words and (Path(words[0]).name in ("builtin", "command") or words[0] in ("{", "then", "do", "else")):
             words = words[1:]  # a compound command's opener leaves the next word the command
         if not words:
             continue  # only an opener (`do`, `then`) before the next `;`
-        if Path(words[0]).name in ("cd", "pushd", "popd"):
+        if Path(words[0]).name in zedshell.CD_COMMANDS:
             # follow `cd <dir> && ...` so later relative targets resolve where the shell will; a target the shell
             # expands (`cd $X`, `cd -`, `popd`) leaves the cwd unknown: later relative targets cannot be checked
-            args = [w for w in words[1:] if w != "--" and not re.fullmatch(r"-[LPe@]+", w)]
-            if args and cwd is not None and not unresolved(args[0]) and args[0] != "-":
-                d = Path(os.path.expanduser(args[0]))
-                cwd = os.path.realpath(d if d.is_absolute() else Path(cwd) / d)
-            elif args or Path(words[0]).name in ("popd", "cd"):
-                cwd = None  # a bare `cd` goes home
+            dirs[scope] = zedshell.cd_target(words, cwd)
             continue
         if prefix := command_denied(words, deny["commands"]):
             return f"`{prefix}` is denied to this hat: anything outward goes to Zed as a draft"
@@ -264,6 +255,11 @@ def opencode_plugin(directory, zed_home, env, deny_tools=()):
     V2 plugin runs bin/zed-deny before every tool call and throws its reason when the call is denied; a throw stops the
     call. `env` (ZED_HAT, ZED_SESSION, ZED_WORKTREE, ZED_PROFILE_DIR) is written into the plugin, so the policy does
     not depend on how the server was started; `deny_tools` are tool names no worker may call (see `claude_settings`).
+    The same check runs when the server starts a shell for any other caller (its `session.shell` and `/api/shell`
+    routes pass no tool hook but do pass the shell hook), and the server's password is taken out of every shell's
+    environment. Not stopped, and said so in the README: a worker that reads the password from the process list and
+    uses the server's terminal route (`/api/pty` passes no hook), starts a server of its own, or runs a script.
+    A shell tool call passes both hooks, so zed-deny runs twice for it: the second run is what checks the routes.
     A zed-deny that cannot run denies. OpenCode has no hook that can refuse a turn end, so there is no stop-guard here;
     a finish that was skipped still shows up as `done:` without a recorded finish. V1 is not supported: a V1 server
     ignores this file, and spawn's canary then refuses the worker."""
@@ -278,14 +274,53 @@ const DENY_TOOLS = {json.dumps(list(deny_tools))};
 export default Plugin.define({{
   id: "zed.deny",
   async setup(ctx) {{
-    await ctx.tool.hook("execute.before", (event) => {{
-      if (DENY_TOOLS.includes(event.tool)) throw new Error(`zed-deny: the tool ${{event.tool}} is denied to a worker`);
+    const check = (tool, input) => {{
       const res = spawnSync({json.dumps(hook_command(zed_home))}, [], {{
-        input: JSON.stringify({{ tool_name: event.tool, tool_input: event.input, cwd: ctx.location.directory }}),
+        input: JSON.stringify({{ tool_name: tool, tool_input: input, cwd: ctx.location.directory }}),
         encoding: "utf-8",
         env: {{ ...process.env, ...ENV }},
       }});
       if (res.status !== 0) throw new Error((res.stderr || res.stdout || "zed-deny could not run").trim());
+    }};
+    await ctx.tool.hook("execute.before", (event) => {{
+      if (DENY_TOOLS.includes(event.tool)) throw new Error(`zed-deny: the tool ${{event.tool}} is denied to a worker`);
+      check(event.tool, event.input);
+    }});
+    await ctx.shell.hook("create.before", (event) => {{
+      delete event.env.OPENCODE_PASSWORD;
+      check("shell", {{ command: event.command, workdir: event.cwd }});
+    }});
+  }},
+}});
+""")
+    return Path(directory)
+
+
+def coordinator_plugin(directory, zed_home, env):
+    """The coordinator's OpenCode config directory gets a V2 plugin that runs bin/zed-pretool before every tool call,
+    with the call's session id, and throws its reason when the call is denied. zed-pretool acts only on the session
+    holding the profile lock (and on its canary), so the plugin is inert anywhere else. `env` (ZED_PROFILE_DIR) is
+    written into the plugin. A zed-pretool that cannot run denies: `bin/zed coordinator` proved it ran once (the
+    canary), so a later failure is a broken install, not a call to wave through."""
+    plugin = Path(directory) / "plugins" / "zed-pretool" / "index.js"
+    plugin.parent.mkdir(parents=True, exist_ok=True)
+    plugin.write_text(f"""import {{ Plugin }} from "@opencode/plugin";
+import {{ spawnSync }} from "node:child_process";
+
+const ENV = {json.dumps(dict(env))};
+
+export default Plugin.define({{
+  id: "zed.pretool",
+  async setup(ctx) {{
+    await ctx.tool.hook("execute.before", (event) => {{
+      const res = spawnSync({json.dumps(str(Path(zed_home) / "bin" / "zed-pretool"))}, [], {{
+        input: JSON.stringify({{ tool_name: event.tool, tool_input: event.input, cwd: ctx.location.directory, session_id: event.sessionID }}),
+        encoding: "utf-8",
+        env: {{ ...process.env, ...ENV }},
+      }});
+      if (res.status !== 0) throw new Error((res.stderr || "zed-pretool could not run").trim());
+      const decision = res.stdout.trim() ? JSON.parse(res.stdout).hookSpecificOutput : null;
+      if (decision && decision.permissionDecision === "deny") throw new Error(decision.permissionDecisionReason);
     }});
   }},
 }});

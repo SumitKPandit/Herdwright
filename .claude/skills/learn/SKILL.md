@@ -22,7 +22,7 @@ Ask: *would this be true and useful for a Zed serving someone else?*
   | Model, effort ceiling, max running sessions | `profile/config/claude.json` |
 
 - **Yes — it makes any Zed better** (a tool quirk, a workflow improvement, a missing step) → core:
-  a lesson in `playbook.md`; a change to a skill, `CLAUDE.md`, `templates/`, `bin/` or
+  a lesson in `playbook.md`; a change to a skill, the manual (`AGENTS.md`), `templates/`, `bin/` or
   `profile.template/` when it changes how Zed works. Never put names, companies, repos, handles or
   other personal details in core — generalise the lesson.
 - **Both** (e.g. "this tool takes reviewer IDs, not names" + this team's IDs) → split it: the general
@@ -41,7 +41,7 @@ code cannot decide.
 3. **Separate told from inferred.** Mark inferences `(inferred, unconfirmed)`; never brief a worker
    with an inference as if it were a decision.
 4. **Lessons** carry the rule, **Why**, and **How to apply**.
-5. **Mind the context budget.** `CLAUDE.md`, `profile.md`, `lessons.md`, `playbook.md` and
+5. **Mind the context budget.** `AGENTS.md`, `profile.md`, `lessons.md`, `playbook.md` and
    `failure-modes.md` are read at every session start, so together they have a word budget
    (`bin/zed start` shows it; the pre-commit hook fails when it is passed). When a
    lesson would push past it, prune or merge older entries, or move the detail into a skill or a

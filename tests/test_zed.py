@@ -665,10 +665,12 @@ class ZedTests(unittest.TestCase):
     def test_context_budget_check(self):
         self.z.ZED_HOME = self.root / "home"
         self.z.ZED_HOME.mkdir()
-        (self.z.ZED_HOME / "CLAUDE.md").write_text("word " * 60)
+        (self.z.ZED_HOME / "AGENTS.md").write_text("word " * 60)
+        (self.z.ZED_HOME / "CLAUDE.md").write_text("@AGENTS.md\n")  # the import is not counted twice
         (self.root / "lessons.md").write_text("word " * 30)
         words, budget = self.z.context_words()
-        self.assertEqual((words["CLAUDE.md"], words["lessons.md"], budget), (60, 30, 4000))
+        self.assertEqual((words["AGENTS.md"], words["lessons.md"], budget), (60, 30, 4000))
+        self.assertNotIn("CLAUDE.md", words)
         self.assertIn("94 of 4000 words", self.z.context_line())
         (self.root / "config").mkdir(exist_ok=True)
         (self.root / "config" / "settings.json").write_text('{"context_budget_words": 90}')

@@ -2,6 +2,7 @@
 
 The script works on the checkout it lives in, so the throwaway checkout links to this one's bin/: nothing here touches
 this checkout's own git config."""
+import json
 import shutil
 import subprocess
 import tempfile
@@ -11,8 +12,9 @@ from pathlib import Path
 from _e2e import FAKES, clean_env
 
 HOME = Path(__file__).resolve().parents[1]
-REQUIRED = ("herdr", "git", "gh", "python3", "claude")
-SHELL_TOOLS = ("dirname", "head")  # what the script itself runs besides the tools it checks
+REQUIRED = ("herdr", "git", "gh", "python3")
+RUNTIMES = ("claude", "opencode")  # one of them is enough: an install runs on one
+SHELL_TOOLS = ("dirname", "head", "env")  # what the script itself runs besides the tools it checks
 
 
 class SetupCase(unittest.TestCase):
@@ -33,15 +35,19 @@ class SetupCase(unittest.TestCase):
         r = subprocess.run(["git", "config", "--get", "core.hooksPath"], cwd=self.repo, env=self.env, capture_output=True, text=True)
         return r.stdout.strip()
 
-    def setup(self, missing=(), cwd=None):
-        """Run zed-setup with every required tool on PATH except `missing` (herdr, gh and claude are the fakes)."""
+    def setup(self, missing=(), cwd=None, runtimes=("claude",)):
+        """Run zed-setup with every required tool on PATH except `missing` (herdr, gh and claude are the fakes) and
+        with `runtimes` installed (opencode is a script that only knows its version)."""
         tools = self.root / "tools"
         shutil.rmtree(tools, ignore_errors=True)
         tools.mkdir()
-        for tool in (*REQUIRED, *SHELL_TOOLS):
+        for tool in (*REQUIRED, *SHELL_TOOLS, *(r for r in runtimes if r == "claude")):
             if tool not in missing:
                 fake = FAKES / "bin" / tool
                 (tools / tool).symlink_to(fake if fake.exists() else shutil.which(tool))
+        if "opencode" in runtimes:
+            (tools / "opencode").write_text("#!/bin/sh\necho 'opencode v9.9.9 (fake)'\n")
+            (tools / "opencode").chmod(0o755)
         return subprocess.run([str(self.repo / "bin" / "zed-setup")], cwd=cwd or self.root, env=self.env | {"PATH": str(tools)},
                               capture_output=True, text=True)
 
@@ -65,6 +71,41 @@ class SetupCase(unittest.TestCase):
                 self.assertEqual(len([line for line in r.stdout.splitlines() if line.startswith("MISSING")]), 1)
                 if tool != "git":  # the hooks are installed all the same (by git, when there is one)
                     self.assertEqual(self.hooks_path(), "hooks")
+
+    def test_one_runtime_is_enough_and_none_fails_the_run(self):
+        r = self.setup(runtimes=("opencode",))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"(?m)^ok +opencode \(opencode v9\.9\.9 \(fake\)\)$")
+        self.assertNotIn("MISSING", r.stdout)
+        self.assertIn("'bin/zed coordinator' on OpenCode (now: opencode)", r.stdout)
+        r = self.setup(runtimes=())
+        self.assertEqual(r.returncode, 1)
+        self.assertRegex(r.stdout, r"(?m)^MISSING +a runtime: claude \(Claude Code\) or opencode \(OpenCode\)$")
+
+    def profile_settings(self, settings=None):
+        (self.repo / "profile" / "config").mkdir(parents=True, exist_ok=True)
+        (self.repo / "profile" / "profile.md").write_text("# A profile\n")
+        path = self.repo / "profile" / "config" / "settings.json"
+        if settings is not None:
+            path.write_text(json.dumps(settings))
+        return path
+
+    def test_the_runtime_key_is_set_from_the_one_runtime_installed_and_other_settings_stay(self):
+        path = self.profile_settings({"guard": {"protected": ["main"]}})
+        r = self.setup(runtimes=("opencode",))
+        self.assertRegex(r.stdout, r"(?m)^runtime +runtime set to opencode in .*settings\.json \(the only one installed\)$")
+        self.assertEqual(json.loads(path.read_text()), {"guard": {"protected": ["main"]}, "runtime": "opencode"})
+        r = self.setup(runtimes=("claude",))  # set once, it is the user's: a later run does not change it
+        self.assertRegex(r.stdout, r"(?m)^runtime +opencode$")
+        self.assertEqual(json.loads(path.read_text())["runtime"], "opencode")
+
+    def test_with_both_runtimes_installed_the_choice_is_left_to_the_user(self):
+        path = self.profile_settings()
+        r = self.setup(runtimes=RUNTIMES)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('Claude Code and OpenCode are both installed and an install uses one: set "runtime"', r.stdout)
+        self.assertIn("(now: claude)", r.stdout)
+        self.assertFalse(path.exists())
 
     def test_running_it_again_changes_nothing(self):
         first, again = self.setup(), self.setup()

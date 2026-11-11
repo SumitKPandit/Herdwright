@@ -18,7 +18,7 @@ repeat), and flags a usage limit and wakes me once. Each event it prints is
    - `ZED:QUESTION` / `ZED:BLOCKED` (Q-ids already recorded) → ask the user: numbered, with the Q-ids,
      the worker's trade-offs and recommendation, verbatim.
    - `ZED:DONE` → tell the user; consider `wrap-up`. A `⚠ PR with no real QA` line means send it back to
-     QA first (CLAUDE.md, directive 6); the task is not set to `pr_open` until QA is real. Whenever you send
+     QA first (the manual, directive 6); the task is not set to `pr_open` until QA is real. Whenever you send
      a worker's work back, log it: `bin/zed log T<id> "S<id> <why>" kind=sendback`
      (a `ready-check` send-back says `ready-check` in the text).
    - `USAGE LIMIT` → tell the user; the worker resumes by itself after the reset (check that it did).
@@ -46,7 +46,5 @@ repeat), and flags a usage limit and wakes me once. Each event it prints is
      same branch.
 3. **Ack what you handled:** `bin/zed ack E<id> …` (or `--all`). An un-acked event is shown again.
 4. Commit the profile if anything changed.
-5. The Claude Stop hook re-arms the watcher after every turn (no model turn needed); if it is not
-   installed or `bin/zed start` says `watcher: NOT RUNNING` with sessions running, run
-   `bin/zed watch --once` in the background.
+5. The watcher is kept running as the manual's "Runtime differences" say for this install's runtime.
    One watcher at a time; a second exits with `WATCH_ALREADY_RUNNING`.

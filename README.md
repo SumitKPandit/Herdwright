@@ -1,6 +1,6 @@
 # Zed
 
-Zed is a personal engineering assistant that runs on [Claude Code](https://claude.com/claude-code); workers can optionally run on [OpenCode](https://opencode.ai).
+Zed is a personal engineering assistant that runs on [Claude Code](https://claude.com/claude-code) or on [OpenCode](https://opencode.ai): an install uses one of them, for Zed and its workers alike.
 You talk only to Zed. It takes your requests, writes a brief for each, and hands the work to
 worker sessions running in [herdr](https://herdr.dev), one git worktree per session. It relays
 their questions to you and your answers back, tracks every task, question and decision in a
@@ -31,7 +31,7 @@ about you lives in **`profile/`**, which exists only on your profile branch.
 
 | Path | What |
 |---|---|
-| `CLAUDE.md` | Zed's operating manual (loaded automatically by Claude Code) |
+| `AGENTS.md` | Zed's operating manual, one for both runtimes (OpenCode reads it; Claude Code reads `CLAUDE.md`, which imports it) |
 | `playbook.md` | Lessons about tools and workflow that help every Zed |
 | `.claude/skills/` | Zed's workflows: onboarding, new-task, check-workers, relay, wrap-up, learn |
 | `templates/` | Core worker rules (system prompt) and the brief skeleton |
@@ -57,16 +57,37 @@ sessions, Zed's and yours included; `spawn` queues the rest). Without the file C
 may not call. The template lists the write tools of one tracker and wiki connector so a new profile's workers cannot
 post outward; replace them with your own connector's write tools.
 
-`profile.template/config/opencode.json` holds the `model` (`provider/model`) and `variant` an OpenCode worker runs
-(`spawn runtime=opencode`); without the file, or a key, the values in that template apply. `max_running` and the spend
-ledger do not cover OpenCode workers.
+`runtime` in `config/settings.json` (`claude` or `opencode`) names the one runtime the install uses; `bin/zed-setup`
+writes it when exactly one of the two is installed, and without the key it is OpenCode only when Claude Code is not
+installed. `profile.template/config/opencode.json` holds the `model` (`provider/model`) and `variant` Zed and its workers
+run on OpenCode; without the file, or a key, the values in that template apply. `max_running` and the spend ledger do
+not cover OpenCode workers.
+
+On OpenCode (V2; tested on v2.2.7) Zed itself is started with `bin/zed coordinator`, not plain `opencode`. It writes the
+session's config directory (model and variant, permission rules for Zed's routine commands, the profile's files as
+instructions, a plugin that runs `bin/zed-pretool` before every tool call), starts a server for it, asks the model for
+one call the guard always denies, and opens the TUI only when that call was stopped. `bin/zed start` refuses an OpenCode
+session that was not opened this way. Not built yet on OpenCode: waking an idle Zed when a worker finishes (`start`
+shows the watcher's events when it is run).
 
 An OpenCode worker (V2; tested on v2.2.7) gets its own server, a background job of its herdr pane, whose config
 directory holds Zed's rules (`AGENTS.md`) and the hat's deny plugin; spawn creates its session with the model and
 variant, and before the brief asks the worker for one call that every hat denies. A worker whose guard does not stop
 that call gets no brief and its session is marked `failed`. It reads the repository's `AGENTS.md` files and skills
-(`.opencode/skills`, `.claude/skills`); it does not read `CLAUDE.md`. `tests/smoke_opencode.py` runs the start, the
-canary, denied calls and the `AGENTS.md` pick-up against the installed `opencode` (not part of the default test run).
+(`.opencode/skills`, `.claude/skills`); it does not read `CLAUDE.md`.
+
+What the guards are, on both runtimes: a check before each tool call and each plain shell command, which stops a worker
+doing by mistake what its hat does not allow. They are not a sandbox. A worker that deliberately routes around them
+through another program is not stopped: a script that writes files itself (`python3 -c …`), and on OpenCode the
+server's terminal route (`/api/pty`, with the server password any process of the same user can read from the process
+list) or a server the worker starts itself. On OpenCode the server password is kept out of the worker's shell, and the
+server's two shell routes run the same check; Zed's own OpenCode session has the tool-call check only, because its
+server's shell is the user's own (`!` in the TUI). A write is checked wherever its path points: absolute, relative to
+the call's working directory, or after a `cd`; a path the shell expands (`$DIR/x`) is not followed. Review and QA by sessions that did not write the code, and the git
+guard, do not depend on these checks. `tests/smoke_opencode.py` runs all of this against
+the installed `opencode` (not part of the default test run): a worker's start, canary, `AGENTS.md` and skills, and its
+server's shell routes refusing what the hat denies, with no model asked for anything; Zed's own canary, model and
+variant, `start`, the lock, and a denied edit, commit and relative-path shell write in a project repo.
 
 Tests: `python3 -B -m unittest discover -s tests -v`.
 
@@ -90,9 +111,8 @@ ignored, never read. `profile/employees/` (named employees, their memory and log
 you like. Merging `main` never edits your profile files; if you edited core files on your branch, those conflict as in
 any merge.
 - **Runtimes.** If you cloned `main` while it supported Pi or Copilot: both are gone, and so is runtime selection
-  (order, fallback, handoff, `runtimes.json`). Workers run on Claude Code with model and effort from
-  `config/claude.json`; `spawn runtime=opencode` starts an OpenCode worker instead (model and variant from
-  `config/opencode.json`, no effort).
+  (order, fallback, handoff, `runtimes.json`). Workers run on the install's runtime: on Claude Code with model and
+  effort from `config/claude.json`, on OpenCode with model and variant from `config/opencode.json` (no effort).
   OpenCode has no blocking stop hook, so an OpenCode worker has no stop-guard: Zed's watcher flags a `done:` without `finish`.
 - **Hats, not names.** Workers wear a hat (`spawn hat=build|review|qa`, default build); `spawn employee=` is refused.
   Whether a reviewer or QA authored the code is checked when the session finishes, not when it is assigned. A hat session
