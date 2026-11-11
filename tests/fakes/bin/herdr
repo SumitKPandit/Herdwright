@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""A fake `herdr`: the commands `bin/zed` and `bin/lib` use, answered from the world in `store.py`, in herdr's own JSON
+shapes and error words (`pane_not_found`, `workspace_not_found`, `agent_not_ready`, `agent_prompt_stalled`).
+
+  workspace create --cwd D --label L [--no-focus] [--env K=V ..]   |  workspace close <id>
+  pane get <pane>  |  pane list  |  pane process-info --pane <pane>
+  agent list | get <a> | read <a> [--source S] [--lines N] | start <a> --kind K --pane P [--timeout MS] -- <cli args>
+        | prompt <a> <text> [--wait ..] | send-keys <a> <key..> | wait <a> --until <state> [--timeout MS]
+
+`agent start` launches the executable named by --kind (found on PATH, as herdr types it into the pane's shell); later
+events reach the same executable (see agent.py). Nothing here waits: an agent is whatever its script made it.
+"""
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import store  # noqa: E402
+
+# what a hat session must not inherit from the coordinator's shell: herdr starts a pane with its own identity
+COORDINATOR_ONLY = ("HERDR_PANE_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID", "OPENCODE_SESSION_ID", "OPENCODE_PID")
+FOOTER = ["─" * 40, "❯ ", "─" * 40, "  ⏵⏵ auto mode on (shift+tab to cycle)"]
+
+
+def ok(result):
+    print(json.dumps({"id": "fake", "result": result}))
+    return 0
+
+
+def fail(code, message=""):
+    print(json.dumps({"error": {"code": code, "message": message or code}}), file=sys.stderr)
+    return 1
+
+
+def option(args, name, default=None):
+    return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else default
+
+
+def options(args, name):
+    return [args[i + 1] for i, a in enumerate(args[:-1]) if a == name]
+
+
+def agent_event(pane_id, event, payload=""):
+    """Let the agent CLI in a pane react to `event`: its own executable runs in the pane's folder and environment."""
+    state = store.read()
+    pane = state["panes"][pane_id]
+    agent = pane["agent"]
+    env = {k: v for k, v in os.environ.items() if k not in COORDINATOR_ONLY}
+    env |= pane["env"] | {"HERDR_PANE_ID": pane_id, "FAKE_AGENT_PANE": pane_id, "FAKE_AGENT_EVENT": event,
+                          "FAKE_AGENT_PAYLOAD": payload}
+    subprocess.run([agent["kind"], *agent["argv"]], cwd=pane["cwd"], env=env, check=True)
+
+
+def workspace(args):
+    if args[0] == "create":
+        env = dict(e.split("=", 1) for e in options(args, "--env"))
+        with store.locked() as state:
+            ws, pane = store.new_pane(state, option(args, "--cwd", os.getcwd()), env, option(args, "--label", ""))
+        return ok({"type": "workspace_created", "workspace": {"workspace_id": ws}, "root_pane": {"pane_id": pane}})
+    if args[0] == "close":
+        with store.locked() as state:
+            ws = state["workspaces"].pop(args[1], None)
+            if ws:
+                state["panes"].pop(ws["pane"], None)
+        return ok({"type": "workspace_closed"}) if ws else fail("workspace_not_found")
+    return fail("unknown_command")
+
+
+def pane(args):
+    state = store.read()
+    if args[0] == "list":
+        return ok({"type": "pane_list", "panes": [store.pane_record(i, p) for i, p in state["panes"].items()]})
+    pane_id = option(args, "--pane") if args[0] == "process-info" else args[1]
+    found = state["panes"].get(pane_id)
+    if not found:
+        return fail("pane_not_found")
+    if args[0] == "get":
+        return ok({"type": "pane", "pane": store.pane_record(pane_id, found)})
+    if args[0] == "process-info":
+        return ok({"type": "pane_process_info", "process_info": {
+            "shell_pid": found["shell_pid"], "foreground_processes": [{"pid": p} for p in found["foreground"]]}})
+    return fail("unknown_command")
+
+
+def agent(args):
+    sub = args[0]
+    if sub == "list":
+        state = store.read()
+        return ok({"type": "agent_list",
+                   "agents": [store.agent_record(i, p) for i, p in state["panes"].items() if p["agent"]]})
+    if sub == "start":
+        name, pane_id = args[1], option(args, "--pane")
+        with store.locked() as state:
+            if pane_id not in state["panes"]:
+                return fail("pane_not_found")
+            state["panes"][pane_id]["agent"] = store.new_agent(name, option(args, "--kind"), args[args.index("--") + 1:])
+        agent_event(pane_id, "start")
+        return ready(name, "idle")
+    pane_id, found = store.find_agent(store.read(), args[1])
+    if not found:
+        return fail("agent_not_found")
+    if sub == "get":
+        return ok({"type": "agent", "agent": store.agent_record(pane_id, found)})
+    if sub == "read":
+        screen = found["agent"]["screen"] + ([] if found["agent"]["dialog"] else FOOTER)
+        if option(args, "--source", "visible") == "visible":
+            screen = screen[-store.VISIBLE_LINES:]
+        if lines := option(args, "--lines"):
+            screen = screen[-int(lines):]
+        print("\n".join(screen))
+        return 0
+    if sub == "prompt":
+        agent_event(pane_id, "prompt", args[2])
+        after = store.find_agent(store.read(), args[1])[1]
+        if "--wait" in args and after and after["agent"]["unsent"] is not None:
+            return fail("agent_prompt_stalled", "no activity after the prompt was submitted")
+        return ok({"type": "agent_prompted"})
+    if sub == "send-keys":
+        agent_event(pane_id, "keys", json.dumps(args[2:]))
+        return ok({"type": "keys_sent"})
+    if sub == "wait":
+        return ready(args[1], *options(args, "--until"))
+    return fail("unknown_command")
+
+
+def ready(name, *states):
+    """Whether the agent is in one of `states` now (the fake never waits: nothing changes while a command runs)."""
+    pane_id, found = store.find_agent(store.read(), name)
+    if found and found["agent"]["status"] in states:
+        return ok({"type": "agent", "agent": store.agent_record(pane_id, found)})
+    return fail("agent_not_ready", f"{name} is {found['agent']['status'] if found else 'gone'}, not {' or '.join(states)}")
+
+
+def main(argv):
+    with store.locked() as state:
+        state["calls"].append(argv)
+    groups = {"workspace": workspace, "pane": pane, "agent": agent}
+    if len(argv) < 2 or argv[0] not in groups:
+        return fail("unknown_command", " ".join(argv))
+    return groups[argv[0]](argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+"""A fake Claude Code CLI. This file is the only place that knows Claude Code's launch flags (`claude_launch` in
+bin/zed) and what its screen looks like; what the agent then does is agent.py, shared by every runtime. A fake for
+another runtime is a file like this one, named after its executable, reading that runtime's flags."""
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import agent  # noqa: E402
+
+VERSION = "9.9.9 (fake Claude Code)"
+
+
+def launch(argv):
+    p = argparse.ArgumentParser(prog="claude")
+    p.add_argument("--version", action="store_true")
+    p.add_argument("--permission-mode")
+    p.add_argument("-n", dest="name")
+    p.add_argument("--append-system-prompt-file", dest="rules")
+    p.add_argument("--add-dir", action="append", default=[], dest="add_dirs")
+    p.add_argument("--model")
+    p.add_argument("--effort")
+    p.add_argument("--settings")
+    return vars(p.parse_args(argv)) | {"runtime": "claude", "bullet": "⏺ "}
+
+
+if __name__ == "__main__":
+    flags = launch(sys.argv[1:])
+    if flags["version"]:
+        print(VERSION)
+        sys.exit(0)
+    agent.main(flags)
