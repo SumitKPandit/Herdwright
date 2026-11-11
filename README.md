@@ -74,7 +74,15 @@ An OpenCode worker (V2; tested on v2.2.7) gets its own server, a background job 
 directory holds Zed's rules (`AGENTS.md`) and the hat's deny plugin; spawn creates its session with the model and
 variant, and before the brief asks the worker for one call that every hat denies. A worker whose guard does not stop
 that call gets no brief and its session is marked `failed`. It reads the repository's `AGENTS.md` files and skills
-(`.opencode/skills`, `.claude/skills`); it does not read `CLAUDE.md`. `tests/smoke_opencode.py` runs all of this against
+(`.opencode/skills`, `.claude/skills`); it does not read `CLAUDE.md`.
+
+What the guards are, on both runtimes: a check before each tool call and each plain shell command, which stops a worker
+doing by mistake what its hat does not allow. They are not a sandbox. A worker that deliberately routes around them
+through another program is not stopped: a script that writes files itself (`python3 -c …`), and on OpenCode the
+server's terminal route (`/api/pty`, with the server password any process of the same user can read from the process
+list) or a server the worker starts itself. On OpenCode the server password is kept out of the worker's shell, and the
+server's two shell routes run the same check. Review and QA by sessions that did not write the code, and the git
+guard, do not depend on these checks. `tests/smoke_opencode.py` runs all of this against
 the installed `opencode` (not part of the default test run): a worker's start, canary, denied calls, `AGENTS.md` and
 skills; Zed's own canary, model and variant, `start`, the lock, and a denied edit and commit in a project repo.
 

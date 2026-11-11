@@ -12,7 +12,9 @@ for a hat that may not edit (the worktree, and the checkout holding the profile)
 `deny.except` globs stay writable inside a denied area (review/qa: their plan,
 findings draft and status log); a command starting with a `deny.gated` prefix (`gh pr create`) runs only once
 `bin/zed gate check HEAD` passes.
-Not caught: a script that writes files itself (python -c ...). `bin/zed-guard` still guards git.
+Not caught: a worker that deliberately routes around the hook through another program: a script that writes files
+itself (python -c ...), or under OpenCode the server's terminal route or a server it starts. The guard prevents
+mistakes; it is not a sandbox. `bin/zed-guard` still guards git.
 
 Test:  echo '{"tool_name":"Bash","tool_input":{"command":"gh pr comment 1"}}' | ZED_HAT=review zed-deny --explain
 """

@@ -264,6 +264,10 @@ def opencode_plugin(directory, zed_home, env, deny_tools=()):
     V2 plugin runs bin/zed-deny before every tool call and throws its reason when the call is denied; a throw stops the
     call. `env` (ZED_HAT, ZED_SESSION, ZED_WORKTREE, ZED_PROFILE_DIR) is written into the plugin, so the policy does
     not depend on how the server was started; `deny_tools` are tool names no worker may call (see `claude_settings`).
+    The same check runs when the server starts a shell for any other caller (its `session.shell` and `/api/shell`
+    routes pass no tool hook but do pass the shell hook), and the server's password is taken out of every shell's
+    environment. Not stopped, and said so in the README: a worker that reads the password from the process list and
+    uses the server's terminal route (`/api/pty` passes no hook), starts a server of its own, or runs a script.
     A zed-deny that cannot run denies. OpenCode has no hook that can refuse a turn end, so there is no stop-guard here;
     a finish that was skipped still shows up as `done:` without a recorded finish. V1 is not supported: a V1 server
     ignores this file, and spawn's canary then refuses the worker."""
@@ -278,14 +282,21 @@ const DENY_TOOLS = {json.dumps(list(deny_tools))};
 export default Plugin.define({{
   id: "zed.deny",
   async setup(ctx) {{
-    await ctx.tool.hook("execute.before", (event) => {{
-      if (DENY_TOOLS.includes(event.tool)) throw new Error(`zed-deny: the tool ${{event.tool}} is denied to a worker`);
+    const check = (tool, input) => {{
       const res = spawnSync({json.dumps(hook_command(zed_home))}, [], {{
-        input: JSON.stringify({{ tool_name: event.tool, tool_input: event.input, cwd: ctx.location.directory }}),
+        input: JSON.stringify({{ tool_name: tool, tool_input: input, cwd: ctx.location.directory }}),
         encoding: "utf-8",
         env: {{ ...process.env, ...ENV }},
       }});
       if (res.status !== 0) throw new Error((res.stderr || res.stdout || "zed-deny could not run").trim());
+    }};
+    await ctx.tool.hook("execute.before", (event) => {{
+      if (DENY_TOOLS.includes(event.tool)) throw new Error(`zed-deny: the tool ${{event.tool}} is denied to a worker`);
+      check(event.tool, event.input);
+    }});
+    await ctx.shell.hook("create.before", (event) => {{
+      delete event.env.OPENCODE_PASSWORD;
+      check("shell", {{ command: event.command, workdir: event.cwd }});
     }});
   }},
 }});
