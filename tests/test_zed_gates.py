@@ -1,5 +1,5 @@
 """Lessons turned into code: the merge gate (verdicts attach to the code, not the commit), prompt guard, relay-post,
-core-sync check, `bb pr approve|comment`. Each gate is tested for the refusal and the allowed case."""
+core-sync check. Each gate is tested for the refusal and the allowed case."""
 import json
 import os
 import shutil
@@ -327,7 +327,7 @@ class PushGateTests(GateCase):
         bare = self.root / "remote.git"
         self.assertTrue(zedlib.git(self.root, "init", "-q", "--bare", str(bare)).ok)
         install = subprocess.run([str(HOME / "bin/zed-guard"), "install", str(self.worktree),
-                                  "--base", "main", "--gate", "--jira", "MENT-20"],
+                                  "--base", "main", "--gate", "--ticket", "MENT-20"],
                                  capture_output=True, text=True, env=env)
         self.assertEqual(install.returncode, 0, install.stderr)
         config = Path(zedlib.git(self.worktree, "rev-parse", "--absolute-git-dir").stdout.strip()) / "zed-hooks/config.json"
@@ -607,29 +607,6 @@ class SessionRefTests(unittest.TestCase):
         self.assertEqual(z.session_ref("61"), "61")
         self.assertEqual(z.session_ref("Sam"), "Sam")  # an agent name that starts with S
         self.assertEqual(z.session_ref("quill-t25"), "quill-t25")
-
-
-class BbTests(unittest.TestCase):
-    def run_bb(self, *argv):
-        bb = _load.load("bb")
-        calls = []
-        with patch.object(bb, "call", side_effect=lambda m, p, body=None: calls.append((m, p, body)) or
-                          {"user": {"display_name": "Sam"}, "links": {"html": {"href": "https://bb/c/1"}}}), \
-                patch.object(bb.sys, "argv", ["bb", *argv]):
-            bb.main()
-        return calls
-
-    def test_approve_posts_to_the_approve_endpoint(self):
-        self.assertEqual(self.run_bb("pr", "approve", "12", "--repo", "ws/slug"),
-                         [("POST", "/repositories/ws/slug/pullrequests/12/approve", None)])
-
-    def test_comment_posts_raw_content(self):
-        self.assertEqual(self.run_bb("pr", "comment", "12", "--repo", "ws/slug", "--body", "LGTM"),
-                         [("POST", "/repositories/ws/slug/pullrequests/12/comments", {"content": {"raw": "LGTM"}})])
-
-    def test_comment_needs_a_body(self):
-        with self.assertRaises(SystemExit):
-            self.run_bb("pr", "comment", "12", "--repo", "ws/slug")
 
 
 if __name__ == "__main__":

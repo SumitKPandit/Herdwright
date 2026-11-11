@@ -14,7 +14,6 @@ if command -v claude >/dev/null 2>&1; then
 else
   echo "MISSING  claude (Claude Code)"; missing=1
 fi
-command -v security >/dev/null 2>&1 || echo "note     no macOS 'security' tool: bin/bb (Bitbucket) needs the macOS Keychain"
 
 current=$(git config --get core.hooksPath)
 if [ -n "$current" ] && [ "$current" != hooks ]; then

@@ -33,8 +33,8 @@ description: Intake a new piece of work from the user, record it, write a brief 
    Technical discovery can inform feasibility, but neither an old specification nor inspected code substitutes for
    Product approval. Finalize the technical specification against reviewed product requirements, without treating
    the PRD as proof of integration readiness or a delivery commitment.
-2. `bin/zed task add title="..." jira=<ticket-id> worktype=<worktype> description="..."` → T-id
-   (`jira=` holds any ticket ID). Record each confirmed decision with
+2. `bin/zed task add title="..." ticket=<ticket-id> worktype=<worktype> description="..."` → T-id.
+   Record each confirmed decision with
    `bin/zed log <T> "decision: ..." kind=decision`.
 3. Per repo, `bin/zed brief <T> repo=<repo> base=<base> branch=<branch per profile/rules.md>`: it fills
    everything mechanical (context, QA environment from the repo's knowledge file, plan block, done

@@ -25,7 +25,7 @@ Ask: *would this be true and useful for a Zed serving someone else?*
   a lesson in `playbook.md`; a change to a skill, `CLAUDE.md`, `templates/`, `bin/` or
   `profile.template/` when it changes how Zed works. Never put names, companies, repos, handles or
   other personal details in core — generalise the lesson.
-- **Both** (e.g. "Bitbucket reviewers must be UUIDs" + this team's UUIDs) → split it: the general
+- **Both** (e.g. "this tool takes reviewer IDs, not names" + this team's IDs) → split it: the general
   lesson to core, the specifics to the profile.
 
 ## 1b. Can it be code?

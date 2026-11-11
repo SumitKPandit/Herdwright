@@ -56,7 +56,7 @@ class DecideTests(unittest.TestCase):
 
     def test_outward_commands_are_denied_by_prefix_whatever_the_program_path_or_env(self):
         for hat in self.manifests:
-            for command in ("gh pr comment 12 --body hi", "gh pr review 12 --approve", "/opt/bin/bb pr comment 3 -m x",
+            for command in ("gh pr comment 12 --body hi", "gh pr review 12 --approve", "/opt/bin/gh pr comment 3 -b x",
                             "FOO=1 gh pr comment 1", "echo a && gh pr review 1", "(gh pr comment 1)"):
                 self.assertIn("denied to this hat", self.bash(hat, command), (hat, command))
             self.assertIsNone(self.bash(hat, "gh pr view 12"), hat)
@@ -117,7 +117,7 @@ class DecideTests(unittest.TestCase):
             self.assertIsNone(self.bash(hat, f"git -C {home / 'bin'} log"), hat)
 
     def test_raising_a_pr_waits_for_the_merge_gate(self):
-        commands = ("gh pr create --draft --title x", "/opt/bin/bb pr create --draft", "git push && gh pr create")
+        commands = ("gh pr create --draft --title x", "/opt/bin/gh pr create --draft", "git push && gh pr create")
         with mock.patch.object(zeddeny.zedgates, "gate_reason", return_value="no review verdict recorded") as gate:
             for command in commands:
                 self.assertIn("waits for a clean review and qa", self.bash("build", command), command)
@@ -247,11 +247,10 @@ class DecideTests(unittest.TestCase):
         self.assertIsNone(self.call("build", "apply_patch", patchText=f"*** Update File: {src}\n"))
         self.assertIn("denied", self.call("review", "bash", command="gh pr comment 1"))
 
-    def test_claude_settings_deny_exactly_the_nine_atlassian_write_tools(self):
-        prefix = "mcp__claude_ai_Atlassian_MCP__"
-        self.assertEqual(sorted(zeddeny.claude_settings(HOME)["permissions"]["deny"]), sorted(prefix + n for n in (
-            "addGraphContext", "addOrEditJiraIssueComment", "createConfluenceContent", "createJiraIssue", "editJiraIssue",
-            "executeDestructive", "executeWrite", "transitionJiraIssue", "updateConfluenceContent")))  # no get*, search*, executeRead, discover
+    def test_claude_settings_deny_exactly_the_tools_given(self):
+        self.assertEqual(zeddeny.claude_settings(HOME)["permissions"]["deny"], [])  # core names no vendor's tools
+        tools = ["mcp__tracker__createIssue", "mcp__wiki__updatePage"]
+        self.assertEqual(zeddeny.claude_settings(HOME, tools)["permissions"]["deny"], tools)
 
     def test_glob_regex(self):
         self.assertTrue(zeddeny.glob_regex("**").match("a/b/c.py"))
@@ -317,9 +316,9 @@ class HookScriptTests(unittest.TestCase):
         env = {"ZED_HAT": "review", "ZED_WORKTREE": "/nonexistent-wt"}
         out = io.StringIO()
         with patch("sys.stdout", out):
-            code, _ = self.run_hook({"tool_name": "Bash", "tool_input": {"command": "bb pr comment 1"}}, env, "--explain")
+            code, _ = self.run_hook({"tool_name": "Bash", "tool_input": {"command": "gh pr comment 1"}}, env, "--explain")
         self.assertEqual(code, 0)
-        self.assertIn("deny: `bb pr comment`", out.getvalue())
+        self.assertIn("deny: `gh pr comment`", out.getvalue())
 
 
 if __name__ == "__main__":

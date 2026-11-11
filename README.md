@@ -17,12 +17,11 @@ What every Zed does, whoever uses it:
 ## Get started
 
 1. Install the prerequisites: Claude Code (`claude`), herdr, git, `gh` (logged in), python3.
-   `bin/bb`, the Bitbucket helper, needs macOS (it keeps its token in the Keychain).
 2. Clone Zed: `git clone <this repo> ~/zed && cd ~/zed && bin/zed-setup`
    (checks the prerequisites and installs the git guard hooks).
 3. Start herdr, open a pane in the Zed folder and run `claude`.
 4. Say hi. On first run Zed **onboards you**: it asks who you are, how you work, which repos and
-   tools you use, connects and verifies your accounts (GitHub, Bitbucket, Jira, Slack, …), and
+   tools you use, connects and verifies your accounts (GitHub, your ticket tracker, chat, …), and
    creates your profile on your own branch, `profile/<name>`. From then on it's your assistant.
 
 ## How it's organised
@@ -34,10 +33,9 @@ about you lives in **`profile/`**, which exists only on your profile branch.
 |---|---|
 | `CLAUDE.md` | Zed's operating manual (loaded automatically by Claude Code) |
 | `playbook.md` | Lessons about tools and workflow that help every Zed |
-| `.claude/skills/` | Zed's workflows: onboarding, new-task, check-workers, relay, wrap-up, learn, attention |
+| `.claude/skills/` | Zed's workflows: onboarding, new-task, check-workers, relay, wrap-up, learn |
 | `templates/` | Core worker rules (system prompt) and the brief skeleton |
 | `bin/zed` | Task DB and herdr session driver (`bin/zed help`) |
-| `bin/bb` | Bitbucket PR helper for workers |
 | `bin/zed-setup` | Prerequisite check + git guard hooks (`hooks/`) |
 | `bin/zed-employee`, `bin/zed-deny` | Hats for workers (build, review, qa): `zed spawn hat=`, `zed-employee finish`, each hat's deny policy |
 | `bin/zed-core-sync` | Carries core improvements from your profile branch to `main` |
@@ -47,7 +45,7 @@ about you lives in **`profile/`**, which exists only on your profile branch.
 Only one Claude session per profile acts as Zed: it holds the profile's lock
 (`bin/zed lock`). Other sessions opened in the checkout are read-only, or can take over.
 
-`bin/zed` and `bin/bb` read `profile/` by default; set `ZED_PROFILE_DIR` to point them at another
+`bin/zed` reads `profile/` by default; set `ZED_PROFILE_DIR` to point it at another
 profile (handy for testing with a throwaway one).
 
 ## Configuration

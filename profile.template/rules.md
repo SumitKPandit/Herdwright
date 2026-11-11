@@ -22,4 +22,4 @@
 - Title: <format>. Target: the base branch from your brief.
 - Description: <what goes in it>.
 - <draft first? when to mark ready? reviewers: see `{{PROFILE}}/knowledge/people.md`>
-- <host-specific commands, e.g. `gh pr create --draft`, or `{{ZED_HOME}}/bin/bb pr create --draft` for Bitbucket>
+- <commands, e.g. `gh pr create --draft`>

@@ -20,7 +20,7 @@ The no-assumption rule applies in full: write down only what the user said or wh
    - What they want Zed for, and which decisions they want to make themselves vs. leave to Zed.
    - How they like to be talked to (length, tone, what to lead with).
    - Claude Code: which plan, and which model and effort ceiling workers should use (`config/claude.json`).
-   - Tools and accounts: code hosts (GitHub, Bitbucket, GitLab…), ticket tracker, wiki, chat, email,
+   - Tools and accounts: code host (GitHub), ticket tracker, wiki, chat, email,
      anything else workers will touch. For each: their handle and how they use it.
    - Repos: name, local path (or where to clone), what each is, which branches are staging /
      production / base for new work, how repos relate. Where worktrees should live.
@@ -45,12 +45,10 @@ The no-assumption rule applies in full: write down only what the user said or wh
      their plan, so ask first; if login is needed they run `claude` themselves).
    - GitHub: `gh auth status` (if needed the user runs `! gh auth login`); check `gh api user` matches
      their handle.
-   - Bitbucket: Atlassian API token in the macOS Keychain — give them the exact command from
-     `bin/bb --help` (the `"$(pbpaste)"` form; see `playbook.md`), then `bin/bb check <workspace/slug>`
-     and `bin/bb whoami`. Put the Keychain service name and a test repo in `config/settings.json`.
-   - Tools exposed as MCP servers (e.g. Atlassian, Slack, Google): find their tools with ToolSearch;
+   - Tools exposed as MCP servers (e.g. a ticket tracker, a wiki, chat): find their tools with ToolSearch;
      if a server needs auth, call its `authenticate` tool and let the user finish in the browser;
-     then make one read-only call that proves it works (e.g. the current user's profile).
+     then make one read-only call that proves it works (e.g. the current user's profile). List the
+     server's write tools under `worker.deny_tools` in `config/settings.json`: workers may read, only Zed posts.
    - Repos: for each, check the path is a git repo and `git -C <path> remote -v` matches what they
      said; offer to clone missing ones (with their OK).
    - Record each account in `profile.md` with how it's connected, how to verify it, and the date

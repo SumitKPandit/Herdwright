@@ -31,8 +31,8 @@ class PureTests(unittest.TestCase):
         self.assertIsNone(f("Merge branch 'x'"))
         self.assertIsNotNone(f("add thing"))
         self.assertIsNotNone(f("MENT-123: Add thing"))
-        self.assertIsNone(f("MENT-5 | x", jira="MENT-5"))
-        self.assertIn("MENT-5 | ", f("MENT-6 | x", jira="MENT-5"))
+        self.assertIsNone(f("MENT-5 | x", ticket="MENT-5"))
+        self.assertIn("MENT-5 | ", f("MENT-6 | x", ticket="MENT-5"))
         self.assertIsNone(f("anything", enforce=False))
 
     def test_push_problems_ask_the_gate_about_branch_pushes_only(self):
@@ -101,7 +101,7 @@ class HookTests(unittest.TestCase):
         return git(self.wt, "commit", "-q", "-m", msg, check=False)
 
     def test_commit_rules_and_chaining(self):
-        self.install("--jira", "MENT-9")
+        self.install("--ticket", "MENT-9")
         bad = self.commit("fix stuff")
         self.assertNotEqual(bad.returncode, 0)
         self.assertIn("must start with 'MENT-9 | '", bad.stderr)
@@ -152,7 +152,7 @@ class HookTests(unittest.TestCase):
         self.assertIn("not a valid regex", out.stderr)
 
     def test_empty_commit_message_file_is_a_readable_refusal(self):
-        self.install("--jira", "ABC-9")
+        self.install("--ticket", "ABC-9")
         empty = self.r / "msg"
         empty.write_text("")
         r = subprocess.run([GUARD, "hook", "commit-msg", str(empty)], cwd=self.wt, capture_output=True, text=True)
@@ -161,7 +161,7 @@ class HookTests(unittest.TestCase):
         self.assertIn("must start with 'ABC-9 | '", r.stderr)
 
     def test_push_rules(self):
-        self.install("--jira", "MENT-9")
+        self.install("--ticket", "MENT-9")
         self.assertEqual(self.commit("MENT-9 | one").returncode, 0)
         ok = git(self.wt, "push", "-q", "origin", "HEAD:refs/heads/task/ment-9-x", check=False)
         self.assertEqual(ok.returncode, 0, ok.stderr)
@@ -177,7 +177,7 @@ class HookTests(unittest.TestCase):
         self.assertIn("deleting remote branch", gone.stderr)
 
     def test_installing_again_with_the_gate_turns_it_on_in_a_guarded_worktree(self):
-        self.install("--jira", "MENT-9")
+        self.install("--ticket", "MENT-9")
         cfg = Path(git(self.wt, "config", "--get", "core.hooksPath").stdout.strip()) / "config.json"
         self.assertFalse(json.loads(cfg.read_text())["gate"])
         again = subprocess.run([GUARD, "install", str(self.wt), "--gate"], capture_output=True, text=True,
@@ -191,27 +191,27 @@ class HookTests(unittest.TestCase):
                               env={**os.environ, "ZED_PROFILE_DIR": str(self.r / "no-profile")})
 
     def test_a_refused_reinstall_without_the_gate_never_turns_an_enabled_gate_off(self):
-        self.install("--jira", "MENT-9", "--gate")
+        self.install("--ticket", "MENT-9", "--gate")
         cfg = Path(git(self.wt, "config", "--get", "core.hooksPath").stdout.strip()) / "config.json"
         before = cfg.read_text()
-        again = self.reinstall("--jira", "MENT-9")
+        again = self.reinstall("--ticket", "MENT-9")
         self.assertEqual(again.returncode, 2)
         self.assertIn("already pointing", again.stderr)
         self.assertEqual(cfg.read_text(), before)
         self.assertTrue(json.loads(cfg.read_text())["gate"])
 
     def test_only_remove_then_install_switches_the_gate_off(self):
-        self.install("--jira", "MENT-9", "--gate")
+        self.install("--ticket", "MENT-9", "--gate")
         cfg = Path(git(self.wt, "config", "--get", "core.hooksPath").stdout.strip()) / "config.json"
         self.assertEqual(subprocess.run([GUARD, "remove", str(self.wt)], capture_output=True, text=True).returncode, 0)
-        self.install("--jira", "MENT-9")
+        self.install("--ticket", "MENT-9")
         self.assertFalse(json.loads(cfg.read_text())["gate"])
 
     def test_a_gated_worktree_refuses_a_push_without_review_and_qa(self):
         profile = self.r / "gate-profile"
         (profile / "db").mkdir(parents=True)
         (profile / "profile.md").write_text("# test profile\n")
-        self.install("--jira", "MENT-9", "--gate", profile=str(profile))
+        self.install("--ticket", "MENT-9", "--gate", profile=str(profile))
         self.assertEqual(self.commit("MENT-9 | one").returncode, 0)
         env = {**os.environ, "ZED_PROFILE_DIR": str(profile), "ZED_GATE_OVERRIDE": "worker says so"}  # only the user may override
         refused = subprocess.run(["git", "push", "origin", "HEAD:refs/heads/task/ment-9-x"], cwd=self.wt, capture_output=True, text=True, env=env)
@@ -220,13 +220,13 @@ class HookTests(unittest.TestCase):
         self.assertIn("no review verdict recorded", refused.stderr)
 
     def test_an_ungated_worktree_pushes_without_asking_the_gate(self):
-        self.install("--jira", "MENT-9")
+        self.install("--ticket", "MENT-9")
         self.assertEqual(self.commit("MENT-9 | one").returncode, 0)
         ok = git(self.wt, "push", "-q", "origin", "HEAD:refs/heads/task/ment-9-x", check=False)
         self.assertEqual(ok.returncode, 0, ok.stderr)
 
     def test_remove_restores_repo_hooks(self):
-        self.install("--jira", "MENT-9")
+        self.install("--ticket", "MENT-9")
         subprocess.run([GUARD, "remove", str(self.wt)], check=True, capture_output=True)
         self.assertEqual(self.commit("any message", "z.txt").returncode, 0)
         self.assertEqual(git(self.wt, "config", "--get", "core.hooksPath").stdout.strip(), str(self.r / "repohooks"))
@@ -234,7 +234,7 @@ class HookTests(unittest.TestCase):
     def test_audit_worktree_findings(self):
         s = {"id": 1, "agent": "a", "repo": "none", "base": "main", "branch": "task/ment-9-x", "worktree": str(self.wt)}
         self.assertIn("hooks not installed", "\n".join(guard.audit_worktree(s, False, 0)))
-        self.install("--jira", "MENT-9")
+        self.install("--ticket", "MENT-9")
         self.assertEqual(guard.audit_worktree(s, False, 0), [])
         git(self.wt, "checkout", "-q", "-b", "other")
         self.assertIn("expected 'task/ment-9-x'", "\n".join(guard.audit_worktree(s, False, 0)))

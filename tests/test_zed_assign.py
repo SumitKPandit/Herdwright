@@ -53,7 +53,7 @@ class AssignCase(unittest.TestCase):
         self.conn = self.z.db()
         self.addCleanup(self.conn.close)
         ts = "2026-10-27 09:00"
-        self.conn.execute("INSERT INTO tasks(id,title,jira,worktype,status,created_at,updated_at) VALUES (20,'Role guard','MENT-20','story','active',?,?)", (ts, ts))
+        self.conn.execute("INSERT INTO tasks(id,title,ticket,worktype,status,created_at,updated_at) VALUES (20,'Role guard','MENT-20','story','active',?,?)", (ts, ts))
         self.conn.commit()
         self.brief = self.root / "brief.md"
         self.brief.write_text(BRIEF)
@@ -331,6 +331,13 @@ class RenderedPolicyTests(AssignCase):
         self.assertEqual(settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"], str(HOME / "bin" / "zed-deny"))
         self.assertEqual(settings["hooks"]["Stop"][0]["hooks"][0]["command"], f"{HOME / 'bin' / 'zed-employee'} stop-guard")
         self.assertIn("ZED_HAT=review", env)
+        self.assertEqual(settings["permissions"]["deny"], [])  # no profile setting: nothing is denied by name
+
+    def test_claude_settings_deny_the_tools_the_profile_names(self):
+        tools = ["mcp__tracker__createIssue", "mcp__wiki__updatePage"]
+        (self.profile / "config" / "settings.json").write_text(json.dumps({"worker": {"deny_tools": tools}}))
+        kit, _ = self.kit("build")
+        self.assertEqual(json.loads(kit["claude_settings"].read_text())["permissions"]["deny"], tools)
 
 
 if __name__ == "__main__":

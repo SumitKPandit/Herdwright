@@ -39,7 +39,7 @@ Anything a script or hook can enforce is code, not a line here.
 - **Keep coordinator QA separate from worker fixtures.** Workers correctly refuse coordinator lock and watcher duties:
   launch a separate, explicitly scoped coordinator fixture with the throwaway profile, and re-read its screen before any action.
 - **PR review posting.** `gh pr review <n> -R <owner>/<repo> --approve -b "<text>"` prints nothing on success; verify with
-  `gh pr view --json reviews`. Bitbucket: `bin/bb pr approve|comment`; no raw REST calls. Relay the user's OK to post with
+  `gh pr view --json reviews`. No raw REST calls. Relay the user's OK to post with
   `bin/zed relay-post` (their words verbatim plus the exact action).
 - **Review and QA of gated work go to their own sessions** (`spawn … hat=review|qa`); a session that changed the code gives no
   verdict. Verdicts are about the code outside `profile/`, so a later profile-only commit keeps them. Never turn the gate off to publish.

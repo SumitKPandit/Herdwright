@@ -22,8 +22,6 @@ import argparse
 import json
 import re
 import sys
-import urllib.error
-import urllib.request
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -193,24 +191,11 @@ def render_facts(d):
 
 
 def fetch_diff(url):
-    """(diff text, CI line). GitHub through `gh`, Bitbucket through bin/bb's credentials."""
-    zed_pr = SourceFileLoader("zed_pr", str(BIN / "zed-pr")).load_module()
-    forge, repo, number = zed_pr.parse_url(url)
-    if forge == "github":
-        r = zedlib.run_bounded(["gh", "pr", "diff", url], timeout=90)
-        if not r.ok:
-            raise RuntimeError(f"gh pr diff failed: {(r.stderr or r.stdout).strip()[:300]}")
-        return r.stdout
-    bb = SourceFileLoader("zed_bb", str(BIN / "bb")).load_module()
-    email, token = bb.credentials()
-    req = urllib.request.Request(f"{bb.API}/repositories/{repo}/pullrequests/{number}/diff")
-    import base64
-    req.add_header("Authorization", "Basic " + base64.b64encode(f"{email}:{token}".encode()).decode())
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return resp.read().decode(errors="replace")
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Bitbucket diff request failed: HTTP {e.code}") from e
+    """The PR's diff text, through `gh`."""
+    r = zedlib.run_bounded(["gh", "pr", "diff", url], timeout=90)
+    if not r.ok:
+        raise RuntimeError(f"gh pr diff failed: {(r.stderr or r.stdout).strip()[:300]}")
+    return r.stdout
 
 
 def ci_line(url):
@@ -252,7 +237,7 @@ FINDING = re.compile(r"^\s*(?:[-*]|\d+[.)])\s*\[(?P<sev>[^\]]*)\]\s*(?P<rest>.*)
 LOCATION = re.compile(r"[\w@./\\-]+\.\w+:\d+")
 SUGGESTION = re.compile(r"\b(fix|suggest(?:ion|ed)?|change to|replace with|instead)\s*:", re.I)
 VERDICT = re.compile(r"^\s*(?:\*\*)?verdict(?:\*\*)?\s*:\s*(?:\*\*)?(\S+?)(?:\*\*)?\s*$", re.I)
-OUTWARD = re.compile(r"\b(?:gh|bb)\s+pr\b|/pullrequests?/\d+/comments|/pulls?/\d+/(?:reviews|comments)|^\s*/(?:approve|lgtm)\b", re.I | re.M)
+OUTWARD = re.compile(r"\bgh\s+pr\b|/pulls?/\d+/(?:reviews|comments)|^\s*/(?:approve|lgtm)\b", re.I | re.M)
 
 
 def check_draft(text):
