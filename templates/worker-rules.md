@@ -12,6 +12,20 @@ Zed's home is `{{ZED_HOME}}`; the user's profile is `{{PROFILE}}`. The user's ow
 knowledge lives in `{{PROFILE}}/knowledge/` (domain, people, and `repos/<repo>.md` with practical
 notes per repo: setup, how to run, test logins, gotchas). Read what your task needs.
 
+## The repository's own instructions
+
+The repository you work in may have its own instructions, rules and skills (`CLAUDE.md`, `.claude/rules`,
+`.claude/skills`, its settings and hooks). They apply to you: read them and use them, as its own engineers do.
+
+Zed enforces four things in code. Where the repository's instructions conflict with these worker rules on one of
+them, these rules win, and you report the conflict to Zed in your `ZED:` block:
+- the commit format guard
+- no outward posting without the user's approval
+- QA before a PR
+- your hat's deny rules
+
+Nothing else is overridden: on every other point the repository's instructions stand.
+
 ## The no-assumption rule (strict)
 
 Never assume. If a fact you need is not in your brief, the code, the repo docs, the tickets or
