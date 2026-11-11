@@ -190,6 +190,43 @@ class CommandTests(CoordinatorCase):
         self.assertTrue(self.processes[0].stopped)
         self.assertFalse(self.record.exists())
 
+    def test_a_second_coordinator_is_refused_while_one_is_open_and_the_first_keeps_its_record(self):
+        """S338: a second run overwrote the record of the open, lock-holding session and deleted it on exit."""
+        first = json.dumps({"session": "ses_first", "server_pid": os.getpid(), "guard": "live", "started_at": "earlier"})
+        self.record.parent.mkdir(exist_ok=True)
+        self.record.write_text(first)
+        with self.installed("opencode"):
+            self.dies(lambda: self.z.cmd_coordinator([]), "a coordinator is already open (session ses_first", "close it first")
+        self.assertEqual((self.processes, self.tui), ([], []))
+        self.assertEqual(self.record.read_text(), first)
+
+    def test_a_record_left_by_a_coordinator_that_is_gone_does_not_block_and_another_runs_record_is_not_deleted(self):
+        self.record.parent.mkdir(exist_ok=True)
+        self.record.write_text(json.dumps({"session": "ses_gone", "server_pid": 2 ** 22 + 12345, "guard": "live"}))  # no such process
+        taken_over = json.dumps({"session": "ses_other", "server_pid": 1, "guard": "live"})
+        self.z.subprocess.call.side_effect = lambda *a, **k: self.record.write_text(taken_over) and 3  # while the TUI ran
+        with self.installed("opencode"), self.assertRaises(SystemExit):
+            self.z.cmd_coordinator([])
+        self.assertEqual(len(self.processes), 1)  # it opened
+        self.assertEqual(self.record.read_text(), taken_over)  # not this run's record: left alone
+
+    def test_a_signal_during_the_canary_turn_stops_the_server_just_started(self):
+        self.server = lambda *a, **k: (_ for _ in ()).throw(SystemExit(129))  # SIGHUP's handler, mid-request
+        with self.installed("opencode"), self.assertRaises(SystemExit):
+            self.z.cmd_coordinator([])
+        self.assertTrue(self.processes[0].stopped)
+        self.assertEqual(self.tui, [])
+
+    def test_without_a_profile_the_temporary_kit_is_removed_when_the_session_ends(self):
+        (self.profile / "profile.md").unlink()
+        made = []
+        real_kit = self.z.coordinator_kit
+        with patch.object(self.z, "coordinator_kit", side_effect=lambda: made.append(real_kit()) or made[-1]), \
+                self.installed("opencode"), self.assertRaises(SystemExit):
+            self.z.cmd_coordinator([])
+        self.assertIsNotNone(made[0]["temporary"])
+        self.assertFalse(made[0]["temporary"].exists())
+
     def test_a_session_whose_guard_is_not_live_is_never_opened(self):
         self.server.guard = "dead"
         with self.installed("opencode"):
@@ -332,6 +369,46 @@ class RelayTests(CoordinatorCase):
         self.state.start()
         self.assertEqual(self.question(self.q1)["status"], "answered")
         self.mock_prompt_worker.assert_called_once()
+
+    def second_worker(self):
+        """A second session with a question of its own (a copy of the first, in another pane); returns (session, question)."""
+        row = dict(self.session(self.sid)) | {"id": None, "agent": "build-two", "pane_id": "pane-two"}
+        other = self.conn.execute(f"INSERT INTO sessions({','.join(row)}) VALUES ({','.join('?' * len(row))})", list(row.values())).lastrowid
+        q = self.z.add_question(self.conn, 20, other, "Which region?")
+        self.conn.commit()
+        return other, q
+
+    def test_two_workers_are_both_checked_before_either_is_prompted(self):
+        """S338: with the second worker `working`, the first had already received its answer and nothing was recorded."""
+        other, q3 = self.second_worker()
+        self.state.stop()
+        with patch.object(self.z, "session_agent_state", side_effect=lambda s: "working" if s["id"] == other else "idle"):
+            self.dies(lambda: self.z.cmd_relay([f"Q{self.q1}", "use port 9196", f"Q{q3}", "eu"]),
+                      f"refused: S{other}", "Nothing was sent and nothing recorded.")
+        self.state.start()
+        self.mock_prompt_worker.assert_not_called()
+        self.assertEqual([self.question(q)["status"] for q in (self.q1, q3)], ["open", "open"])
+        self.assertNotIn("9196", self.brief.read_text())
+        self.z.cmd_relay([f"Q{self.q1}", "use port 9196", f"Q{q3}", "eu"])  # both idle: one prompt each
+        self.assertEqual([c.args[0] for c in self.mock_prompt_worker.call_args_list], ["build-t20", "build-two"])
+        self.assertEqual([self.question(q)["status"] for q in (self.q1, q3)], ["answered", "answered"])
+
+    def test_a_prompt_that_fails_for_the_second_worker_leaves_the_first_recorded_and_not_prompted_again(self):
+        other, q3 = self.second_worker()
+        self.mock_prompt_worker.side_effect = lambda agent, text: (agent != "build-two", "agent_prompt_stalled")
+        self.dies(lambda: self.z.cmd_relay([f"Q{self.q1}", "use port 9196", f"Q{q3}", "eu"]), f"prompt to S{other} failed: agent_prompt_stalled")
+        self.assertEqual([(self.question(q)["status"], self.question(q)["answer"]) for q in (self.q1, q3)], [("answered", "use port 9196"), ("open", None)])
+        self.assertIn('"Which port?": "use port 9196"', self.brief.read_text())
+        self.mock_prompt_worker.side_effect = None
+        self.mock_prompt_worker.reset_mock()
+        self.z.cmd_relay([f"Q{q3}", "eu"])  # the rest, again: the first worker hears nothing twice
+        self.assertEqual([c.args[0] for c in self.mock_prompt_worker.call_args_list], ["build-two"])
+        self.assertEqual(self.question(q3)["answer"], "eu")
+
+    def test_an_answer_of_several_lines_stays_one_item_in_the_brief(self):
+        self.z.cmd_relay([f"Q{self.q1}", "use port 9196\n\nand keep 9000 as a fallback"])
+        self.assertEqual(self.question(self.q1)["answer"], "use port 9196\n\nand keep 9000 as a fallback")  # the record is verbatim
+        self.assertIn('"Which port?": "use port 9196 and keep 9000 as a fallback"\n\n## Plan', self.brief.read_text())
 
     def test_a_prompt_that_fails_leaves_the_question_open(self):
         self.mock_prompt_worker.return_value = (False, "agent_prompt_stalled")

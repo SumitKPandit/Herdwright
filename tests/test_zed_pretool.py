@@ -72,6 +72,43 @@ class PretoolTests(unittest.TestCase):
         self.assertIsNone(bash("rm -f /tmp/x"))
         self.assertIsNotNone(bash("cp ~/notes.txt ~/.ssh/x"))
 
+    def test_a_relative_write_is_resolved_where_the_shell_stands(self):
+        """S339 B1: `touch c.txt` with OpenCode's `workdir` in a project repo passed; so did `touch ../../x` on Claude Code."""
+        for command in ("touch c.txt", "rm keep.txt", "rm -rf src", "sed -i '' s/a/b/ c.txt", "mkdir -p a/b", "cp c.txt d.txt",
+                        "mv c.txt d.txt", "echo x > c.txt", "echo x | tee c.txt", "perl -pi -e s/a/b/ c.txt", "ln -s a b"):
+            for where in ({"workdir": "/code/proj"}, {"workdir": "../code/proj"}, {"cwd": "/code/proj"}):  # OpenCode, OpenCode, Claude Code
+                self.assertIn("outside Zed's repo/profile/tmp", decide("shell", command=command, **where), (command, where))
+            self.assertIsNone(decide("shell", command=command, workdir="profile/briefs"), command)  # in Zed's own repo
+            self.assertIsNone(bash(command), command)
+        self.assertIn("`touch` on c.txt in /code/proj", decide("shell", command="touch c.txt", workdir="/code/proj"))
+        for command in ("touch ../../outside.txt", "rm ../code/proj/a.py", "echo x >> ../x.txt", "touch bin/../../x"):
+            self.assertIsNotNone(bash(command), command)
+        self.assertIsNone(bash("touch ../zed-home/notes.md"))
+        self.assertIsNone(decide("shell", command="ls && cat c.txt", workdir="/code/proj"))  # reads stay free
+
+    def test_a_cd_before_a_write_is_followed(self):
+        for command in ("(cd /code/proj && touch c.txt)", "(cd /code/proj; rm -rf src)", "(cd /code && cd proj && echo x > c.txt)",
+                        "(cd ../code/proj && sed -i '' s/a/b/ c.txt)", "(cd /code/proj && git commit -m x)", "(pushd /code/proj && touch c.txt)",
+                        "cd /tmp && cd ../code/proj && touch c.txt", "ls | (cd /code/proj && tee c.txt)"):
+            self.assertIsNotNone(bash(command), command)
+        for command in ("(cd /code/proj && ls) && touch c.txt", "(cd /code/proj); touch c.txt", "cd /code/proj | touch c.txt",
+                        "cd /tmp && touch c.txt", "(cd /code/proj && git status); git commit -m x", "cd bin && touch ../notes.md"):
+            self.assertIsNone(bash(command), command)
+        # from a project repo (OpenCode's workdir), a cd into Zed's home makes the write Zed's own; one in a subshell does not
+        self.assertIsNone(decide("shell", command="cd /zed-home && touch c.txt", workdir="/code/proj"))
+        self.assertIsNotNone(decide("shell", command="(cd /zed-home) && touch c.txt", workdir="/code/proj"))
+        # a directory the shell expands cannot be followed: absolute targets are still checked, relative ones are not
+        self.assertIsNotNone(bash("cd $D && touch /code/proj/c.txt"))
+        self.assertIsNone(bash("cd $D && touch c.txt"))
+        self.assertIsNone(bash("cd - && git commit -m x"))
+
+    def test_an_edit_that_names_no_file_is_denied_to_the_lock_holder(self):
+        """S338: zed-deny denies it; here an unknown input shape (a patch without file markers) passed silently."""
+        for tool, inp in (("patch", {"patchText": "*** Begin Patch\n+x\n*** End Patch"}), ("patch", {"diff": "--- a\n+++ b"}),
+                          ("write", {"filePath": "/code/proj/a.py", "content": "x"}), ("Edit", {})):
+            self.assertIn("names no file", decide(tool, **inp), (tool, inp))
+            self.assertIsNone(decide(tool, sid="ses_worker", **inp))  # not the lock holder
+
     def test_heredoc_body_and_bad_quotes_do_not_trip(self):
         self.assertIsNone(bash("cat > /tmp/a.md <<'EOF'\ncd /code/proj\ngit push\nEOF\nls"))
         self.assertIsNone(bash("echo 'unbalanced"))

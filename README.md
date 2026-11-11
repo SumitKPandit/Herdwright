@@ -81,10 +81,13 @@ doing by mistake what its hat does not allow. They are not a sandbox. A worker t
 through another program is not stopped: a script that writes files itself (`python3 -c …`), and on OpenCode the
 server's terminal route (`/api/pty`, with the server password any process of the same user can read from the process
 list) or a server the worker starts itself. On OpenCode the server password is kept out of the worker's shell, and the
-server's two shell routes run the same check. Review and QA by sessions that did not write the code, and the git
+server's two shell routes run the same check; Zed's own OpenCode session has the tool-call check only, because its
+server's shell is the user's own (`!` in the TUI). A write is checked wherever its path points: absolute, relative to
+the call's working directory, or after a `cd`; a path the shell expands (`$DIR/x`) is not followed. Review and QA by sessions that did not write the code, and the git
 guard, do not depend on these checks. `tests/smoke_opencode.py` runs all of this against
-the installed `opencode` (not part of the default test run): a worker's start, canary, denied calls, `AGENTS.md` and
-skills; Zed's own canary, model and variant, `start`, the lock, and a denied edit and commit in a project repo.
+the installed `opencode` (not part of the default test run): a worker's start, canary, `AGENTS.md` and skills, and its
+server's shell routes refusing what the hat denies, with no model asked for anything; Zed's own canary, model and
+variant, `start`, the lock, and a denied edit, commit and relative-path shell write in a project repo.
 
 Tests: `python3 -B -m unittest discover -s tests -v`.
 

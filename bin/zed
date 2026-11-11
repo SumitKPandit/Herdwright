@@ -96,7 +96,6 @@ OPENCODE_CANARY_SECONDS = 180  # for the one model turn that makes the canary ca
 # session Zed then works in, and the watcher has an address to wake it at. The session's shell commands carry
 # COORDINATOR_ENV, the path of the record `start` checks before it lets the session act as Zed.
 COORDINATOR_ENV = "ZED_COORDINATOR"
-PRETOOL_CANARY = "zed-pretool-canary"  # bin/zed-pretool denies it in every session
 # The repository section of the worker rules names Claude Code's files; this says what OpenCode reads instead.
 OPENCODE_RULES_NOTE = """## You run on OpenCode
 
@@ -1286,15 +1285,23 @@ def session_agent_state(s):
     return a["agent_status"] if a else "gone"
 
 
-def send_prompt(conn, s, text, redirect, what):
-    """The one way Zed prompts a worker: refuses a `working` session unless redirect (lesson: don't derail a working session)."""
+def prompt_problem(s, redirect):
+    """(the agent's state, why Zed does not prompt this session now or None): an external session, one without a live
+    agent, and a `working` one unless redirect (lesson: don't derail a working session)."""
     if s["external"]:
-        die(f"S{s['id']} is external (the user's own session): not prompted")
+        return None, f"S{s['id']} is external (the user's own session): not prompted"
     state = session_agent_state(s)
     if state == "gone":
-        die(f"S{s['id']} has no live agent")
-    if reason := zedgates.prompt_refusal(state, redirect):
-        die(f"refused: S{s['id']} {reason}")
+        return state, f"S{s['id']} has no live agent"
+    reason = zedgates.prompt_refusal(state, redirect)
+    return state, f"refused: S{s['id']} {reason}" if reason else None
+
+
+def send_prompt(conn, s, text, redirect, what):
+    """The one way Zed prompts a worker, after `prompt_problem` finds nothing against it."""
+    state, problem = prompt_problem(s, redirect)
+    if problem:
+        die(problem)
     ok, err = prompt_worker(s["agent"], text)
     if not ok:
         die(f"prompt to S{s['id']} failed: {err.strip()}")
@@ -1334,9 +1341,12 @@ def note_decision(brief, line):
 
 def cmd_relay(args):
     """relay <Q> <answer> [<Q> <answer> …] [--redirect] — the user's answers to workers' questions, in one command and
-    in this order: each worker is prompted with its answers verbatim (one prompt per worker; refused while it is
-    `working` unless --redirect, and then nothing is recorded), then the answers are recorded (as `q answer`) and
-    noted in the session's brief. A question no session asked is only recorded."""
+    in this order: every worker concerned is checked first (one that is `working` refuses the whole command unless
+    --redirect: nothing is sent and nothing recorded); then each worker is prompted with its answers verbatim (one
+    prompt per worker) and, once its prompt went through, its answers are recorded (as `q answer`) and noted in its
+    brief. A prompt that fails stops the command there: the workers before it are prompted and recorded, that one and
+    those after it are neither, so running the command again for them repeats nothing. A question no session asked
+    is only recorded."""
     redirect, args = "--redirect" in args, [a for a in args if a != "--redirect"]
     if not args or len(args) % 2:
         die('relay <Q> "<answer>" [<Q> "<answer>" …] [--redirect]: one quoted answer after each question id')
@@ -1349,16 +1359,20 @@ def cmd_relay(args):
     for q, ans in answers:
         by_session.setdefault(q["session_id"], []).append((q, ans))
     sessions = {sid: resolve_session(conn, sid) for sid in by_session if sid is not None}
-    for sid, s in sessions.items():  # every prompt first: a refusal leaves the record untouched
-        parts = [f"Answer from the user to your question Q{q['id']} ({q['question'].splitlines()[0][:120]}): {ans}" for q, ans in by_session[sid]]
-        send_prompt(conn, s, "\n".join(parts) + "\nContinue.", redirect, "relay: " + ", ".join(f"Q{q['id']}" for q, _ in by_session[sid]))
-    for q, ans in answers:
-        answer_question(conn, q, ans)
-        s = sessions.get(q["session_id"])
-        if s and s["brief"] and Path(s["brief"]).is_file():
-            note_decision(Path(s["brief"]), f"- User ({now()}), Q{q['id']} \"{q['question'].splitlines()[0][:160]}\": \"{ans}\"")
-    conn.commit()
-    write_status(conn)
+    if problems := [problem for s in sessions.values() if (problem := prompt_problem(s, redirect)[1])]:
+        die("; ".join(problems) + ". Nothing was sent and nothing recorded.")
+    for sid, pairs in by_session.items():  # a session's record follows its own prompt: a later failure cannot undo or repeat it
+        s = sessions.get(sid)
+        if s:
+            parts = [f"Answer from the user to your question Q{q['id']} ({q['question'].splitlines()[0][:120]}): {ans}" for q, ans in pairs]
+            send_prompt(conn, s, "\n".join(parts) + "\nContinue.", redirect, "relay: " + ", ".join(f"Q{q['id']}" for q, _ in pairs))
+        for q, ans in pairs:
+            answer_question(conn, q, ans)
+            if s and s["brief"] and Path(s["brief"]).is_file():
+                said = " ".join(ans.split())  # one list item, whatever line breaks the answer has
+                note_decision(Path(s["brief"]), f"- User ({now()}), Q{q['id']} \"{q['question'].splitlines()[0][:160]}\": \"{said}\"")
+        conn.commit()
+        write_status(conn)
     print("recorded " + ", ".join(f"Q{q['id']}" for q, _ in answers))
 
 
@@ -2276,9 +2290,7 @@ def start_reading():
 def context_words():
     """(words per always-loaded file, budget). The budget is `context_budget_words` in the profile's
     config/settings.json (default 4000); the files are what every Zed session reads at start."""
-    files = {"AGENTS.md": ZED_HOME / "AGENTS.md", "playbook.md": ZED_HOME / "playbook.md",
-             "failure-modes.md": ZED_HOME / "failure-modes.md", "profile.md": PROFILE_DIR / "profile.md",
-             "lessons.md": PROFILE_DIR / "lessons.md"}
+    files = {f.name: f for f in [ZED_HOME / "AGENTS.md"] + start_reading()}
     budget = read_json(PROFILE_DIR / "config" / "settings.json", {}).get("context_budget_words", CONTEXT_BUDGET_WORDS)
     return {n: len(f.read_text().split()) for n, f in files.items() if f.exists()}, budget
 
@@ -2394,8 +2406,21 @@ def coordinator_permissions():
     must reach the guard instead of waiting for an answer nobody can give. Everything else keeps OpenCode's default."""
     allowed = read_json(ZED_HOME / ".claude" / "settings.json", {}).get("permissions", {}).get("allow", [])
     commands = [m.group(1) for a in allowed if (m := re.fullmatch(r"Bash\((.+):\*\)", a))]
-    commands += [str(ZED_HOME / c) for c in commands if c.startswith("bin/")] + [PRETOOL_CANARY]
+    commands += [str(ZED_HOME / c) for c in commands if c.startswith("bin/")] + [zeddeny.PRETOOL_CANARY]
     return [{"action": "shell", "resource": f"{c} *", "effect": "allow"} for c in commands]
+
+
+def coordinator_record_path():
+    return PROFILE_DIR / ".cache" / "coordinator.json"
+
+
+def server_alive(record):
+    """Whether the server a coordinator record names is still running."""
+    try:
+        os.kill(record["server_pid"], 0)
+    except (OSError, KeyError, TypeError):
+        return False
+    return True
 
 
 def coordinator_kit():
@@ -2405,7 +2430,7 @@ def coordinator_kit():
     of the record `start` checks. Under the profile's .cache, or in a temporary folder while there is no profile yet
     (onboarding copies the template to `profile/`, which must not exist before)."""
     has_profile = (PROFILE_DIR / "profile.md").exists()
-    home = PROFILE_DIR / ".cache" if has_profile else Path(tempfile.mkdtemp(prefix="zed-coordinator-"))
+    home = coordinator_record_path().parent if has_profile else Path(tempfile.mkdtemp(prefix="zed-coordinator-"))
     config_dir = zeddeny.coordinator_plugin(home / "coordinator-opencode", ZED_HOME, {"ZED_PROFILE_DIR": str(PROFILE_DIR)})
     opencode = opencode_config()
     (config_dir / "opencode.json").write_text(json.dumps({
@@ -2415,7 +2440,8 @@ def coordinator_kit():
         "permissions": coordinator_permissions(),
         "instructions": [str(p) for p in start_reading()]}, indent=2) + "\n")
     return {"config_dir": config_dir, "record": home / "coordinator.json", "model": opencode["model"],
-            "variant": opencode["variant"], "server": private_server(config_dir / "server.log")}
+            "variant": opencode["variant"], "server": private_server(config_dir / "server.log"),
+            "temporary": None if has_profile else home}
 
 
 def open_coordinator(kit):
@@ -2432,9 +2458,12 @@ def open_coordinator(kit):
     session = None
     try:
         session, problem = opencode_session(server, ZED_HOME, "zed", kit["model"], kit["variant"])
-        problem = problem or opencode_canary(server, session, PRETOOL_CANARY, "coordinator guard (bin/zed-pretool)")
+        problem = problem or opencode_canary(server, session, zeddeny.PRETOOL_CANARY, "coordinator guard (bin/zed-pretool)")
     except (OSError, ValueError, KeyError, TypeError) as e:
         problem = f"its OpenCode server at {server['url']} failed ({type(e).__name__}: {e}); its log: {server['log']}"
+    except BaseException:  # a closed terminal or Ctrl-C during the canary turn must not leave the server behind
+        process.terminate()
+        raise
     if not problem:
         kit["record"].touch(mode=0o600)  # it holds the server's password: the watcher wakes the coordinator through it
         kit["record"].write_text(json.dumps({
@@ -2450,11 +2479,7 @@ def coordinator_record():
     record = read_json(Path(path), None) if path else None
     if not record or record.get("guard") != "live" or record.get("session") != os.environ.get("OPENCODE_SESSION_ID"):
         return None
-    try:
-        os.kill(record["server_pid"], 0)
-    except (OSError, KeyError, TypeError):
-        return None
-    return record
+    return record if server_alive(record) else None
 
 
 def cmd_coordinator(args):
@@ -2468,6 +2493,10 @@ def cmd_coordinator(args):
             f"\"runtime\": \"opencode\" in {PROFILE_DIR / 'config' / 'settings.json'}.)")
     if not shutil.which("opencode"):
         die("`opencode` is not installed or not on PATH")
+    open_already = read_json(coordinator_record_path(), None)
+    if isinstance(open_already, dict) and server_alive(open_already):  # a second one would take over its record, then delete it
+        die(f"a coordinator is already open (session {open_already.get('session')}, server pid {open_already['server_pid']}, "
+            f"started {open_already.get('started_at')}): close it first. If it is gone, delete {coordinator_record_path()}.")
     kit = coordinator_kit()
     for sig in (signal.SIGHUP, signal.SIGTERM):  # a closed terminal must not leave the server behind
         signal.signal(sig, lambda number, frame: sys.exit(128 + number))
@@ -2484,7 +2513,10 @@ def cmd_coordinator(args):
             process.wait(10)
         except subprocess.TimeoutExpired:
             process.kill()
-        kit["record"].unlink(missing_ok=True)
+        if (read_json(kit["record"], None) or {}).get("server_pid") == process.pid:  # this run's record only
+            kit["record"].unlink(missing_ok=True)
+        if kit["temporary"]:
+            shutil.rmtree(kit["temporary"], ignore_errors=True)
     sys.exit(code)
 
 

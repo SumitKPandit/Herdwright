@@ -258,6 +258,16 @@ class DecideTests(unittest.TestCase):
         self.assertIn("denied", self.call("review", "shell", command="rm a.py", workdir=str(self.wt / "src")))
         self.assertIsNone(self.call("review", "shell", command="rm a.md", workdir=str(self.evidence)))
 
+    def test_a_cd_in_a_subshell_a_pipe_or_the_background_does_not_move_the_commands_after_it(self):
+        for command in (f"(cd {self.evidence}) && touch x", f"(cd {self.evidence}; ls); rm src/a.py", f"cd {self.evidence} | touch x",
+                        f"cd {self.evidence} & touch x", f"(cd {self.evidence} && (cd /tmp)) ; echo y > x", "(cd /tmp); (touch x)"):
+            self.assertIn("denied", self.bash("review", command), command)
+        for command in (f"(cd {self.evidence} && touch x)", f"(cd {self.evidence}; (cd /tmp; ls); touch x)",
+                        f"cd {self.evidence} && (cd {self.wt}; ls) && touch x", f"ls | (cd {self.evidence} && tee x)"):
+            self.assertIsNone(self.bash("review", command), command)
+        self.assertIn("denied", self.bash("review", f"cd {self.evidence} && (cd {self.wt} && touch x)"))
+        self.assertIn("denied", self.call("review", "shell", command="(cd /tmp) && touch a.py", workdir="src"))  # OpenCode
+
     def test_the_canary_command_is_denied_to_every_hat(self):
         for hat in ("build", "review", "qa"):
             for tool in ("shell", "Bash"):
