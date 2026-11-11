@@ -1,21 +1,4 @@
 {
-  "attention": {
-    "since_hours": 24,
-    "github": {
-      "login": null,
-      "repos": [],
-      "exclude_authors": [],
-      "include_drafts": false,
-      "max_age_days": 14
-    },
-    "bitbucket": {
-      "workspace": null,
-      "repos": [],
-      "exclude_authors": [],
-      "include_drafts": false,
-      "max_age_days": 14
-    }
-  },
   "bitbucket": {
     "keychain_service": "zed-bitbucket",
     "check_repo": null

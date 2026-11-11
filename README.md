@@ -34,7 +34,7 @@ about you lives in **`profile/`**, which exists only on your profile branch.
 |---|---|
 | `CLAUDE.md` | Zed's operating manual (loaded automatically by Claude Code) |
 | `playbook.md` | Lessons about tools and workflow that help every Zed |
-| `.claude/skills/` | Zed's workflows: onboarding, new-task, check-workers, relay, wrap-up, learn, attention |
+| `.claude/skills/` | Zed's workflows: onboarding, new-task, check-workers, relay, wrap-up, learn |
 | `templates/` | Core worker rules (system prompt) and the brief skeleton |
 | `bin/zed` | Task DB and herdr session driver (`bin/zed help`) |
 | `bin/bb` | Bitbucket PR helper for workers |

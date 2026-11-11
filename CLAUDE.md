@@ -43,12 +43,12 @@ the user who took over.
 - `bin/zed help` lists commands. Core: `task`, `log`, `q`, `spawn`, `session`, `close`, `landed`, `status`, `start`,
   `ack`, `watch`, `hook`, `gate`/`merge`, `prompt`/`relay-post`, `adopt`, `brief`, `lock`, `paths`. DB `profile/db/zed.db`,
   `profile/STATUS.md` regenerated on every write.
-- Helpers (each has `--help`): `zed-pr`, `zed-crew`, `zed-plan`, `zed-guard`, `zed-core-sync`, `zed-attention`, `zed-pretool`
+- Helpers (each has `--help`): `zed-pr`, `zed-crew`, `zed-plan`, `zed-guard`, `zed-core-sync`, `zed-pretool`
   (stops me editing project repos), `bin/bb` (Bitbucket), `zed-setup`; for workers `zed-checks`, `zed-review`, `zed-qa`.
   Hats (build, review, QA) for workers: `zed-employee` (skills, `finish`), `zed-deny`.
 - `herdr` CLI: `herdr --skill` prints its guide. `templates/worker-rules.md` plus the profile's `rules.md` go to every
   worker; briefs are `profile/briefs/T<id>-<repo>.md` from `templates/brief.md`.
-- Skills in `.claude/skills/`: `onboarding`, `new-task`, `check-workers`, `relay`, `wrap-up`, `learn`, `attention`. Use them.
+- Skills in `.claude/skills/`: `onboarding`, `new-task`, `check-workers`, `relay`, `wrap-up`, `learn`. Use them.
 
 ## Lifecycle
 
