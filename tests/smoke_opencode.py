@@ -10,7 +10,8 @@ It proves, and prints the evidence for:
 1. a worker whose deny plugin does not load (the V1 plugin Zed used to write, which V2 ignores) fails the canary: its
    session is marked failed, no TUI is started and no brief is handed over;
 2. a worker with the V2 plugin passes the canary, runs the configured model and variant, is denied what its hat (review)
-   denies, and has read the repository's `AGENTS.md` and Zed's rules, but not `CLAUDE.md`.
+   denies (a write and an edit in the worktree, a command, a subagent), has read the repository's `AGENTS.md` and Zed's
+   rules but not `CLAUDE.md`, and has loaded one repository skill from `.claude/skills` and one from `.opencode/skills`.
 """
 import contextlib
 import io
@@ -48,7 +49,7 @@ class OpenCodeWorkerSmoke(unittest.TestCase):
         self.root = Path(tmp.name).resolve()
         self.profile, self.repo, self.evidence = self.root / "profile", self.root / "demo", self.root / "evidence"
         self.worktree = self.root / "wt" / "demo" / "smoke"
-        self.words = {name: f"{name}-{secrets.token_hex(3)}" for name in ("REPO", "CLAUDE", "RULES")}
+        self.words = {name: f"{name}-{secrets.token_hex(3)}" for name in ("REPO", "CLAUDE", "RULES", "SKILLC", "SKILLO")}
         (self.profile / "config").mkdir(parents=True)
         self.evidence.mkdir()
         self.repo.mkdir()
@@ -60,6 +61,11 @@ class OpenCodeWorkerSmoke(unittest.TestCase):
             zedlib.git(self.repo, *cmd)
         (self.repo / "AGENTS.md").write_text(f"# Demo\nThe repository code word is {self.words['REPO']}.\n")
         (self.repo / "CLAUDE.md").write_text(f"# Demo\nThe repository code word is {self.words['CLAUDE']}.\n")
+        for folder, name, word in ((".claude", "smoke-claude-skill", "SKILLC"), (".opencode", "smoke-opencode-skill", "SKILLO")):
+            skill = self.repo / folder / "skills" / name / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text(f"---\nname: {name}\ndescription: Gives the code word of {name}. Load it when asked for that code word.\n---\n"
+                             f"The code word of this skill is {self.words[word]}.\n")
         zedlib.git(self.repo, "add", ".")
         zedlib.git(self.repo, "commit", "-qm", "init")
         self.worktree.parent.mkdir(parents=True)
@@ -69,9 +75,11 @@ class OpenCodeWorkerSmoke(unittest.TestCase):
             "# Brief: startup check of this worker\n\n## Goal\n"
             f"1. Write every code word that your instructions give you (not this brief) into the file "
             f"{self.evidence}/words.txt, one per line.\n"
-            "2. Reply with the single line ZED:DONE and stop.\n\n"
-            "## Plan\n- The two steps above are the plan. Write no plan file and read no other file.\n\n"
-            "## Definition of done\n- Step 2 is reached.\n")
+            "2. Load the skill smoke-claude-skill and the skill smoke-opencode-skill with the skill tool (do not read their "
+            f"files) and write the code word each one gives into the file {self.evidence}/skills.txt, one per line.\n"
+            "3. Reply with the single line ZED:DONE and stop.\n\n"
+            "## Plan\n- The three steps above are the plan. Write no plan file and read no other file.\n\n"
+            "## Definition of done\n- Step 3 is reached.\n")
         for name, value in (("PROFILE_DIR", self.profile), ("DB_PATH", self.profile / "db" / "zed.db"),
                             ("PROJECTS_PATH", self.profile / "config" / "projects.json")):
             patcher = patch.object(zedlib, name, value)
@@ -169,6 +177,8 @@ class OpenCodeWorkerSmoke(unittest.TestCase):
         # what a review hat is denied, asked for outright (a model that knows its rules does not try them by itself)
         self.ask(session, f"Call the write tool exactly once with the path {self.worktree}/denied.txt and the content x.")
         self.ask(session, "Call the shell tool exactly once with exactly this command: gh pr comment 1 --body x")
+        self.ask(session, f"Call the edit tool exactly once on the file {self.worktree}/AGENTS.md, replacing the word Demo with the word Changed.")
+        self.ask(session, "Start exactly one subagent with the task: reply with the single word HELLO.")
         messages = self.api("GET", f"/session/{session}/message")
         calls = self.tool_calls(session)
         denied = lambda c: c["state"]["status"] == "error"
@@ -191,10 +201,16 @@ class OpenCodeWorkerSmoke(unittest.TestCase):
 
         inside = lambda c: self.worktree in (self.worktree / str(c["state"]["input"].get("path", ""))).resolve().parents
         edits = [c for c in calls if c.get("name") in ("write", "edit") and inside(c)]  # the hat may write outside the worktree
-        self.assertTrue(edits, "the model made no edit call in the worktree, so the edit rule was not exercised: run again")
+        for tool in ("write", "edit"):
+            made = [c for c in edits if c["name"] == tool]
+            self.assertTrue(made, f"the model made no {tool} call in the worktree, so that rule was not exercised: run again")
+            self.say(tool, f"{made[0]['state']['input'].get('path')} -> {reason(made[0])}")
         self.assertTrue(all(denied(c) and "zed-deny: editing" in reason(c) for c in edits), edits)
         self.assertFalse((self.worktree / "denied.txt").exists())
-        self.say("edit", f"{edits[0]['name']} {edits[0]['state']['input'].get('path')} -> {reason(edits[0])}")
+        subagents = [c for c in calls if c.get("name") in self.z.zeddeny.SUBAGENT_TOOLS]
+        self.assertTrue(subagents, f"the model started no subagent ({sorted({c.get('name') for c in calls})}), so that rule was not exercised: run again")
+        self.assertTrue(all(denied(c) and "this hat starts no subagents" in reason(c) for c in subagents), subagents)
+        self.say("subagent", f"{subagents[0]['name']} -> {reason(subagents[0])}")
         posts = [c for c in calls if "gh pr comment" in str(c["state"]["input"].get("command", ""))]
         self.assertTrue(posts, "the model made no `gh pr comment` call, so the command rule was not exercised: run again")
         self.assertTrue(all(denied(c) and "`gh pr comment` is denied" in reason(c) for c in posts), posts)
@@ -207,6 +223,12 @@ class OpenCodeWorkerSmoke(unittest.TestCase):
         reads = [str(c["state"]["input"].get("path", "")) for c in calls if c.get("name") == "read" and not denied(c)]  # that worked
         self.assertFalse([p for p in reads if "rules" in p or p.endswith("AGENTS.md")], reads)  # ... not from reading a file
         self.assertNotIn(self.words["CLAUDE"], words)  # CLAUDE.md is not read by OpenCode V2
+        loaded = (self.evidence / "skills.txt").read_text() if (self.evidence / "skills.txt").exists() else ""
+        self.say("skill code words the worker wrote", loaded.split())
+        self.assertIn(self.words["SKILLC"], loaded)  # the repository's .claude/skills
+        self.assertIn(self.words["SKILLO"], loaded)  # the repository's .opencode/skills
+        self.assertFalse([p for p in reads if p.endswith("SKILL.md")], reads)  # through the skill tool, not by reading the file
+        self.say("skill tool calls", [json.dumps(c["state"]["input"]) for c in calls if c.get("name") == "skill"])
         # the worker's shell commands run in its server: the session's pane must host it, or `zed-employee finish` refuses
         server_pid = self.api("GET", "/info")["pid"]
         info = json.loads(subprocess.run(["herdr", "pane", "process-info", "--pane", s["pane_id"]], capture_output=True, text=True).stdout)

@@ -86,7 +86,7 @@ LIMIT_PATTERNS = [r"hit your \w+ limit", r"usage limit reached", r"limit reached
 # shell commands in the server, and a hat session is known by the pane that hosts its processes (zedemployee.process_pane).
 # The TUI takes no model flag, so spawn creates the session through the server's API with the model and variant from
 # <profile>/config/opencode.json and attaches the TUI to it. The TUI showed no dialog at start.
-OPENCODE_DEFAULTS = {"model": "opencode/nemotron-3.5-super-vl-free", "variant": "xhigh"}
+OPENCODE_DEFAULTS_PATH = ZED_HOME / "profile.template" / "config" / "opencode.json"  # the one place the defaults live
 OPENCODE_START_TIMEOUT_MS = 180000
 OPENCODE_SERVER_SECONDS = 60  # for the server to answer after `opencode serve`
 OPENCODE_CANARY_SECONDS = 180  # for the one model turn that makes the canary call
@@ -378,8 +378,9 @@ def read_json(path, default):
 
 
 def opencode_config():
-    """The profile's config/opencode.json: {"model" ("provider/model"), "variant"}; a missing key takes OPENCODE_DEFAULTS."""
-    return OPENCODE_DEFAULTS | read_json(OPENCODE_CONFIG_PATH, {})
+    """The profile's config/opencode.json: {"model" ("provider/model"), "variant"}; a missing file or key takes the
+    value in the profile template's opencode.json."""
+    return read_json(OPENCODE_DEFAULTS_PATH, {}) | read_json(OPENCODE_CONFIG_PATH, {})
 
 
 def pick_model(kind):
@@ -1110,14 +1111,15 @@ def cmd_spawn(args):
         require_capacity(conn, tid)
         model, effort, model_why = pick_model(kind)
     else:  # claude.json names Claude models and efforts: an OpenCode worker's model and variant are in opencode.json
-        model, effort, model_why = opencode_config()["model"], opencode_config()["variant"], "opencode.json"
+        opencode = opencode_config()
+        model, effort, model_why = opencode["model"], opencode["variant"], "opencode.json"  # `effort` carries the variant
     if "model" in kv:
         model, model_why = kv["model"], "given to spawn"
     if runtime == "opencode" and not re.fullmatch(r"[^/\s]+/\S+", model):
         die(f"an OpenCode model is written provider/model, not '{model}'")
     if "effort" in kv:
         effort, model_why = kv["effort"], model_why + "; effort given to spawn"
-    if effort and effort not in EFFORTS:
+    if runtime == "claude" and effort and effort not in EFFORTS:  # an OpenCode variant is the model's own word
         die(f"invalid effort '{effort}': {EFFORTS}")
 
     agent = kv.get("name") or f"{hat}-t{tid}"
