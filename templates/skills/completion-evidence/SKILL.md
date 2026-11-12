@@ -30,7 +30,8 @@ describes the code as it was when it ran: after any code change, run it again.
 - `blockers`, with the findings file, is for what was checked and failed: in a review a `[blocker]` finding, in QA a
   case that failed or is blocked.
 - A review that could not be completed, with no `[blocker]` found, gives no verdict: `HW:BLOCKED` or `HW:QUESTION`,
-  as below.
+  as below. A QA that could not run a case (its environment is down, a login is missing) records the case as
+  blocked and gives `blockers`; `HW:BLOCKED` is for a QA that could write no report at all.
 - A decision that is missing: `HW:QUESTION`. An ambiguous, unrelated or missing answer is not a resolution; ask again.
 - A capability, setup, check or piece of evidence that is unavailable: `HW:BLOCKED`, naming what is missing. Do not
   run later steps as though it had passed.

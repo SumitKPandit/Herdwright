@@ -5,6 +5,7 @@ import contextlib
 import io
 import re
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -177,6 +178,10 @@ class GuaranteeTests(unittest.TestCase):
                          "`hw-employee finish --verdict ...`")
         self.assert_says("qa-web", "qa", "`hw-qa report-check <dir>` must pass before `hw-employee finish`")
         self.assert_says("completion-evidence", "qa", "`clean`", "`blockers`", "`HW:BLOCKED`")
+        # T109 round 2: a QA whose environment is down read both "blocked case → blockers" and "unavailable → HW:BLOCKED"
+        self.assert_says("completion-evidence", "qa", "A QA that could not run a case (its environment is down, a login is "
+                         "missing) records the case as\n  blocked and gives `blockers`; `HW:BLOCKED` is for a QA that could "
+                         "write no report at all.")
 
 
 class ContentTests(unittest.TestCase):
@@ -245,8 +250,42 @@ class UnfinishedWorkTests(unittest.TestCase):
         self.assertEqual(verdict_problems("pass", "blockers"), ["verdict is blockers but no case failed or is blocked"])
 
 
+def own_change(repo, bases=BASE_BRANCHES):
+    """The diff of the checkout's own change: its working tree against where it forked from the first base branch
+    found (None when there is none). Once the change is merged HEAD is that fork point, so the diff would be empty and
+    prove nothing: the last change merged (from HEAD's first parent) is read instead."""
+    git = lambda *args: subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    base = next((b for b in bases if git("rev-parse", "--verify", "--quiet", b).returncode == 0), None)
+    if base is None:
+        return None
+    fork = git("merge-base", "HEAD", base).stdout.strip()
+    if fork == git("rev-parse", "HEAD").stdout.strip():
+        fork = git("rev-parse", "HEAD^1").stdout.strip()
+    return git("diff", fork).stdout
+
+
 class OwnDiffTests(unittest.TestCase):
     """This repository's own change passes the code rules a script can check."""
+
+    def test_the_own_change_is_read_before_and_after_it_is_merged(self):
+        """T109 round 2: after the merge the check compared HEAD with itself and passed on an empty diff."""
+        with tempfile.TemporaryDirectory() as tmp:
+            git = lambda *a: subprocess.run(["git", "-C", tmp, *a], check=True, capture_output=True, text=True)
+            git("init", "-q", "-b", "herdwright")
+            git("config", "user.email", "t@t")
+            git("config", "user.name", "t")
+            (Path(tmp) / "a.py").write_text("x = 1\n")
+            git("add", ".")
+            git("commit", "-qm", "init")
+            git("checkout", "-qb", "feature")
+            (Path(tmp) / "a.py").write_text("x = 1\nbreakpoint()\n")
+            git("commit", "-qam", "change")
+            kinds = lambda: [f["kind"] for f in review.analyze(own_change(tmp, ("herdwright",)))["debug_leftovers"]]
+            self.assertEqual(kinds(), ["debugger"])  # on the branch
+            git("checkout", "-q", "herdwright")
+            git("merge", "-q", "--no-ff", "-m", "merge", "feature")
+            self.assertEqual(kinds(), ["debugger"])  # merged: HEAD is the base branch
+        self.assertIsNone(own_change(_load.HOME, ("no-such-branch",)))
 
     def test_rule_11_asks_what_this_repository_does(self):
         row = re.search(r"^\| 11 \| (.+?) \| (.+?) \|$", skill_text("code-rules", "build"), re.M)
@@ -255,15 +294,15 @@ class OwnDiffTests(unittest.TestCase):
                                         "user is the source of the why, the comment names it."))
 
     def test_the_change_on_this_branch_passes_the_script_checked_rules(self):
+        """Reads the tracked files only: a file never added is not in the diff. A dependency a brief records is
+        allowed by rule 13; one would have to be listed here."""
         rows = dict(re.findall(r"^\| (\d+) \| (.+?) \| .+? \|$", skill_text("code-rules", "build"), re.M))
         for number, (words, _) in SCRIPT_CHECKED_RULES.items():
             self.assertIn(words, rows[str(number)], number)
-        git = lambda *args: subprocess.run(["git", "-C", str(_load.HOME), *args], capture_output=True, text=True)
-        base = next((b for b in BASE_BRANCHES if git("rev-parse", "--verify", "--quiet", b).returncode == 0), None)
-        if base is None:
+        diff = own_change(_load.HOME)
+        if diff is None:
             self.skipTest("no base branch in this checkout")
-        fork = git("merge-base", "HEAD", base).stdout.strip()
-        facts = review.analyze(git("diff", fork).stdout)
+        facts = review.analyze(diff)
         leftovers = [f for f in facts["debug_leftovers"] if f["kind"] != "print("]
         for number, (_, fact) in SCRIPT_CHECKED_RULES.items():
             self.assertEqual(leftovers if fact == "debug_leftovers" else facts[fact], [], f"rule {number}")
