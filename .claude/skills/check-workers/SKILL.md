@@ -44,7 +44,8 @@ repeat), and flags a usage limit and wakes me once. Each event it prints is
      automation requirement, not an active guarantee.
    - `GONE` → find out (pane closed? crash?), tell the user, propose resuming with a new session on the
      same branch.
-3. **Ack what you handled:** `bin/hw ack E<id> …` (or `--all`). An un-acked event is shown again.
+3. **Ack what you handled:** `bin/hw ack E<id> …` (or `--all`). An un-acked event is shown again once a whole turn of
+   yours has ended with it in front of you.
 4. Commit the profile if anything changed.
 5. The watcher is kept running as the manual's "Runtime differences" say for this install's runtime.
    One watcher at a time; a second exits with `WATCH_ALREADY_RUNNING`.

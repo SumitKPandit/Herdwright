@@ -20,7 +20,9 @@ The server (HTTP basic auth, user `opencode`, password $OPENCODE_PASSWORD), unde
                                            dies); `opencode-held` keeps the caller waiting until the file is removed
                                            (`opencode-held.reached` appears once a caller waits).
   POST /experimental/session/<id>/wait     returns at once: nothing here takes time
-  GET  /session/<id>/message               the session's messages, tool calls as OpenCode v2.2.7 reports them
+  GET  /session/<id>/message[?limit=N]     the session's messages, newest first, tool calls as OpenCode v2.2.7 reports
+                                           them; a turn's end is an `idle` message: at once after a prompt without a
+                                           TUI, and for the session a TUI is on when the test ends its turn (`rest`)
 
 The screen is what `herdr agent read` showed of OpenCode v2.2.7 on 2026-11-12: a prompt is echoed behind a bar, a
 message is indented without a bullet and followed by a line naming the agent, model and time, and the idle input box
@@ -114,7 +116,7 @@ class Api(BaseHTTPRequestHandler):
             return self.answer(401, "unauthorized")
         length = int(self.headers.get("content-length") or 0)
         body = json.loads(self.rfile.read(length) or "{}") if length else {}
-        path = self.path.removeprefix("/api")
+        path, _, query = self.path.removeprefix("/api").partition("?")
         if (method, path) == ("GET", "/info"):
             return self.answer(200, {"version": VERSION})
         if (method, path) == ("POST", "/session"):
@@ -130,7 +132,9 @@ class Api(BaseHTTPRequestHandler):
         if m.group(2) == "wait":
             return self.answer(200, None)
         if m.group(2) == "message":
-            return self.answer(200, session["messages"])
+            limit = re.fullmatch(r"limit=(\d+)", query)
+            newest_first = session["messages"][::-1]
+            return self.answer(200, newest_first[:int(limit.group(1))] if limit else newest_first)
         if self.told("opencode-down"):
             return self.answer(500, "the server cannot take a prompt now")
         if self.told("opencode-cut"):
@@ -163,7 +167,8 @@ class Api(BaseHTTPRequestHandler):
                 {"status": "completed", "input": {"command": command}}
             reply["content"].append({"type": "tool", "name": "shell", "executed": False, "state": state})
         with store.locked() as state:
-            state["panes"][self.pane]["opencode"][session_id]["messages"] += [message, reply]
+            state["panes"][self.pane]["opencode"][session_id]["messages"] += [message] if on_screen else \
+                [message, reply, store.idle_message()]
         if on_screen:
             store.agent_event(self.pane, "prompt", text)
         return {k: message[k] for k in ("id", "sessionID")}

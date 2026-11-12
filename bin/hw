@@ -2203,21 +2203,35 @@ def deliver_answers(conn, s, seq, alerts):
 _watcher_lock = None  # held open for the life of this watcher; the kernel drops it when the process dies
 
 
-MAX_SHOWS = 3  # an un-acked wake is re-presented by `watch` until it has been shown this many times
-REPRESENT_SECONDS = 300  # the long-lived watcher shows an event again when it is still un-acked this long after it was last shown
+MAX_SHOWS = 3  # an un-acked wake is shown again until it has been shown this many times
+REPRESENT_SECONDS = 300  # OpenCode, a wake typed into the pane (no message id to follow): shown again this long after it was last shown
+REPLY_WINDOW = 50  # the coordinator's latest messages read to find the turn's end that follows a wake (newest first)
 
 
 @contextlib.contextmanager
 def wake_queue():
-    """The durable wake queue ({"next": n, "events": [{"id", "ts", "text", "shown", "shown_at", "acked", "wake"}]}),
-    under a file lock because the watcher appends while Herdwright acks. Changes are saved on exit. `shown_at` is when the
-    event was last shown (epoch); `wake` is the receipt of the long-lived watcher's last prompt for it (wake_coordinator)."""
+    """The durable wake queue, under a file lock because the watcher appends while Herdwright acks. Changes are saved
+    on exit. {"next": n, "turn": t, "running": bool, "events": [{"id", "ts", "text", "shown", "shown_at", "due_turn",
+    "acked", "wake"}]}.
+    Claude Code: `turn` counts Herdwright's finished turns and `running` says one has started since the last counted
+    (`hook turn-start` on a prompt, or a wake this queue delivered); a Stop counts only then, so a second Stop of the
+    same turn (another Stop hook blocked the first) does not. `due_turn` is the count at which an un-acked event is
+    shown again: one turn on when it reached an idle Herdwright (the turn its wake starts), two when a turn was running
+    (it is read only in the next one). OpenCode: `wake` is the receipt of the long-lived watcher's last prompt for it
+    (wake_coordinator); `shown_at` is when it was last shown (epoch)."""
     WAKE_QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(WAKE_QUEUE_PATH.with_suffix(".guard"), "w") as guard:
         fcntl.flock(guard, fcntl.LOCK_EX)
         q = read_json(WAKE_QUEUE_PATH, {"next": 1, "events": []})
+        q.setdefault("turn", 0)
+        q.setdefault("running", True)  # a queue from before turns were counted: the first Stop counts
         yield q
         WAKE_QUEUE_PATH.write_text(json.dumps(q))
+
+
+def mark_shown(q, e):
+    """Mark `e` as shown to Herdwright now; a shown event wakes Herdwright, so a turn runs from here on."""
+    e["shown_at"], e["due_turn"] = time.time(), q["turn"] + (2 if q["running"] else 1)
 
 
 def queue_add(lines):
@@ -2225,22 +2239,80 @@ def queue_add(lines):
     out = []
     with wake_queue() as q:
         for text in lines:
-            q["events"].append({"id": q["next"], "ts": now(), "text": text, "shown": 1, "shown_at": time.time(), "acked": False})
+            e = {"id": q["next"], "ts": now(), "text": text, "shown": 1, "acked": False}
+            mark_shown(q, e)
+            q["events"].append(e)
             out.append(f"[E{q['next']}] {text}")
             q["next"] += 1
+        q["running"] = q["running"] or bool(lines)
     return out
 
 
-def queue_represent(older_than=0):
-    """Un-acked events to show again (a handling turn that crashed or hit a limit never acked them). Each is
-    re-presented at most MAX_SHOWS times in total so a forgotten ack can't wake Herdwright forever; `hw start` lists
-    them regardless. `older_than`: only those last shown at least that many seconds ago (the long-lived watcher asks
-    on every look; a one-shot watcher shows them all once, when it starts)."""
+def queue_turn_started():
+    """A turn of Herdwright started (`hook turn-start`, on the user's prompt)."""
     with wake_queue() as q:
-        again = [e for e in q["events"] if not e["acked"] and e["shown"] < MAX_SHOWS and time.time() - e.get("shown_at", 0) >= older_than]
+        q["running"] = True
+
+
+def queue_end_turn():
+    """A Stop: counts as the end of a turn only when a turn start was recorded since the last one counted."""
+    with wake_queue() as q:
+        if q["running"]:
+            q["turn"], q["running"] = q["turn"] + 1, False
+
+
+def due_by_turn(q, e):
+    return q["turn"] >= e.get("due_turn", 0)  # an event from before turns were counted is due at once
+
+
+def queue_due():
+    """Whether an un-acked event is due again by Herdwright's turns (Claude Code)."""
+    with wake_queue() as q:
+        return any(not e["acked"] and e["shown"] < MAX_SHOWS and due_by_turn(q, e) for e in q["events"])
+
+
+def queue_represent(due=due_by_turn):
+    """Un-acked events to show again (a handling turn that crashed, hit a limit or forgot never acked them), read
+    under the queue's lock at the moment of the call, so an ack that landed before it wins. `due(q, e)` decides which:
+    by Herdwright's turns (Claude Code, see wake_queue) or by its OpenCode session (due_by_reply). Each is shown at most
+    MAX_SHOWS times in total, so a forgotten ack can't wake Herdwright forever; `hw start` lists them regardless."""
+    with wake_queue() as q:
+        again = [e for e in q["events"] if not e["acked"] and e["shown"] < MAX_SHOWS and due(q, e)]
         for e in again:
-            e["shown"], e["shown_at"] = e["shown"] + 1, time.time()
+            e["shown"] += 1
+            mark_shown(q, e)
+        q["running"] = q["running"] or bool(again)
         return [f"[E{e['id']}] (again, un-acked since {e['ts']}) {e['text']}" for e in again]
+
+
+def due_by_reply(record):
+    """The re-show rule of the long-lived watcher (OpenCode), as `due` for queue_represent: an event whose wake the
+    coordinator's server admitted is due once a turn of its session has ended after that message entered it (an
+    `idle` message follows it: the turn had the event in front of it), however long that took. A wake typed into the
+    pane has no message to follow and is due REPRESENT_SECONDS after it was shown. The server is asked only while an
+    admitted wake is waiting; when it does not answer, nothing is due by it this time."""
+    waiting = {e["wake"]["message"] for e in queue_pending() if (e.get("wake") or {}).get("via") == "api"}
+    turn_ended = set()
+    if waiting:
+        path = f"/session/{record['session']}/message"
+        try:
+            messages = opencode_api(record["server"], "GET", f"{path}?limit={REPLY_WINDOW}")
+            if len(messages) == REPLY_WINDOW and waiting - {m["id"] for m in messages}:
+                messages = opencode_api(record["server"], "GET", path)  # a wake older than the window: read them all
+        except Exception:  # the watcher must outlive its server's hiccups
+            messages = []
+        ended = False
+        for m in messages:  # newest first
+            ended = ended or m.get("type") == "idle"
+            if ended and m["id"] in waiting:
+                turn_ended.add(m["id"])
+
+    def due(q, e):
+        wake = e.get("wake") or {}
+        if wake.get("via") == "api":
+            return wake["message"] in turn_ended
+        return time.time() - e.get("shown_at", 0) >= REPRESENT_SECONDS
+    return due
 
 
 def queue_receipt(lines, receipt):
@@ -2258,7 +2330,7 @@ def queue_pending():
 
 
 def cmd_ack(args):
-    """ack <E-id>... | ack --all — retire handled wake events (shown again by `watch` and `start` until acked)."""
+    """ack <E-id>... | ack --all — retire handled wake events (until acked, shown again after a further turn of Herdwright, and listed by `start`)."""
     if not args:
         die("ack <E-id>... | ack --all")
     require_profile()
@@ -2332,9 +2404,9 @@ def cmd_watch(args):
       watch --once     exits after the first event(s) and remembers what it has reported, so a re-armed watch only
                        reports new changes (Claude Code: the Stop hook re-arms it after every turn)
       watch --daemon   OpenCode, which has no such hook: one long-lived process, started by `start`. For every new
-                       event, and for one still un-acked REPRESENT_SECONDS after it was last shown, it wakes the
-                       coordinator's session through its server (wake_coordinator) and keeps the receipt on the event.
-                       It ends when the coordinator's server is gone.
+                       event, and for one still un-acked after a turn of the coordinator's session has ended with it
+                       (due_by_reply), it wakes the coordinator's session through its server (wake_coordinator) and
+                       keeps the receipt on the event. It ends when the coordinator's server is gone.
     One watcher per profile. Exits (3) when this session loses the Herdwright lock."""
     once, daemon = "--once" in args, "--daemon" in args
     until_idle = "--exit-when-idle" in args  # the Stop hook's watcher gives up when no work is tracked any more
@@ -2349,7 +2421,7 @@ def cmd_watch(args):
     if not claim_watcher():
         print(f"WATCH_ALREADY_RUNNING pid {watcher_alive()}: one watcher is enough; it will wake Herdwright.", flush=True)
         sys.exit(4)
-    again = [] if daemon else queue_represent()  # the long-lived watcher was started by `start`, which lists them itself
+    again = [] if daemon else queue_represent()  # due ones only: the long-lived watcher's `start` lists them all itself
     for line in again:
         print(line, flush=True)
     if once and again:
@@ -2432,7 +2504,7 @@ def cmd_watch(args):
             conn.close()
         except Exception as e:  # keep the watch alive through transient failures
             print(f"watch error: {e}", file=sys.stderr, flush=True)
-        shown = queue_add(events) + (queue_represent(REPRESENT_SECONDS) if daemon else [])
+        shown = queue_add(events) + (queue_represent(due_by_reply(record)) if daemon else [])
         # What this look has seen is saved as soon as its events are queued, before the wake (a call that can take
         # long): a watcher stopped in between would have its successor read the same reports and raise them again.
         WATCH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -2567,17 +2639,24 @@ def has_tracked_work():
 
 
 def cmd_hook(args):
-    """hook arm | hook stop-guard — Claude Code `Stop` hooks (see .claude/settings.json). Both act only in the
-    session that holds the profile lock and only while sessions are tracked, so read-only sessions are untouched.
-      arm         (asyncRewake) runs the watcher inside the hook: re-arming takes no model turn. It exits 2, which
-                  wakes Herdwright with the events on stderr, only when there are events (or the lock is lost). One watcher
-                  at a time; it gives up quietly when no work is tracked any more.
-      stop-guard  blocks ending a turn with tracked work and no live watcher, once per stop (stop_hook_active)."""
+    """hook arm | hook stop-guard | hook turn-start — Claude Code hooks (see .claude/settings.json). They act only in
+    the session that holds the profile lock, arm and stop-guard only while sessions are tracked, so read-only sessions
+    are untouched.
+      arm         (Stop, asyncRewake) counts the turn that ended, shows again the un-acked events now due (see
+                  wake_queue), and otherwise runs the watcher inside the hook: re-arming takes no model turn. It exits
+                  2, which wakes Herdwright with the events on stderr, only when there are events (or the lock is lost).
+                  One watcher at a time; it gives up quietly when no work is tracked any more.
+      stop-guard  (Stop) blocks ending a turn with tracked work and no live watcher, once per stop (stop_hook_active).
+      turn-start  (UserPromptSubmit) records that a turn of Herdwright is running."""
     mode = args[0] if args else ""
-    if mode not in ("arm", "stop-guard"):
-        die("hook arm | hook stop-guard")
+    if mode not in ("arm", "stop-guard", "turn-start"):
+        die("hook arm | hook stop-guard | hook turn-start")
     data = hook_input()
     try:
+        if mode == "turn-start":
+            if holds_lock():
+                queue_turn_started()
+            return
         if not holds_lock() or not has_tracked_work() or (mode == "stop-guard" and data.get("stop_hook_active")):
             return
         if mode == "stop-guard":
@@ -2594,14 +2673,23 @@ def cmd_hook(args):
             sys.exit(2)
         ARM_STAMP_PATH.parent.mkdir(parents=True, exist_ok=True)
         ARM_STAMP_PATH.touch()
-        if watcher_alive():
-            return
         armed_at = time.time()
-        try:
-            with contextlib.redirect_stdout(sys.stderr):
-                woke = cmd_watch(["--once", "--exit-when-idle"])
-        except SystemExit as e:  # 3: lock lost (the message is already on stderr); 4: another watcher won the race
-            woke = e.code == 3
+        queue_end_turn()
+        again = []
+        if queue_due():
+            time.sleep(ARM_MIN_SECONDS)  # wait first, so the queue is read right before the wake is printed
+            again = queue_represent()
+            for line in again:
+                print(line, file=sys.stderr, flush=True)
+        woke = bool(again)
+        if not woke:
+            if watcher_alive():
+                return
+            try:
+                with contextlib.redirect_stdout(sys.stderr):
+                    woke = cmd_watch(["--once", "--exit-when-idle"])
+            except SystemExit as e:  # 3: lock lost (the message is already on stderr); 4: another watcher won the race
+                woke = e.code == 3
         if woke:
             time.sleep(max(0, ARM_MIN_SECONDS - (time.time() - armed_at)))
             sys.exit(2)
@@ -3138,9 +3226,9 @@ def cmd_help(args):
   merge <branch> [dir] [--override "<reason>"]
                                      `git merge --no-ff` only past the gate; --override is the user's call, logged
   adopt <pane-id> <T> [repo=]        track a session Herdwright didn't start (user's own)
-  hook arm | hook stop-guard         Claude Stop hooks (.claude/settings.json): tokenless watcher re-arm and a
-                                     turn-end guard; act only in the session holding the lock
-  ack <E-id>... | ack --all          retire handled watcher events; un-acked ones are shown again by `watch`
+  hook arm | stop-guard | turn-start Claude hooks (.claude/settings.json): tokenless watcher re-arm, a turn-end
+                                     guard and a turn-start mark; act only in the session holding the lock
+  ack <E-id>... | ack --all          retire handled watcher events; un-acked ones are shown again after a further turn
                                      (up to 3 times) and always by `start`
   watch [interval-seconds] [--once | --daemon]
                                      run under Monitor, or `watch --once` as a background shell: exits after the first

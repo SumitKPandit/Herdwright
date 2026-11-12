@@ -2,6 +2,7 @@
 `bin/hw relay`. OpenCode's server is the fake from test_hw_assign; tests/smoke_opencode.py runs the same flow against
 the installed `opencode`."""
 import json
+import re
 import os
 import stat
 import subprocess
@@ -487,17 +488,62 @@ class WakeTests(CoordinatorCase):
         self.assertEqual((receipt["via"], receipt["error"]), (None, "ConnectionRefusedError: connection refused; herdr: agent_not_found"))
         self.assertIn("this session is in no herdr pane", self.z.wake_coordinator(self.RECORD, None, ["[E1] S1 asks"])["error"])
 
-    def test_a_receipt_is_kept_on_its_events_and_an_event_is_shown_again_only_after_a_while(self):
+    def session_messages(self, *messages):
+        """The coordinator's session as its server lists it (OpenCode v2.2.7, seen 2026-11-12): newest first; a
+        turn's end is an `idle` message; a prompt keeps the id its admission returned."""
+        listed = [{"id": i, "type": kind} for i, kind in messages]
+        calls = []
+
+        def api(server, method, path, body=None, timeout=30):
+            calls.append(path)
+            limit = re.search(r"\?limit=(\d+)$", path)
+            return listed[:int(limit.group(1))] if limit else listed
+        return patch.object(self.z, "opencode_api", side_effect=api), calls
+
+    def test_a_receipt_is_kept_and_an_event_is_shown_again_once_a_turn_has_ended_with_it(self):
+        """T121: not after five minutes but after the coordinator's session ended a turn with the wake in front of it,
+        however long that turn ran; a wake typed into the pane has no message to follow and keeps the timer."""
         shown = self.z.queue_add(["S1 asks", "S2 is gone"])
         self.z.queue_receipt(shown[:1], {"via": "api", "message": "msg_9"})
+        self.z.queue_receipt(shown[1:], {"via": "herdr", "api_error": "HTTPError"})
         first, second = self.z.queue_pending()
-        self.assertEqual((first["wake"], "wake" in second), ({"via": "api", "message": "msg_9"}, False))
-        self.assertEqual(self.z.queue_represent(self.z.REPRESENT_SECONDS), [])  # fresh: the long-lived watcher leaves them
+        self.assertEqual((first["wake"], second["wake"]["via"]), ({"via": "api", "message": "msg_9"}, "herdr"))
         with self.z.wake_queue() as q:
-            q["events"][1]["shown_at"] -= self.z.REPRESENT_SECONDS + 1
-        again, = self.z.queue_represent(self.z.REPRESENT_SECONDS)
+            for e in q["events"]:
+                e["shown_at"] -= 3600  # an hour: a long turn is no reason to show it again
+        running, calls = self.session_messages(("msg_10", "assistant"), ("msg_9", "user"), ("msg_8", "idle"))
+        with running:  # the turn that took the wake in has not ended: only the typed wake's timer has run out
+            again, = self.z.queue_represent(self.z.due_by_reply(self.RECORD))
         self.assertRegex(again, r"^\[E2\] \(again, un-acked since .*\) S2 is gone$")
-        self.assertEqual(self.z.queue_represent(self.z.REPRESENT_SECONDS), [])
+        self.assertEqual(calls, [f"/session/{self.RECORD['session']}/message?limit={self.z.REPLY_WINDOW}"])
+        ended, _ = self.session_messages(("msg_11", "idle"), ("msg_10", "assistant"), ("msg_9", "user"), ("msg_8", "idle"))
+        with ended:
+            again, = self.z.queue_represent(self.z.due_by_reply(self.RECORD))
+            self.assertRegex(again, r"^\[E1\] \(again, un-acked since .*\) S1 asks$")
+            self.z.queue_receipt([again], {"via": "api", "message": "msg_12"})  # the new wake is a new message to follow
+            self.assertEqual(self.z.queue_represent(self.z.due_by_reply(self.RECORD)), [])
+
+    def test_an_acked_event_or_an_unanswering_server_shows_nothing_again(self):
+        shown = self.z.queue_add(["S1 asks"])
+        self.z.queue_receipt(shown, {"via": "api", "message": "msg_9"})
+        down = patch.object(self.z, "opencode_api", side_effect=OSError("connection refused"))
+        with down:
+            self.assertEqual(self.z.queue_represent(self.z.due_by_reply(self.RECORD)), [])
+        ended, calls = self.session_messages(("msg_11", "idle"), ("msg_9", "user"))
+        with self.z.wake_queue() as q:
+            q["events"][0]["acked"] = True
+        with ended:
+            self.assertEqual(self.z.queue_represent(self.z.due_by_reply(self.RECORD)), [])
+        self.assertEqual(calls, [])  # nothing waits: the server is not asked
+
+    def test_a_wake_older_than_the_window_is_found_in_the_whole_list(self):
+        shown = self.z.queue_add(["S1 asks"])
+        self.z.queue_receipt(shown, {"via": "api", "message": "msg_old"})
+        newer = [(f"msg_{i}", "assistant") for i in range(self.z.REPLY_WINDOW)]
+        ended, calls = self.session_messages(*newer[:1], ("msg_idle", "idle"), *newer[1:], ("msg_old", "user"))
+        with ended:
+            self.assertEqual(len(self.z.queue_represent(self.z.due_by_reply(self.RECORD))), 1)
+        self.assertEqual(calls[-1], f"/session/{self.RECORD['session']}/message")
 
 
 class RelayTests(CoordinatorCase):

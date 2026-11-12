@@ -8,6 +8,10 @@ coordinator through Stop hooks instead (tests/test_hooks.py).
 |                                                                        | _receipt_is_kept                                                  |
 | When the server refuses, the prompt is typed into its pane instead     | Wake.test_when_the_server_refuses_the_wake_is_typed_into_the_pane |
 | An event left un-acked is shown again, three times at most             | Wake.test_an_event_left_unacked_wakes_again_three_times_at_most   |
+| An event acked in the turn its wake started is not shown again         | Wake.test_an_event_acked_in_the_turn_its_wake_started_is_not_shown|
+|                                                                        | _again                                                            |
+| A wake typed into the pane is shown again after five minutes           | Wake.test_a_wake_typed_into_the_pane_is_shown_again_after_five_   |
+|                                                                        | minutes                                                           |
 | One watcher per profile                                                | Wake.test_one_watcher_per_profile                                 |
 | The watcher stops when its coordinator loses the lock, and says so     | Wake.test_the_watcher_stops_when_its_coordinator_loses_the_lock   |
 | The watcher ends with the coordinator's server and types nothing       | Wake.test_the_watcher_ends_with_the_coordinators_server           |
@@ -79,7 +83,7 @@ class Wake(DaemonCase):
         self.assertEqual(typed[2], self.w.me["HERDR_PANE_ID"])
         self.assertEqual(self.prompts(), [typed[3]])
         self.assertIn("Q1: Red or blue?", typed[3])
-        self.assertEqual(self.w.server_messages("hw"), [])
+        self.assertEqual([m for m in self.w.server_messages("hw") if m["type"] == "user"], [])
 
     def test_a_server_that_breaks_off_its_answer_does_not_end_the_watcher(self):
         pid = self.w.watcher_pid()
@@ -108,16 +112,39 @@ class Wake(DaemonCase):
     def test_an_event_left_unacked_wakes_again_three_times_at_most(self):
         self.w.started(BRANCH, turns=[ask("Red or blue?")])
         self.woken()
+        self.w.age_wakes()  # however long the turn that took the wake in runs
         self.w.watch_state_changes(2)
-        self.assertEqual(len(self.prompts()), 1)  # not again while it is fresh
+        self.assertEqual(len(self.prompts()), 1)  # not again while that turn runs
         for shown in (2, 3):
-            self.w.age_wakes()  # five minutes pass without an ack
+            self.w.rest()  # the turn ends without an ack
             self.w.wait_for(f"wake {shown}", lambda: len(self.prompts()) == shown)
             self.assertIn("[E1] (again, un-acked since ", self.prompts()[-1])
-        self.w.age_wakes()
+        self.w.rest()
         self.w.watch_state_changes(2)
         self.assertEqual(len(self.prompts()), 3)  # a forgotten ack cannot wake the coordinator for ever
         self.assertIn("[E1] ", self.w.hw("start").stdout)  # `start` still lists it
+
+    def test_an_event_acked_in_the_turn_its_wake_started_is_not_shown_again(self):
+        """T121: the turn ends after the ack, however long it ran; the event is not shown again."""
+        self.w.started(BRANCH, turns=[ask("Red or blue?")])
+        self.woken()
+        self.w.age_wakes()
+        self.w.ack_all()
+        self.w.rest()
+        self.w.watch_state_changes(3)
+        self.assertEqual(len(self.prompts()), 1)
+
+    def test_a_wake_typed_into_the_pane_is_shown_again_after_five_minutes(self):
+        """It has no message in the session to follow, so the watcher keeps time for it."""
+        (self.w.herdr / "opencode-down").write_text(self.w.me["HERDR_PANE_ID"])
+        self.w.started(BRANCH, turns=[ask("Red or blue?")])
+        self.woken()
+        self.w.rest()
+        self.w.watch_state_changes(2)
+        self.assertEqual(len(self.prompts()), 1)
+        self.w.age_wakes()  # five minutes pass without an ack
+        self.w.wait_for("wake 2", lambda: len(self.prompts()) == 2)
+        self.assertIn("[E1] (again, un-acked since ", self.prompts()[-1])
 
     def test_one_watcher_per_profile(self):
         pid = self.w.watcher_pid()
