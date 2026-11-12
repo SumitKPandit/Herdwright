@@ -38,18 +38,30 @@ class WordTests(unittest.TestCase):
     def test_a_commands_own_words_begin_with_its_program(self):
         for command, own in (("FOO=1 BAR=2 touch x", "touch x"), ("then touch x", "touch x"), ("do", ""), ("! rm x", "rm x"),
                              ("{ env -u A B=1 touch x", "touch x"), ("sudo -u bob nice -n 5 rm x", "rm x"), ("xargs -n 1 rm", "rm"),
-                             ("/usr/bin/env touch x", "touch x"), ("ls -l", "ls -l"), ("exec -a name time rm x", "rm x")):
+                             ("/usr/bin/env touch x", "touch x"), ("ls -l", "ls -l"), ("exec -a name time rm x", "rm x"),
+                             ("timeout 5 rm x", "rm x"), ("timeout -s KILL -k 1 5 rm x", "rm x"), ("timeout --signal=KILL 5s rm x", "rm x"),
+                             ("gtimeout 5 rm x", "rm x"), ("env A=1 rm x", "rm x"), ("nohup rm x", "rm x"), ("time -p rm x", "rm x"),
+                             ("xargs rm", "rm"), ("sudo rm x", "rm x"), ("command rm x", "rm x"), ("exec rm x", "rm x"),
+                             ("stdbuf -oL rm x", "rm x"), ("stdbuf -o L -e 0 rm x", "rm x"), ("setsid rm x", "rm x"),
+                             ("caffeinate -i -t 60 rm x", "rm x"), ("nohup timeout 5 nice rm x", "rm x"), ("timeout 5", "")):
             self.assertEqual(" ".join(command_words(command.split())), own, command)
 
     def test_what_a_command_writes(self):
         for command, redirects, writes in (
                 ("echo x > a 2>&1", ["a"], []), ("echo x &> a", ["a"], []), ("echo x >& a >&2", ["a"], []), ("echo x >> a >| b &>> c", ["a", "b", "c"], []),
-                ("rm -rf a b", [], ["a", "b"]), ("chmod -R u+x , g-w a", [], ["a"]), ("chmod 755 a b", [], ["a", "b"]), ("chown bob:staff a", [], ["a"]),
+                ("rm -rf a b", [], ["a", "b"]), ("install -m 755 a b", [], ["755", "a", "b"]), ("rsync -a a b", [], ["a", "b"]), ("chmod -R u+x , g-w a", [], ["a"]), ("chmod 755 a b", [], ["a", "b"]), ("chown bob:staff a", [], ["a"]),
                 ("sed -i.bak s/a/b/ f", [], ["s/a/b/", "f"]), ("sed s/a/b/ f", [], []), ("dd if=a of=b bs=1", [], ["b"]),
-                ("find a b -name x -delete", [], ["a", "b"]), ("find -delete", [], ["."]), ("find a -exec rm {}", [], ["a"]),
+                ("find a b -name x -delete", [], ["a", "b"]), ("find -delete", [], ["."]),
+                ("find -L a -name x -delete", [], ["a"]), ("find -H -O2 -D tree a b -delete", [], ["a", "b"]), ("find -P -delete", [], ["."]), ("find a -exec rm {}", [], ["a"]),
                 ("find a -exec grep x {}", [], []), ("ls a", [], [])):
             words = command.split()
             self.assertEqual((redirect_targets(words), write_targets(words)), (redirects, writes), command)
+
+    def test_a_run_of_operators_is_cut_into_each(self):
+        for command, words in (("true;>a", ["true", ";", ">", "a"]), ("(a);b", ["(", "a", ")", ";", "b"]), ("a&>>b", ["a", "&>>", "b"]),
+                               ("a|&b", ["a", "|&", "b"]), ("a;>|b", ["a", ";", ">|", "b"]), ("a 2>&1", ["a", "2", ">&", "1"]),
+                               ("a&&>b", ["a", "&&", ">", "b"]), ("a ;; b", ["a", ";;", "b"]), ("a<<<b", ["a", "<<<", "b"])):
+            self.assertEqual(tokens(command), words, command)
 
     def test_a_heredoc_keeps_the_rest_of_its_opening_line(self):
         self.assertEqual(tokens("cat <<EOF > a\nrm b\nEOF\nls"), ["cat", ">", "a", ";", ";", "ls"])

@@ -337,6 +337,39 @@ class Answers(LoopCase):
         self.w.watch_ticks(2)
         self.assertEqual(self.w.agent(s["agent"])["prompts"][1:], [self.GIVEN])
 
+    def test_an_answer_relayed_twice_is_sent_once(self):
+        s = self.asked(ask("Red or blue?"), [{"say": "Blue it is."}])
+        self.assertIn("recorded Q1", self.relay())
+        self.assertEqual(self.relay().strip(), "Q1: already answered in these words and given to the worker; not sent again")
+        self.assertEqual(self.w.agent(s["agent"])["prompts"][1:], [self.GIVEN])
+        self.assertEqual(self.w.events("answer"), ["Q1: Blue, as on the home page."])
+        self.assertIn("recorded Q1", self.w.zed("relay", "Q1", "Red after all.").stdout)  # other words are a new answer
+        self.assertEqual(len(self.w.agent(s["agent"])["prompts"]), 3)
+
+    def test_an_answer_is_never_prompted_to_a_session_of_the_users_own(self):
+        """`relay` and `prompt` refuse an external session; the watcher leaves it alone as well."""
+        s = self.asked(ask("Red or blue?"))
+        self.w.adopted(s["session"])
+        self.w.zed("q", "answer", "Q1", "Blue, as on the home page.")
+        self.assertNotIn("[E", self.w.watch_ticks(3))
+        self.assertEqual(len(self.w.agent(s["agent"])["prompts"]), 1)
+        self.assertEqual(self.delivered(), [{"status": "answered", "given": 0}])  # recorded, and still there to be read
+
+    def test_an_answer_is_not_lost_when_herdr_refuses_the_prompt(self):
+        """The pane can close between the watcher's list of agents and its prompt: the answer it had claimed for the
+        prompt is given back, the coordinator is told, and the watcher goes on."""
+        s = self.asked(ask("Red or blue?"), [self.READ])
+        self.w.zed("q", "answer", "Q1", "Blue, as on the home page.")
+        (self.w.herdr / "herdr-refuses").write_text(f"agent get {s['agent']}\n")
+        out = self.w.watch_ticks(3)
+        self.assertIn("[E2] S1 T1 build-t1 · the answers to Q1 could not be prompted to it (herdr refused", out)
+        self.assertEqual(out.count("[E"), 1)  # the watcher lived on through its later looks, and said it once
+        self.assertEqual(len(self.w.agent(s["agent"])["prompts"]), 1)
+        self.assertEqual(self.delivered(), [{"status": "answered", "given": 0}])
+        (self.w.herdr / "herdr-refuses").unlink()
+        self.w.zed("prompt", s["session"], "Look for your answers.")  # it is still there for the worker to read
+        self.assertEqual(self.w.agent(s["agent"])["results"][-1]["out"].strip(), self.GIVEN.splitlines()[0])
+
     def test_a_question_asked_again_is_answered_from_the_record_and_not_put_to_the_user_again(self):
         s = self.asked(ask("Red or blue?"), [{"say": "Thanks."}, {"pause": True}, *ask("Red or blue?")])
         self.assertIn("recorded Q1", self.relay())  # idle: prompted at once, and it works on

@@ -1,5 +1,10 @@
 #!/bin/sh
 # zed-setup — check Zed's prerequisites and install its git guard hooks. Safe to re-run.
+case "$1" in -h|--help)
+  echo "zed-setup: check Zed's prerequisites (herdr, git, gh, python3 and one runtime: claude or opencode), install its"
+  echo "git guard hooks (core.hooksPath=hooks) and report the profile. Takes no arguments. Safe to re-run."
+  exit 0;;
+esac
 cd "$(dirname "$0")/.." || exit 1
 missing=0
 for tool in herdr git gh python3; do

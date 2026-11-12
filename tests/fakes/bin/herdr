@@ -11,6 +11,7 @@ shapes and error words (`pane_not_found`, `workspace_not_found`, `agent_not_read
 events reach the same executable (see agent.py). Nothing here waits: an agent is whatever its script made it.
 `pane run` types a command line into the pane's shell: it runs in the pane's folder and environment, and a server it
 leaves in the background (`opencode serve .. &`) is up when the command returns.
+A file `herdr-refuses` in the world's folder makes every command that starts with one of its lines fail (`refused`).
 """
 import json
 import os
@@ -131,6 +132,9 @@ def ready(name, *states):
 def main(argv):
     with store.locked() as state:
         state["calls"].append(argv)
+    refuses = store.home() / "herdr-refuses"
+    if refuses.exists() and any(line and " ".join(argv).startswith(line) for line in refuses.read_text().splitlines()):
+        return fail("refused", "herdr refuses this command")
     groups = {"workspace": workspace, "pane": pane, "agent": agent}
     if len(argv) < 2 or argv[0] not in groups:
         return fail("unknown_command", " ".join(argv))

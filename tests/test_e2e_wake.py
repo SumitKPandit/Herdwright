@@ -81,6 +81,30 @@ class Wake(DaemonCase):
         self.assertIn("Q1: Red or blue?", typed[3])
         self.assertEqual(self.w.server_messages("zed"), [])
 
+    def test_a_server_that_breaks_off_its_answer_does_not_end_the_watcher(self):
+        pid = self.w.watcher_pid()
+        (self.w.herdr / "opencode-cut").write_text(self.w.me["HERDR_PANE_ID"])
+        self.w.started(BRANCH, turns=[ask("Red or blue?")])
+        event, = self.woken()
+        self.assertEqual(event["wake"]["via"], "herdr")
+        self.assertIn("IncompleteRead", event["wake"]["api_error"])
+        self.w.watch_state_changes(2)
+        self.assertEqual(self.w.watcher_pid(), pid)
+
+    def test_a_watcher_killed_during_the_wake_does_not_have_its_events_raised_again(self):
+        """What a look has seen is saved before the coordinator is woken: the wake is a call that can take long, and a
+        watcher that dies in it must not leave its successor to read the same report as new."""
+        held = self.w.herdr / "opencode-held"
+        held.write_text(self.w.me["HERDR_PANE_ID"])
+        self.w.started(BRANCH, turns=[ask("Red or blue?")])
+        self.w.wait_for("the wake to reach the server", held.with_name("opencode-held.reached").exists)
+        self.w.stop_watcher(signal.SIGKILL)
+        held.unlink()
+        self.assertIn("[E1] ", self.w.zed("start").stdout)  # the next watcher starts, and the event is still listed
+        self.w.watch_state_changes(3)
+        self.assertEqual([e["id"] for e in self.w.wakes()], [1])
+        self.assertEqual(self.w.rows("SELECT COUNT(*) AS n FROM questions"), [{"n": 1}])
+
     def test_an_event_left_unacked_wakes_again_three_times_at_most(self):
         self.w.started(BRANCH, turns=[ask("Red or blue?")])
         self.woken()

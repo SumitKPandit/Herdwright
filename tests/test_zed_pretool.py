@@ -106,7 +106,9 @@ class PretoolTests(unittest.TestCase):
         """S341 and S342: only the first word of a simple command was read as the program."""
         for command in ("{ touch c.txt; }", "if true; then touch c.txt; fi", "for f in a b; do rm c.txt; done", "command touch c.txt",
                         "env touch c.txt", "env FOO=1 rm c.txt", "! rm keep.txt", "sudo rm keep.txt", "time rm keep.txt", "xargs rm keep.txt",
-                        "nice -n 5 touch c.txt", "if true; then git commit -m x; fi"):
+                        "nice -n 5 touch c.txt", "if true; then git commit -m x; fi",
+                        # S351: `timeout`, a run of operators, a `find` with options before its paths
+                        "timeout 5 rm c.txt", "timeout -k 1 5s rm c.txt", "stdbuf -oL touch c.txt", "true;>c.txt", "find -L . -name x -delete"):
             self.assertIsNotNone(decide("shell", command=command, workdir="/code/proj"), command)
             self.assertIsNone(bash(command), command)  # in Zed's own repo
         for command in ("{ cd /code/proj && touch c.txt; }", "if true; then cd /code/proj; touch c.txt; fi", "builtin cd /code/proj && touch c.txt",

@@ -96,14 +96,17 @@ list) or a server the worker starts itself. On OpenCode the server password is k
 server's two shell routes run the same check; Zed's own OpenCode session has the tool-call check only, because its
 server's shell is the user's own (`!` in the TUI). A write is checked wherever its path points: absolute, relative to
 the call's working directory, or after a `cd`; behind a compound command's opener or a wrapper (`{`, `then`, `do`,
-`env`, `sudo`, `xargs`); as any redirect (`>`, `&>`, `>&`, after a heredoc), a file-writing program, `dd of=` or a
+`env`, `sudo`, `xargs`, `timeout`); as any redirect (`>`, `&>`, `>&`, after a heredoc), a file-writing program, `dd of=` or a
 deleting `find`. A path the shell expands (`$DIR/x`) is not followed. Review and QA by sessions that did not write the code, and the git
 guard, do not depend on these checks. `tests/smoke_opencode.py` runs all of this against
 the installed `opencode` (not part of the default test run): a worker's start, canary, `AGENTS.md` and skills, and its
-server's shell routes refusing what the hat denies, with no model asked for anything; Zed's own canary, model and
-variant, `start`, the lock, and a denied edit, commit and relative-path shell write in a project repo; and the wake:
-an idle session prompted through its server with the receipt kept, the prompt typed into its pane when the server
-refuses, and one watcher only.
+server's shell routes refusing what the hat denies, with no model asked for anything; Zed's own canary, `start`, the
+lock, and its guard, called as its plugin calls it, denying an edit, a commit and a relative-path shell write in a
+project repo, again with no model asked; and the wake: an idle session prompted through its server with the receipt
+kept, the prompt typed into its pane when the server refuses, and one watcher only. Three checks need the model to do
+what it is asked, so they can fail without a fault in Zed: that Zed's session runs the configured model and variant,
+has the manual and the profile in its instructions and its skills, and runs `bin/zed start` without a permission
+prompt (6 runs of 6 here on `github-copilot/claude-haiku-5.5` at `low`).
 
 Tests: `python3 -B -m unittest discover -s tests -v`.
 

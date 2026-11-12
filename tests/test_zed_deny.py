@@ -155,7 +155,8 @@ class DecideTests(unittest.TestCase):
         """S341: the worker guard looked past `{`, `then`, `do`, `command`; not past `env`, `sudo`, `xargs`, `!`, `time`."""
         for command in ("{ touch a.py; }", "if true; then touch a.py; fi", "for f in a b; do rm a.py; done", "while true; do rm a.py; done",
                         "command touch a.py", "builtin command touch a.py", "env touch a.py", "env FOO=1 touch a.py", "sudo rm a.py",
-                        "sudo -u bob rm a.py", "xargs rm a.py", "! rm a.py", "time rm a.py", "nice -n 5 touch a.py", "FOO=1 nohup touch a.py"):
+                        "sudo -u bob rm a.py", "xargs rm a.py", "! rm a.py", "time rm a.py", "nice -n 5 touch a.py", "FOO=1 nohup touch a.py",
+                        "timeout 5 rm a.py", "timeout -k 1 5s rm a.py", "stdbuf -oL touch a.py", "true;>a.py", "find -L . -name x -delete"):
             self.assertIn("denied", self.bash("review", command), command)
         for command in ("env gh pr comment 1 -b x", "if true; then gh pr comment 1 -b x; fi"):
             self.assertIn("anything outward", self.bash("review", command), command)

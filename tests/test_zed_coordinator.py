@@ -276,6 +276,19 @@ class StartTests(CoordinatorCase):
         super().setUp()
         self.armed = []
 
+    def test_the_watchers_log_is_cut_back_when_it_has_grown_and_keeps_its_last_words(self):
+        log = self.profile / ".cache" / "watch.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("x" * 100 + "why the last watcher ended\n")
+        with patch.object(self.z, "WATCH_LOG_BYTES", 60), patch.object(self.z.subprocess, "Popen") as popen, \
+                patch.object(self.z, "watcher_alive", return_value=4321):
+            self.assertEqual(self.z.arm_watcher(), 4321)
+            self.assertEqual(log.read_text(), "xxx" + "why the last watcher ended\n")  # the last half of the limit
+            self.assertEqual(popen.call_args.args[0][-2:], ["watch", "--daemon"])
+            log.write_text("short\n")
+            self.z.arm_watcher()
+            self.assertEqual(log.read_text(), "short\n")
+
     def test_start_starts_the_long_lived_watcher_when_none_runs_and_says_so(self):
         """OpenCode has no Stop hook to re-arm a watcher: `start` is what starts it, with or without tracked work."""
         self.proven()

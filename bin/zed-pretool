@@ -19,7 +19,7 @@ For the coordinator it denies:
     `&>>`, `>&`, also after a heredoc), rm, mv, cp, touch, mkdir, tee, ln, chmod, chown, sed -i, perl -i, `dd of=`, a
     `find` that deletes or runs one of these. The path may be absolute, or relative to the call's working directory
     (OpenCode's `workdir`) or to a `cd` before it; the command may stand after a compound command's opener (`{`,
-    `then`, `do`, `!`) or a wrapper (`command`, `env`, `sudo`, `xargs`, `time`, `nice`, `nohup`, `exec`).
+    `then`, `do`, `!`) or a wrapper (`command`, `env`, `sudo`, `xargs`, `time`, `nice`, `nohup`, `exec`, `timeout`).
     Not followed: a path the shell expands (`$DIR/x`, `cd $X`), and a write made by another program (`bash -c`,
     `python3 -c`, `npm install`, a script).
   * an edit-tool call that names no file (it cannot be checked)

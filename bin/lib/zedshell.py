@@ -8,16 +8,20 @@ from pathlib import Path
 
 GIT_WRITE = {"commit", "push", "rebase", "merge", "cherry-pick", "reset", "revert", "add", "apply", "am", "tag", "stash", "rm", "mv", "restore",
              "clean", "checkout", "switch"}
-FILE_WRITERS = {"rm", "mv", "cp", "touch", "mkdir", "tee", "ln", "rmdir", "truncate", "chmod", "chown"}
+FILE_WRITERS = {"rm", "mv", "cp", "touch", "mkdir", "tee", "ln", "rmdir", "truncate", "chmod", "chown", "install", "rsync"}
 PIPES = {"|", "|&"}
 OPERATORS = {"&&", "||", ";", "&", "(", ")"} | PIPES
 REDIRECTS = {">", ">>", ">|", "&>", "&>>", ">&"}
+# Every operator a run of punctuation can hold, longest first: `;>` is `;` then `>`
+SYMBOLS = sorted(OPERATORS | REDIRECTS | {";;", "<", "<<", "<<<", "<&", "<>"}, key=len, reverse=True)
 # What may stand before a simple command's program: the opener of a compound command, and programs that run the
 # command that follows them, each with its options that take a value
 OPENERS = {"{", "then", "do", "else", "elif", "if", "while", "until", "!"}
 WRAPPERS = {"builtin": (), "command": (), "exec": ("-a",), "nohup": (), "time": (), "nice": ("-n",), "env": ("-u", "-C"),
             "sudo": ("-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-U"), "doas": ("-u", "-C"),
-            "xargs": ("-n", "-I", "-P", "-L", "-s", "-d", "-E", "-a")}
+            "xargs": ("-n", "-I", "-P", "-L", "-s", "-d", "-E", "-a"), "timeout": ("-s", "-k"), "gtimeout": ("-s", "-k"),
+            "stdbuf": ("-i", "-o", "-e"), "setsid": (), "caffeinate": ("-t", "-w")}
+WRAPPER_ARGUMENTS = {"timeout": 1, "gtimeout": 1}  # words of its own a wrapper takes before the command: the duration
 ASSIGNMENT = re.compile(r"\w+=.*")
 MODE = re.compile(r"[0-7]{3,4}|[ugoa]*[-+=][rwxXstugo]*(,[ugoa]*[-+=][rwxXstugo]*)*")  # chmod's first argument
 
@@ -45,8 +49,17 @@ def tokens(cmd):
     lex = shlex.shlex(strip_heredocs(cmd).replace("\n", " ; "), posix=True, punctuation_chars=True)
     lex.whitespace_split = False
     lex.wordchars += "${}+:@%"  # keep `$E` / `${E}` one word, so `git -C $E commit` reads as a git commit in an unknown repo
-    # shlex returns a run of punctuation as one word (`);`, `))`): a parenthesis is an operator of its own
-    return [part for t in lex for part in (re.findall(r"[()]|[^()]+", t) if re.fullmatch(r"[();<>|&]+", t) else [t])]
+    # shlex returns a run of punctuation as one word (`);`, `))`, `;>`): it is cut into its operators
+    return [part for t in lex for part in (operators(t) if re.fullmatch(r"[();<>|&]+", t) else [t])]
+
+
+def operators(run):
+    """The operators a run of punctuation holds, the longest match first: `;>` is `;` and `>`, `&>>` is itself."""
+    out = []
+    while run:
+        out.append(next((s for s in SYMBOLS if run.startswith(s)), run[0]))
+        run = run[len(out[-1]):]
+    return out
 
 
 def scoped_commands(toks):
@@ -79,8 +92,8 @@ def scoped_commands(toks):
 
 def command_words(words):
     """A simple command's own words, the program first: without the variable assignments, the compound command's
-    opener (`{`, `then`, `do`, `!` ...) and the wrappers (`command`, `env`, `sudo`, `xargs` ...) before it. So
-    `if true; then FOO=1 env touch x; fi` reads as `touch x`. [] when nothing is left (`do`, `fi`, `}` alone)."""
+    opener (`{`, `then`, `do`, `!` ...) and the wrappers (`command`, `env`, `sudo`, `xargs`, `timeout` ...) before it.
+    So `if true; then FOO=1 env touch x; fi` reads as `touch x`. [] when nothing is left (`do`, `fi`, `}` alone)."""
     while words:
         name = Path(words[0]).name
         if ASSIGNMENT.fullmatch(words[0]) or words[0] in OPENERS:
@@ -89,6 +102,7 @@ def command_words(words):
             words = words[1:]
             while words and (words[0].startswith("-") or (name == "env" and ASSIGNMENT.fullmatch(words[0]))):
                 words = words[1 + (words[0] in WRAPPERS[name]):]
+            words = words[WRAPPER_ARGUMENTS.get(name, 0):]
         else:
             break
     return words
@@ -118,7 +132,10 @@ def write_targets(words):
     if name == "find":
         runs = [words[i + 1:] for i, w in enumerate(words) if w in ("-exec", "-execdir", "-ok", "-okdir")]
         if "-delete" in words or any(write_targets(command_words(run)) for run in runs):
-            return list(takewhile(lambda w: not w.startswith(("-", "(", "!")), words[1:])) or ["."]
+            rest = words[1:]
+            while rest and (rest[0] in ("-H", "-L", "-P", "-D") or rest[0].startswith("-O")):  # its options stand before the paths
+                rest = rest[1 + (rest[0] == "-D"):]
+            return list(takewhile(lambda w: not w.startswith(("-", "(", "!")), rest)) or ["."]
     return []
 
 

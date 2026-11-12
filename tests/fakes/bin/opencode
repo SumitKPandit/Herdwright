@@ -15,7 +15,10 @@ The server (HTTP basic auth, user `opencode`, password $OPENCODE_PASSWORD), unde
                                            call gets it: the call passes the plugins in $OPENCODE_CONFIG_DIR/plugins the
                                            way OpenCode runs them, so a guard that is installed stops it and one that is
                                            not lets it run. A file `opencode-down` in the world's folder that names
-                                           the server's pane makes the route fail (HTTP 500), for a caller's fallback.
+                                           the server's pane makes the route fail (HTTP 500), for a caller's fallback;
+                                           `opencode-cut` makes it break off in the middle of its answer (a server that
+                                           dies); `opencode-held` keeps the caller waiting until the file is removed
+                                           (`opencode-held.reached` appears once a caller waits).
   POST /experimental/session/<id>/wait     returns at once: nothing here takes time
   GET  /session/<id>/message               the session's messages, tool calls as OpenCode v2.2.7 reports them
 
@@ -128,10 +131,24 @@ class Api(BaseHTTPRequestHandler):
             return self.answer(200, None)
         if m.group(2) == "message":
             return self.answer(200, session["messages"])
-        down = store.home() / "opencode-down"
-        if down.exists() and self.pane in down.read_text().split():
+        if self.told("opencode-down"):
             return self.answer(500, "the server cannot take a prompt now")
+        if self.told("opencode-cut"):
+            self.send_response(200)
+            self.send_header("content-length", "1000")
+            self.end_headers()
+            self.wfile.write(b'{"data": ')
+            return
+        if self.told("opencode-held"):
+            (store.home() / "opencode-held.reached").touch()
+            while self.told("opencode-held"):
+                time.sleep(0.02)
         self.answer(200, self.prompt(m.group(1), session, body["text"]))
+
+    def told(self, name):
+        """Whether a file `name` in the world's folder names this server's pane (see the prompt route above)."""
+        path = store.home() / name
+        return path.exists() and self.pane in path.read_text().split()
 
     def prompt(self, session_id, session, text):
         """Admit `text` to the session's inbox and let its turn run. Returns the admitted message."""

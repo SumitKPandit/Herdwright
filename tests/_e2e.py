@@ -129,9 +129,12 @@ class World:
     # ------------------------------------------------------------ running things
 
     def env(self, coordinator=None):
-        """The environment of a command run by `coordinator` (default: the first one)."""
+        """The environment of a command run by `coordinator` (default: the first one). On OpenCode `start` and `spawn`
+        start the long-lived watcher only in a world that is about it (`self.daemon`): the other tests look through a
+        watcher of their own (`watch_once`, `watch_ticks`), and a profile has one watcher at a time."""
         return clean_env(self.root / "home", ZED_PROFILE_DIR=str(self.profile), FAKE_HERDR_DIR=str(self.herdr),
-                         FAKE_AGENT_SCRIPT=str(self.script_path)) | (coordinator or getattr(self, "me", {}))
+                         FAKE_AGENT_SCRIPT=str(self.script_path), **({} if self.daemon else {"FAKE_NO_WATCHER": "1"})
+                         ) | (coordinator or getattr(self, "me", {}))
 
     def git(self, *args, cwd=None, check=True):
         r = subprocess.run(["git", *args], cwd=cwd or self.repo, env=self.env(), capture_output=True, text=True)
@@ -140,14 +143,9 @@ class World:
         return r
 
     def zed(self, *args, coordinator=None, check=True, timeout=90):
-        """Run `bin/zed <args>` as a coordinator session. With check, a failure fails the test with the output.
-        On OpenCode `start` and `spawn` leave the long-lived watcher running. Unless the test is about it
-        (`self.daemon`), it is stopped again: these tests look through a watcher of their own (`watch_once`,
-        `watch_ticks`), and a profile has one watcher at a time."""
+        """Run `bin/zed <args>` as a coordinator session. With check, a failure fails the test with the output."""
         r = subprocess.run([*RUN_ZED, *args], env=self.env(coordinator), capture_output=True, text=True,
                            timeout=timeout, cwd=self.root)
-        if args[0] in ("start", "spawn") and not self.daemon:
-            self.stop_watcher()
         if check:
             self.case.assertEqual(r.returncode, 0, f"bin/zed {' '.join(args)}\n{r.stdout}{r.stderr}")
         return r
@@ -374,6 +372,13 @@ class World:
             pane_id, pane = store.find_agent(state, name)
             del state["panes"][pane_id]
             del state["workspaces"][pane["workspace_id"]]
+
+    def adopted(self, sid):
+        """The session is one of the user's own that Zed only tracks (`bin/zed adopt`): never prompted."""
+        conn = sqlite3.connect(self.profile / "db" / "zed.db")
+        with conn:
+            conn.execute("UPDATE sessions SET external=1 WHERE id=?", (int(str(sid).lstrip("S")),))
+        conn.close()
 
     def age_sessions(self, minutes=10):
         """Stand in for waiting: the watcher treats a session younger than three minutes as still reading its brief."""

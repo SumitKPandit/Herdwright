@@ -107,6 +107,14 @@ class SetupCase(unittest.TestCase):
         self.assertIn("(now: claude)", r.stdout)
         self.assertFalse(path.exists())
 
+    def test_asked_for_help_it_says_what_it_does_and_changes_nothing(self):
+        for flag in ("--help", "-h"):
+            r = subprocess.run([str(self.repo / "bin" / "zed-setup"), flag], cwd=self.repo, env=self.env, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0)
+            self.assertIn("zed-setup: check Zed's prerequisites", r.stdout)
+            self.assertNotIn("ok ", r.stdout)
+        self.assertEqual(self.hooks_path(), "")
+
     def test_running_it_again_changes_nothing(self):
         first, again = self.setup(), self.setup()
         self.assertEqual((again.returncode, again.stdout), (first.returncode, first.stdout))
