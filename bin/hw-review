@@ -272,7 +272,7 @@ def check_draft(text):
         if f["sev"] not in SEVERITIES:
             problems.append(f"{where}: severity must be one of {', '.join(SEVERITIES)} (got '{f['sev'] or 'empty'}')")
         if not LOCATION.search(f["text"]):
-            problems.append(f"{where}: no file:line (like app/guard.py:42 or bin/hw:120)")
+            problems.append(f"{where}: no file:line (like app/guard.py:42, bin/hw:120, or ./Makefile:3 for a top-level file without an extension)")
         if f["sev"] == "blocker" and not GROUND.search(f["text"]):
             problems.append(f"{where}: a blocker names its ground (write 'Ground: requirement', 'Ground: bug' or 'Ground: rule <n>')")
         if not SUGGESTION.search(f["text"]):
