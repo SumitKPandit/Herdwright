@@ -589,6 +589,17 @@ class HwTests(unittest.TestCase):
         self.assertEqual(self.stop(), 2)  # the next full turn does
         self.assertEqual(self.shown_again(), ["1"])
 
+    def test_a_stop_with_no_tracked_work_still_counts_its_turn(self):
+        """T121 review S393: arm returned before counting when no work was tracked, so `running` stayed set and the
+        count lagged the real turns."""
+        self.z.queue_turn_started()
+        self.assertEqual(self.stop(tracked=False), 0)
+        with self.z.wake_queue() as q:
+            self.assertEqual((q["turn"], q["running"]), (1, False))
+        self.assertEqual(self.stop(tracked=False, lock=False), 0)  # a read-only session's Stop is not Herdwright's turn
+        with self.z.wake_queue() as q:
+            self.assertEqual(q["turn"], 1)
+
     def test_an_ack_between_the_stop_and_the_print_wins(self):
         self.z.queue_end_turn()
         self.z.queue_add(["S1 asks"])

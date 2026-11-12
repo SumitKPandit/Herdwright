@@ -2642,7 +2642,7 @@ def cmd_hook(args):
     """hook arm | hook stop-guard | hook turn-start — Claude Code hooks (see .claude/settings.json). They act only in
     the session that holds the profile lock, arm and stop-guard only while sessions are tracked, so read-only sessions
     are untouched.
-      arm         (Stop, asyncRewake) counts the turn that ended, shows again the un-acked events now due (see
+      arm         (Stop, asyncRewake) counts the turn that ended (tracked work or not), shows again the un-acked events now due (see
                   wake_queue), and otherwise runs the watcher inside the hook: re-arming takes no model turn. It exits
                   2, which wakes Herdwright with the events on stderr, only when there are events (or the lock is lost).
                   One watcher at a time; it gives up quietly when no work is tracked any more.
@@ -2657,7 +2657,11 @@ def cmd_hook(args):
             if holds_lock():
                 queue_turn_started()
             return
-        if not holds_lock() or not has_tracked_work() or (mode == "stop-guard" and data.get("stop_hook_active")):
+        if not holds_lock():
+            return
+        if mode == "arm":
+            queue_end_turn()  # every turn of Herdwright counts, with work tracked or not, so the count keeps up
+        if not has_tracked_work() or (mode == "stop-guard" and data.get("stop_hook_active")):
             return
         if mode == "stop-guard":
             started = time.time()
@@ -2674,7 +2678,6 @@ def cmd_hook(args):
         ARM_STAMP_PATH.parent.mkdir(parents=True, exist_ok=True)
         ARM_STAMP_PATH.touch()
         armed_at = time.time()
-        queue_end_turn()
         again = []
         if queue_due():
             time.sleep(ARM_MIN_SECONDS)  # wait first, so the queue is read right before the wake is printed
