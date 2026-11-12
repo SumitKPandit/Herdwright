@@ -1,6 +1,6 @@
 {
   "scripts": ["zed-pr", "zed-review", "zed-checks", "zed-employee"],
-  "skills": ["review-maintainability", "finish"],
+  "skills": ["review-maintainability", "code-rules", "completion-evidence", "finish"],
   "deny": {"edit": ["**", "profile/**"], "commands": ["gh pr review", "gh pr comment"],
            "except": ["profile/briefs/*-plan.md", "profile/briefs/*-findings.md", "profile/.cache/status/{session}.log"]},
   "subagents": "none",
