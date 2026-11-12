@@ -2976,9 +2976,13 @@ def cmd_configure(args):
         flag = args.pop(0)
         value = args.pop(0) if args else None
         key = flag[2:] if flag.startswith("--") else None
-        if value is None or key not in (*CONFIGURE_KEYS, "clear") or (key == "clear" and value not in CONFIGURE_KEYS):
+        if value is None or key not in (*CONFIGURE_KEYS, "clear"):
             die(cmd_configure.__doc__.split(" — ")[0].replace("configure", "usage: hw configure", 1))
+        if key == "clear" and value not in CONFIGURE_KEYS:
+            die(f"--clear takes one of {', '.join(CONFIGURE_KEYS)}, not '{value}'")
         cleared, key = key == "clear", value if key == "clear" else key
+        if key in values:  # `--model a --clear model`: which one the user meant is theirs to say
+            die(f"{key} is given twice in one command: say once whether to set it or to clear it")
         if key != "max-sessions" and key not in keys:
             die(f"{RUNTIME_NAMES[runtime]} has no {key}: its choices are --{', --'.join(keys)} and --max-sessions")
         if cleared:
