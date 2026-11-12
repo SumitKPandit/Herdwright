@@ -23,7 +23,9 @@ WRAPPERS = {"builtin": (), "command": (), "exec": ("-a",), "nohup": (), "time": 
             "stdbuf": ("-i", "-o", "-e"), "setsid": (), "caffeinate": ("-t", "-w")}
 WRAPPER_ARGUMENTS = {"timeout": 1, "gtimeout": 1}  # words of its own a wrapper takes before the command: the duration
 ASSIGNMENT = re.compile(r"\w+=.*")
-FIND_OPTIONS = {"-H", "-L", "-P", "-D", "-E", "-X", "-d", "-s", "-x", "-f"}  # GNU's and BSD's, before the paths; -D and -f take a word
+# A word of options before find's paths, GNU's and BSD's: flags alone or grouped (`-EX`, BSD), `-O<level>` (GNU), `--`,
+# and a group may end in -D <debug> (GNU) or -f <path> (BSD), which take the rest of the word or the next one.
+FIND_OPTIONS = re.compile(r"-(?:[HLPEXdsx]+|(?P<flags>[HLPEXdsx]*)(?P<takes>[Df])(?P<attached>.*)|O\d*|-)")
 MODE = re.compile(r"[0-7]{3,4}|[ugoa]*[-+=][rwxXstugo]*(,[ugoa]*[-+=][rwxXstugo]*)*")  # chmod's first argument
 
 
@@ -134,9 +136,15 @@ def write_targets(words):
         runs = [words[i + 1:] for i, w in enumerate(words) if w in ("-exec", "-execdir", "-ok", "-okdir")]
         if "-delete" in words or any(write_targets(command_words(run)) for run in runs):
             rest, named = words[1:], []
-            while rest and (rest[0] in FIND_OPTIONS or rest[0].startswith("-O")):  # its options stand before the paths
-                named += rest[1:2] if rest[0] == "-f" else []
-                rest = rest[1 + (rest[0] in ("-D", "-f")):]
+            while rest and (m := FIND_OPTIONS.fullmatch(rest[0])):  # its options stand before the paths
+                rest = rest[1:]
+                if m.group(0) == "--":
+                    break
+                if m.group("takes"):  # -D <debug> (GNU), -f <path> (BSD): the rest of the word, or the next word
+                    word = m.group("attached") or (rest.pop(0) if rest else "")
+                    if m.group("takes") == "f":
+                        # `-follow` is a path to BSD and a primary over "." to GNU: both are kept
+                        named += [word, "."] if m.group("attached") else [word]
             return named + list(takewhile(lambda w: not w.startswith(("-", "(", "!")), rest)) or ["."]
     return []
 

@@ -54,6 +54,10 @@ class WordTests(unittest.TestCase):
                 ("find a b -name x -delete", [], ["a", "b"]), ("find -delete", [], ["."]),
                 ("find -L a -name x -delete", [], ["a"]), ("find -H -O2 -D tree a b -delete", [], ["a", "b"]), ("find -P -delete", [], ["."]),
                 ("find -E -X -d -s -x a -delete", [], ["a"]), ("find -f a -E b -delete", [], ["a", "b"]),  # BSD's (macOS)
+                # grouped (BSD), an attached word, `--`; a primary that looks like a group is not one
+                ("find -EX a -delete", [], ["a"]), ("find -EXdsx a -delete", [], ["a"]), ("find -Ef a b -delete", [], ["a", "b"]),
+                ("find -Xfa b -delete", [], ["a", ".", "b"]), ("find -Dtree a -delete", [], ["a"]), ("find -L -- a -delete", [], ["a"]),
+                ("find -follow -delete", [], ["ollow", "."]), ("find -depth -delete", [], ["."]), ("find -x -delete", [], ["."]),
                 ("find a -exec rm {}", [], ["a"]),
                 ("find a -exec grep x {}", [], []), ("ls a", [], [])):
             words = command.split()
