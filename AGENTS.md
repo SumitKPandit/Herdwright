@@ -63,7 +63,7 @@ the user who took over.
 
 1. **Intake** (`new-task`): read the ticket, collect what's missing, `bin/hw task add`.
 2. **Spawn**: write the brief with its Plan section, `bin/hw spawn <T> repo= base= branch= brief= [hat=build|review|qa]`.
-   The worker runs on the install's runtime with the model from its config file; override only when the user asks.
+   The worker runs on the install's runtime. Model, effort and the number of sessions are the user's: see below.
 3. **Watch**: one watcher runs while any session is running (how it is armed: "Runtime differences"). It does routine
    work in code and wakes me only for what needs judgment; I `bin/hw ack` each `[E<id>]` once handled.
 4. **Check** (`check-workers`): compare progress with the plan file; redirect a worker that is off-plan, redoing work or over estimate.
@@ -73,18 +73,24 @@ the user who took over.
 
 External sessions (adopted with `bin/hw adopt`) are tracked and reported but never prompted or closed unless asked.
 
+**Model, effort, sessions.** Herdwright ships no model or effort and I never pick one. When the user says which model,
+which effort (on OpenCode: variant) or how many sessions at once they want, I run `bin/hw configure --model <m>
+--effort <e> --max-sessions <n>` with what they said (`--variant` on OpenCode; `--clear <key>` drops a choice) and tell
+them what it printed. It holds for every later spawn. `bin/hw configure` alone shows what holds now.
+
 ## Runtime differences
 
 Only these parts depend on the runtime; `bin/hw start` says which one this install uses.
 - **Claude Code.** Reads this manual through `CLAUDE.md`, which imports it. Started with `claude` in this repo. The Stop
   hooks (`.claude/settings.json`) re-arm the watcher after every turn; if `start` says it is not running, run
   `bin/hw watch --once` with Bash `run_in_background`. `bin/hw-pretool` runs as a PreToolUse hook. Workers: model and
-  effort from `config/claude.json`.
+  effort from `config/claude.json`; what is not set there is not passed, so the user's own Claude Code default applies.
 - **OpenCode.** Reads this manual as `AGENTS.md`. Started with `bin/hw coordinator`, never plain `opencode`: it sets the
   model and variant from `config/opencode.json`, the permission rules and the guard plugin (`bin/hw-pretool`), proves
   the guard with a canary and opens the session; `start` refuses any other session. There are no Stop hooks: `start`
   starts one long-lived watcher (`watch --daemon`; restarted by `start` if it died) that wakes this session through
-  its server for every event, and shows the un-acked ones. Workers: model and variant from `config/opencode.json`.
+  its server for every event, and shows the un-acked ones. Workers: model and variant from `config/opencode.json`. OpenCode's
+  server has no default that is the user's, so a model is needed: `coordinator` asks for it once, in the terminal.
 
 ## Talking to the user
 

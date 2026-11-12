@@ -13,14 +13,17 @@ The no-assumption rule applies in full: write down only what the user said or wh
    delegates engineering work to AI workers (Claude Code) in herdr,
    tracks everything, asks before anything goes out). Run `bin/hw-setup` and get anything it
    reports missing fixed first (the user runs installs/logins themselves; in Claude Code with
-   `! <command>`).
+   `! <command>`). If it reports the runtime as MISSING (Claude Code and OpenCode both installed, or
+   neither), ask the user which one and run `bin/hw-setup --runtime claude|opencode`.
 
 2. **Interview** — a few numbered questions at a time, not one giant form:
    - Name, role, organisation, team/product; time zone.
    - What to call the assistant (stored in step 3; "Herdwright" when they have no preference).
    - What they want Herdwright for, and which decisions they want to make themselves vs. leave to Herdwright.
    - How they like to be talked to (length, tone, what to lead with).
-   - Claude Code: which plan, and which model and effort ceiling workers should use (`config/claude.json`).
+   - Model and effort: do not ask and do not choose. Workers run on Claude Code's own default (on OpenCode:
+     the model the user gave `bin/hw coordinator`). If the user names a model, an effort (OpenCode: a variant)
+     or how many sessions may run at once, store it in step 3 with `bin/hw configure` and tell them what it printed.
    - Tools and accounts: code host (GitHub), ticket tracker, wiki, chat, email,
      anything else workers will touch. For each: their handle and how they use it.
    - Repos: name, local path (or where to clone), what each is, which branches are staging /
@@ -33,12 +36,14 @@ The no-assumption rule applies in full: write down only what the user said or wh
 
 3. **Create the profile branch and files.**
    - `git switch main && git switch -c profile/<name>` (`<name>`: short, lowercase, e.g. first name).
-   - `cp -R profile.template profile`, then fill `profile/profile.md`, `rules.md`,
+   - `cp -Rn profile.template/. profile/` (`-n`: a config file `bin/hw-setup` or `bin/hw coordinator` already
+     wrote there stays), then fill `profile/profile.md`, `rules.md`,
      `knowledge/domain.md` (rename to the product if you like), `knowledge/people.md`,
-     `config/projects.json`, `config/settings.json` and `config/claude.json` from the answers. Delete placeholder lines
+     `config/projects.json` and `config/settings.json` from the answers. Delete placeholder lines
      you have no answer for, and the guidance comments once a file is filled. Keep
      `knowledge/README.md` matching the files that exist.
    - `bin/hw name --set "<name>"` when the user chose a name for the assistant.
+   - `bin/hw configure --model … --effort … --max-sessions …` only for what the user asked for (see step 2).
    - `bin/hw lock acquire` (this session becomes the profile's one active Herdwright), then `bin/hw status`
      creates the task DB and `profile/STATUS.md`.
 

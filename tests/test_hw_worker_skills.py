@@ -304,7 +304,8 @@ class ReadmeTests(unittest.TestCase):
         for sentence in README_SENTENCES:
             self.assertIn(sentence, readme)
         lines = [ln for ln in readme.splitlines() if re.search(r"code[- ]rules|completion[- ]evidence|test[- ]first|"
-                                                               r"act like a user|blocker|worker skill|hat's skills", ln, re.I)]
+                                                               r"act like a user|blocker|worker skill|hat's skills", ln, re.I)
+                 and not ln.lstrip().startswith("<!--")]  # a comment names the tests behind a line: test_readme_claims.py
         for line in lines:
             self.assertTrue([s for s in README_SENTENCES if s in line], line)
 

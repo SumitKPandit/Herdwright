@@ -190,6 +190,20 @@ class ToolInsideItselfTests(AssignCase):
             self.assertNotIn(runtime_only, rest, "runtime-specific text belongs under Runtime differences")
         self.assertIn("Skills in `.claude/skills/` (both runtimes load them from there)", manual)
 
+    def test_the_manual_and_onboarding_leave_model_effort_and_sessions_to_the_user_and_name_the_command(self):
+        manual = " ".join((HOME / "AGENTS.md").read_text().split())
+        for part in ("Herdwright ships no model or effort and I never pick one.",
+                     "I run `bin/hw configure --model <m> --effort <e> --max-sessions <n>` with what they said",
+                     "`--clear <key>` drops a choice) and tell them what it printed. It holds for every later spawn.",
+                     "what is not set there is not passed, so the user's own Claude Code default applies",
+                     "so a model is needed: `coordinator` asks for it once, in the terminal"):
+            self.assertIn(part, manual)
+        onboarding = " ".join((HOME / ".claude" / "skills" / "onboarding" / "SKILL.md").read_text().split())
+        for part in ("Model and effort: do not ask and do not choose.", "`bin/hw-setup --runtime claude|opencode`",
+                     "`cp -Rn profile.template/. profile/`", "only for what the user asked for"):
+            self.assertIn(part, onboarding)
+        self.assertNotIn("cp -R profile.template profile", onboarding)  # it would overwrite what setup stored
+
     def test_the_manual_gives_one_command_per_ordered_routine(self):
         manual = (HOME / "AGENTS.md").read_text()
         start = manual[manual.index("**At the start of every session**"):manual.index("## One active Herdwright per profile")]

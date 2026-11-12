@@ -120,7 +120,9 @@ def refuse_old_database(program):
 
 
 def db_readonly():
-    """Read-only connection to the task DB; None when there is no DB yet."""
+    """Read-only connection to the task DB; None when there is no DB yet. A profile from before the rename that
+    `bin/hw start` has not renamed yet reads as "no DB" here: the read-only helpers then report nothing, while every
+    command that would create a database refuses (refuse_old_database)."""
     if not DB_PATH.exists():
         return None
     conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)

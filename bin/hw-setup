@@ -1,10 +1,17 @@
 #!/bin/sh
 # hw-setup — check Herdwright's prerequisites and install its git guard hooks. Safe to re-run.
-case "$1" in -h|--help)
-  echo "hw-setup: check Herdwright's prerequisites (herdr, git, gh, python3 and one runtime: claude or opencode), install its"
-  echo "git guard hooks (core.hooksPath=hooks), report the profile and, in a terminal, ask once what to call the assistant."
-  echo "Takes no arguments. Safe to re-run."
-  exit 0;;
+chosen=
+case "$1" in
+  -h|--help)
+    echo "hw-setup: check Herdwright's prerequisites (herdr, git, gh, python3 and one runtime: claude or opencode), install its"
+    echo "git guard hooks (core.hooksPath=hooks) and settle the runtime the install uses: the one that is installed; with"
+    echo "both or neither installed it asks (in a terminal), or takes it from --runtime. With a profile it also asks once,"
+    echo "in a terminal, what to call the assistant. It asks nothing about models: sessions run on the runtime's own"
+    echo "default until you tell the assistant otherwise (bin/hw configure). Safe to re-run; what is set stays."
+    echo "  hw-setup [--runtime claude|opencode]"
+    exit 0;;
+  --runtime) chosen=$2;;
+  ?*) echo "usage: hw-setup [--runtime claude|opencode]" >&2; exit 2;;
 esac
 cd "$(dirname "$0")/.." || exit 1
 missing=0
@@ -37,13 +44,17 @@ else
 fi
 
 profile="${HW_PROFILE_DIR:-$PWD/profile}"  # where bin/hw looks for it
+# The one runtime the install uses, stored in the profile's settings (also before onboarding has made the profile:
+# `bin/hw coordinator` reads it to open the first session on OpenCode).
+if command -v python3 >/dev/null 2>&1; then
+  HW_PROFILE_DIR="$profile" bin/hw runtime --choose $chosen || missing=1
+fi
 if [ -f "$profile/profile.md" ]; then
   echo "ok       profile present at $profile (branch: $(git branch --show-current))"
-  echo "runtime  $(HW_PROFILE_DIR="$profile" bin/hw runtime --set-installed)"
   # What the user calls the assistant: asked once, in a terminal, and kept in the profile's settings.
   echo "name     $(HW_PROFILE_DIR="$profile" bin/hw name --ask) (change it: bin/hw name --set <name>)"
 else
   echo "note     no profile yet: start Herdwright here (inside herdr) and it will onboard you: 'claude' on Claude Code,"
-  echo "         'bin/hw coordinator' on OpenCode (now: $(HW_PROFILE_DIR="$profile" bin/hw runtime))"
+  echo "         'bin/hw coordinator' on OpenCode"
 fi
 exit $missing

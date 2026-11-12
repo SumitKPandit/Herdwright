@@ -6,7 +6,7 @@ import os
 import sys
 
 # a worker session carries these; tests must not depend on them
-for _name in [k for k in os.environ if k.startswith("HW_")]:
+for _name in [k for k in os.environ if k.startswith(("HW_", "ZED_"))]:  # ZED_: HW_ before the rename
     del os.environ[_name]
 
 HOME = Path(__file__).resolve().parents[1]

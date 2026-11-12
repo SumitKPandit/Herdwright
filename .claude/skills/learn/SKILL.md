@@ -19,7 +19,7 @@ Ask: *would this be true and useful for a Herdwright serving someone else?*
   | People, handles, reviewers | `profile/knowledge/people.md` |
   | How to set up / run / log in / QA a repo; gotchas | `profile/knowledge/repos/<repo>.md` |
   | Repo paths, base branches, worktree root | `profile/config/projects.json` |
-  | Model, effort ceiling, max running sessions | `profile/config/claude.json` |
+  | Model, effort (OpenCode: variant), max running sessions | `bin/hw configure` (it writes `profile/config/claude.json` or `opencode.json`) |
 
 - **Yes — it makes any Herdwright better** (a tool quirk, a workflow improvement, a missing step) → core:
   a lesson in `playbook.md`; a change to a skill, the manual (`AGENTS.md`), `templates/`, `bin/` or

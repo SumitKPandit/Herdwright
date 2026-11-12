@@ -37,7 +37,7 @@ class SetupCase(unittest.TestCase):
         r = subprocess.run(["git", "config", "--get", "core.hooksPath"], cwd=self.repo, env=self.env, capture_output=True, text=True)
         return r.stdout.strip()
 
-    def setup(self, missing=(), cwd=None, runtimes=("claude",), stdin=subprocess.DEVNULL):
+    def setup(self, missing=(), cwd=None, runtimes=("claude",), stdin=subprocess.DEVNULL, args=()):
         """Run hw-setup with every required tool on PATH except `missing` (herdr, gh and claude are the fakes) and
         with `runtimes` installed (opencode is a script that only knows its version)."""
         tools = self.root / "tools"
@@ -50,7 +50,7 @@ class SetupCase(unittest.TestCase):
         if "opencode" in runtimes:
             (tools / "opencode").write_text("#!/bin/sh\necho 'opencode v9.9.9 (fake)'\n")
             (tools / "opencode").chmod(0o755)
-        return subprocess.run([str(self.repo / "bin" / "hw-setup")], cwd=cwd or self.root, env=self.env | {"PATH": str(tools)},
+        return subprocess.run([str(self.repo / "bin" / "hw-setup"), *args], cwd=cwd or self.root, env=self.env | {"PATH": str(tools)},
                               capture_output=True, text=True, stdin=stdin)
 
     def test_a_complete_machine_passes_and_gets_the_guard_hooks(self):
@@ -79,10 +79,13 @@ class SetupCase(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertRegex(r.stdout, r"(?m)^ok +opencode \(opencode v9\.9\.9 \(fake\)\)$")
         self.assertNotIn("MISSING", r.stdout)
-        self.assertIn("'bin/hw coordinator' on OpenCode (now: opencode)", r.stdout)
+        self.assertRegex(r.stdout, r"(?m)^runtime +opencode \(the only one installed\)$")
+        self.assertIn("'bin/hw coordinator' on OpenCode", r.stdout)
         r = self.setup(runtimes=())
         self.assertEqual(r.returncode, 1)
         self.assertRegex(r.stdout, r"(?m)^MISSING +a runtime: claude \(Claude Code\) or opencode \(OpenCode\)$")
+        self.assertRegex(r.stdout, r"(?m)^MISSING +the runtime: Neither Claude Code nor OpenCode is installed, and an install uses one\. "
+                                   r"Choose it: bin/hw-setup --runtime claude\|opencode$")
 
     def profile_settings(self, settings=None):
         (self.repo / "profile" / "config").mkdir(parents=True, exist_ok=True)
@@ -95,27 +98,49 @@ class SetupCase(unittest.TestCase):
     def test_the_runtime_key_is_set_from_the_one_runtime_installed_and_other_settings_stay(self):
         path = self.profile_settings({"guard": {"protected": ["main"]}})
         r = self.setup(runtimes=("opencode",))
-        self.assertRegex(r.stdout, r"(?m)^runtime +runtime set to opencode in .*settings\.json \(the only one installed\)$")
+        self.assertRegex(r.stdout, rf'(?m)^runtime +opencode \(the only one installed; "runtime" in {path}\)$')
         self.assertEqual(json.loads(path.read_text()), {"guard": {"protected": ["main"]}, "runtime": "opencode"})
         r = self.setup(runtimes=("claude",))  # set once, it is the user's: a later run does not change it
-        self.assertRegex(r.stdout, r"(?m)^runtime +opencode$")
+        self.assertRegex(r.stdout, r"(?m)^runtime +opencode \(as stored; ")
         self.assertEqual(json.loads(path.read_text())["runtime"], "opencode")
 
-    def test_with_both_runtimes_installed_the_choice_is_left_to_the_user(self):
-        path = self.profile_settings()
-        r = self.setup(runtimes=RUNTIMES)
+    def test_with_both_runtimes_installed_it_asks_in_a_terminal_which_one_and_stores_the_answer(self):
+        path = self.profile_settings({"assistant_name": "Ada"})
+        r = self.in_a_terminal("opencode\n", runtimes=RUNTIMES)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn('Claude Code and OpenCode are both installed and an install uses one: set "runtime"', r.stdout)
-        self.assertIn("(now: claude)", r.stdout)
-        self.assertFalse(path.exists())
+        self.assertEqual(r.stderr, "Claude Code and OpenCode are both installed, and an install uses one. Which one (claude or opencode)? ")
+        self.assertRegex(r.stdout, r"(?m)^runtime +opencode \(your answer; ")
+        self.assertEqual(json.loads(path.read_text()), {"assistant_name": "Ada", "runtime": "opencode"})
+        self.assertEqual(self.in_a_terminal("claude\n", runtimes=RUNTIMES).stderr, "")  # asked once
 
-    def in_a_terminal(self, typed):
+    def test_with_both_runtimes_and_no_answer_nothing_is_chosen_and_the_run_fails_until_one_is_named(self):
+        path = self.profile_settings({"assistant_name": "Ada"})
+        for r in (self.setup(runtimes=RUNTIMES), self.in_a_terminal("\n", runtimes=RUNTIMES)):  # no terminal; a bare Enter
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertRegex(r.stdout, r"(?m)^MISSING +the runtime: Claude Code and OpenCode are both installed, and an install uses one\. "
+                                       r"Choose it: bin/hw-setup --runtime claude\|opencode$")
+            self.assertNotIn("runtime", json.loads(path.read_text()))
+        r = self.setup(runtimes=RUNTIMES, args=("--runtime", "claude"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(json.loads(path.read_text())["runtime"], "claude")
+        r = self.setup(runtimes=RUNTIMES, args=("--runtime", "pi"))
+        self.assertEqual((r.returncode, r.stderr), (1, "hw: 'pi' is not a runtime: claude or opencode\n"))
+        r = self.setup(args=("--model", "opus"))  # models are not setup's business
+        self.assertEqual((r.returncode, r.stderr), (2, "usage: hw-setup [--runtime claude|opencode]\n"))
+
+    def test_it_asks_nothing_about_models_and_writes_none(self):
+        self.profile_settings({"runtime": "claude", "assistant_name": "Ada"})
+        r = self.in_a_terminal("opus\n")
+        self.assertEqual((r.returncode, r.stderr), (0, ""))
+        self.assertEqual(sorted(p.name for p in (self.repo / "profile" / "config").iterdir()), ["settings.json"])
+
+    def in_a_terminal(self, typed, **kwargs):
         """Run hw-setup with a terminal as its input, in which the user types `typed`."""
         user, terminal = pty.openpty()
         self.addCleanup(os.close, user)
         self.addCleanup(os.close, terminal)
         os.write(user, typed.encode())
-        return self.setup(stdin=terminal)
+        return self.setup(stdin=terminal, **kwargs)
 
     def test_in_a_terminal_it_asks_once_what_to_call_the_assistant_and_stores_the_answer(self):
         path = self.profile_settings({"runtime": "claude"})

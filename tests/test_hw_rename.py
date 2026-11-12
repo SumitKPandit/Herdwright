@@ -122,6 +122,30 @@ class OldProfile(LoopCase):
         self.assertEqual(sorted(p.name for p in self.db.iterdir()), ["zed.db"])
         self.assertFalse((self.cache / "hw.lock").exists())
 
+    def test_an_old_lock_file_that_is_empty_or_not_json_does_not_stop_start(self):
+        """PR 3 QA G1: `hw: invalid JSON in …/zed.lock`, exit 1, on every start until the file was deleted by hand."""
+        for damaged in ("", "not json", '{"pane": "p1", "pid"'):
+            with self.subTest(damaged=damaged):
+                (self.cache / "zed.lock").write_text(damaged)
+                r = self.w.start()
+                self.assertEqual(r.stderr, "")
+                self.assertIn(f"renamed {self.db / 'zed.db'} to hw.db", r.stdout)
+                self.assertIn("lock: held by this session", r.stdout)
+                self.assertFalse((self.cache / "zed.lock").exists())
+                (self.db / "hw.db").rename(self.db / "zed.db")  # an old profile again, for the next damaged file
+                (self.cache / "hw.lock").unlink()
+
+    def test_lock_acquire_is_stopped_while_a_live_session_of_the_old_code_holds_the_old_lock(self):
+        """PR 3 QA G2: it wrote hw.lock next to the live zed.lock, with or without --take-over."""
+        other = self.w.coordinator("upgraded")
+        for args in (("lock", "acquire"), ("lock", "acquire", "--take-over")):
+            r = self.w.hw(*args, coordinator=other, check=False)
+            self.assertEqual(r.returncode, 1, args)
+            self.assertIn(f"hw: OLD COORDINATOR STILL RUNNING: {self.cache / 'zed.lock'} is held by a live session", r.stderr)
+            self.assertFalse((self.cache / "hw.lock").exists())
+            self.assertFalse((self.cache / "hw.guard").exists())
+        self.assertEqual(json.loads(self.w.hw("lock", "status", coordinator=other).stdout)["you_hold_it"], False)
+
     def test_an_old_lock_whose_holder_is_gone_does_not_stop_the_renames(self):
         gone = subprocess.Popen([sys.executable, "-c", "pass"])
         gone.wait()
@@ -131,6 +155,9 @@ class OldProfile(LoopCase):
         self.assertIn("lock: held by this session", out)
 
     def test_start_on_a_throwaway_profile_leaves_the_refs_of_the_checkout_under_test_alone(self):
+        """Bites only in a checkout that has a `refs/zed/core-sync/*` ref (one upgraded from before the rename, or a
+        worktree sharing its git directory): there a migrating `start` once renamed it. In a fresh clone it holds
+        trivially; the rule itself is tested in OldNamesInACheckout."""
         before = refs(HOME)
         self.assertIn("renamed", self.w.start().stdout)
         self.assertEqual(refs(HOME), before)
@@ -172,10 +199,20 @@ class OldNamesInACheckout(LoopCase):
         shutil.copytree(self.w.profile, self.checkout / "profile")
         return {"HW_PROFILE_DIR": None}
 
-    def test_with_the_profile_elsewhere_start_touches_no_ref_of_the_checkout(self):
+    def test_with_the_profile_elsewhere_start_touches_no_ref_of_the_checkout_and_says_how_to_keep_the_sync_point(self):
+        """PR 3 review: the old ref was skipped without a word and hw-core-sync fell back to the merge-base."""
         before = refs(self.checkout)
-        self.assertNotIn("git ref", self.start())
+        out = self.start()
+        self.assertIn(f"OLD NAME LEFT ALONE: git ref refs/zed/core-sync/profile/ada ({self.head[:9]}): the profile in use is outside "
+                      "this checkout, so no ref of it is renamed. If this checkout's branch belongs to that profile, record its sync "
+                      f"point under the new name: `bin/hw-core-sync --mark {self.head[:9]}`.", out.splitlines())
+        self.assertNotIn("profile/bob", out)  # another branch's ref is not this checkout's
         self.assertEqual(refs(self.checkout), before)
+        r = subprocess.run([sys.executable, str(self.checkout / "bin" / "hw-core-sync"), "--mark", self.head[:9]], capture_output=True,
+                           text=True, cwd=self.checkout, env=self.w.env())
+        self.assertEqual((r.returncode, r.stdout), (0, f"marked {self.head[:9]} as synced for profile/ada\n"), r.stderr)
+        self.assertIn("OLD NAME LEFT ALONE: git refs refs/zed/core-sync/profile/ada and refs/hw/core-sync/profile/ada both exist; "
+                      "refs/hw/core-sync/profile/ada is the one in use.", self.start().splitlines())  # as for any old name beside its new one
 
     def test_on_its_own_profile_start_renames_the_sync_point_of_its_branch_once_and_no_other(self):
         env = self.own_profile()
@@ -198,11 +235,27 @@ class OldNamesInACheckout(LoopCase):
         self.assertIn(f"profile {self.w.profile}", out)
         self.assertFalse(elsewhere.exists())
 
-    def test_with_only_the_old_variable_set_start_finds_no_profile_and_names_the_variable(self):
+    def test_with_only_the_old_variable_set_start_says_one_thing_and_does_not_send_the_assistant_to_onboard(self):
+        """PR 3 review: it named the variable and then still printed NEW USER, which starts a second profile."""
         out = self.start(HW_PROFILE_DIR=None, ZED_PROFILE_DIR=str(self.w.profile))
-        self.assertEqual(out.splitlines(), ["NOT READ: ZED_PROFILE_DIR (the old names). Set HW_PROFILE_DIR instead.",
-                                            f"NEW USER: there is no profile at {self.checkout / 'profile'}. Run the `onboarding` "
+        self.assertEqual(out.splitlines(), [
+            f"OLD VARIABLE, NO PROFILE: ZED_PROFILE_DIR={self.w.profile} is set and no longer read, and there is no profile at "
+            f"{self.checkout / 'profile'}. Do not onboard. Tell the user to set HW_PROFILE_DIR to that folder and start again; run the "
+            "`onboarding` skill only if they say there is no earlier profile."])
+        self.assertNotIn("NEW USER", out)
+        self.assertFalse((self.checkout / "profile").exists())
+
+    def test_a_new_user_with_no_old_variable_is_still_sent_to_onboarding(self):
+        out = self.start(HW_PROFILE_DIR=None)
+        self.assertEqual(out.splitlines(), [f"NEW USER: there is no profile at {self.checkout / 'profile'}. Run the `onboarding` "
                                             "skill and do nothing else until it is done."])
+
+    def test_only_the_profile_variable_gets_a_new_name_to_set_a_workers_own_variables_are_just_named(self):
+        """PR 3 review nit: "Set HW_SESSION, HW_HAT instead" told the user to set what only spawn sets."""
+        out = self.start(ZED_SESSION="S9", ZED_HAT="build")
+        self.assertIn("NOT READ: ZED_HAT, ZED_SESSION (the old names).", out.splitlines())
+        out = self.start(ZED_SESSION="S9", ZED_PROFILE_DIR=str(self.w.root / "elsewhere"))
+        self.assertIn("NOT READ: ZED_PROFILE_DIR, ZED_SESSION (the old names). Set HW_PROFILE_DIR instead.", out.splitlines())
 
 
 @unittest.skipUnless(subprocess.run(["git", "-C", str(HOME), "cat-file", "-e", f"{BEFORE_RENAME}^{{commit}}"], capture_output=True).returncode == 0,

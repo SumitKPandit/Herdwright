@@ -39,6 +39,7 @@ class AssignCase(unittest.TestCase):
         (self.profile / "config" / "projects.json").write_text(json.dumps(
             {"worktree_root": str(self.wt_root), "repos": {"api": {"path": str(self.repo), "dev_base": "main"}}}))
         (self.profile / "config" / "claude.json").write_text(json.dumps({"model": "claude-opus-5-5", "effort": "high"}))
+        (self.profile / "config" / "opencode.json").write_text(json.dumps({"model": "acme/base", "variant": "xhigh"}))
         for name, value in (("PROFILE_DIR", self.profile), ("DB_PATH", self.profile / "db" / "hw.db"),
                             ("PROJECTS_PATH", self.profile / "config" / "projects.json")):
             patcher = patch.object(hwlib, name, value)
@@ -279,7 +280,8 @@ class FakeOpenCodeServer:
         if not self.up:
             raise ConnectionRefusedError("connection refused")
         if (method, path) == ("POST", "/session"):
-            return {"id": "ses_test1", "model": self.model or body["model"]}
+            asked = body.get("model") and {"variant": "default"} | body["model"]  # no variant asked for: OpenCode names its own
+            return {"id": "ses_test1"} | ({"model": self.model or asked} if self.model or asked else {})
         if path.endswith("/prompt"):
             return {"id": f"msg_{len(self.calls)}"}
         if path.endswith("/message"):
@@ -350,25 +352,26 @@ class OpenCodeTests(AssignCase):
         url = f"http://127.0.0.1:{port}"
         created = next(body for method, path, body in self.server.calls if (method, path) == ("POST", "/session"))
         self.assertEqual(created, {"location": {"directory": str(self.worktree)}, "title": "review-t20",
-                                   "model": {"providerID": "opencode", "id": "nemotron-3.5-super-vl-free", "variant": "xhigh"}})
+                                   "model": {"providerID": "acme", "id": "base", "variant": "xhigh"}})
         start = self.start_call()
         self.assertEqual((start[start.index("--kind") + 1], start[start.index("--timeout") + 1]), ("opencode", "180000"))
         self.assertEqual(self.after_dashes(start), ["--server", url, "--auto", "--session", "ses_test1"])  # no --model: the TUI has none
         s = self.session(sid)
         self.assertEqual((s["status"], s["claude_session_id"], s["model"], s["effort"]),
-                         ("running", "ses_test1", "opencode/nemotron-3.5-super-vl-free", "xhigh"))
+                         ("running", "ses_test1", "acme/base", "xhigh"))
         event = self.conn.execute("SELECT text FROM events WHERE kind='spawn'").fetchone()[0]
-        self.assertIn("model opencode/nemotron-3.5-super-vl-free variant xhigh (opencode.json)", event)
+        self.assertIn("model acme/base variant xhigh (opencode.json)", event)
         self.assertIn("runtime opencode, session ses_test1", event)
         self.assertFalse((self.kit_dir.parent / "review-t20-settings.json").exists())
-        self.mock_require_capacity.assert_not_called()  # claude.json's max_running counts Claude sessions
+        self.mock_require_capacity.assert_called_once()  # opencode.json's max_running counts OpenCode sessions
 
     def test_model_and_variant_come_from_the_profiles_opencode_json_and_model_can_be_given(self):
         self.refused("review", "an OpenCode model is written provider/model, not 'nemotron'", runtime="opencode", model="nemotron")
         (self.profile / "config" / "opencode.json").write_text(json.dumps({"model": "acme/m-1", "variant": "low"}))
         self.spawn("review", runtime="opencode")
         self.assertEqual(self.server.calls[1][2]["model"], {"providerID": "acme", "id": "m-1", "variant": "low"})
-        (self.profile / "config" / "opencode.json").write_text(json.dumps({"variant": "high"}))  # a missing key keeps its default
+        (self.profile / "config" / "opencode.json").write_text(json.dumps({"variant": "high"}))
+        self.refused("qa", "no model is set for OpenCode", runtime="opencode")  # a variant alone names no model
         self.server.calls.clear()
         sid = self.spawn("qa", runtime="opencode", model="acme/sub/m-2")
         self.assertEqual(self.server.calls[1][2]["model"], {"providerID": "acme", "id": "sub/m-2", "variant": "high"})
@@ -381,12 +384,21 @@ class OpenCodeTests(AssignCase):
         sid = self.spawn("review", runtime="opencode")
         self.assertEqual(self.server.calls[1][2]["model"], {"providerID": "acme", "id": "m-1", "variant": "minimal"})
         self.assertEqual(self.session(sid)["effort"], "minimal")
-        self.refused("qa", "invalid effort 'minimal'", effort="minimal")  # Claude Code's own list still applies to it
+        self.refused("qa", "'minimal' is not an effort of Claude Code: low, medium, high, xhigh, max", effort="minimal")  # its own list applies
 
-    def test_the_default_model_and_variant_are_the_profile_templates(self):
-        template = json.loads((_load.HOME / "profile.template" / "config" / "opencode.json").read_text())
-        self.assertEqual(self.z.opencode_config(), template)  # no opencode.json in this profile
-        self.assertEqual(set(template), {"model", "variant"})
+    def test_without_a_model_an_opencode_worker_is_refused_because_its_server_would_pick_one(self):
+        (self.profile / "config" / "opencode.json").unlink()
+        self.refused("review", "no model is set for OpenCode (config/opencode.json), and a session created without one runs whatever "
+                               "OpenCode's server picks, not the user's choice. Ask the user which model to use, then "
+                               "`bin/hw configure --model <provider/model>`", runtime="opencode")
+        self.assertEqual(self.server.calls, [])
+        self.assertIsNone(self.conn.execute("SELECT 1 FROM sessions").fetchone())
+
+    def test_a_model_without_a_variant_is_passed_alone(self):
+        (self.profile / "config" / "opencode.json").write_text(json.dumps({"model": "acme/m-1"}))
+        sid = self.spawn("review", runtime="opencode")
+        self.assertEqual(self.server.calls[1][2]["model"], {"providerID": "acme", "id": "m-1"})
+        self.assertEqual((self.session(sid)["status"], self.session(sid)["effort"]), ("running", None))
 
     def test_the_canary_is_denied_before_the_tui_starts_and_the_brief_goes_through_the_server(self):
         sid = self.spawn("review", runtime="opencode")

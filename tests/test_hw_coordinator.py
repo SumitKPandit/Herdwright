@@ -86,30 +86,123 @@ class RuntimeTests(CoordinatorCase):
 
     def test_a_worker_runs_on_the_installs_runtime_unless_spawn_names_one(self):
         sid = self.spawn("review")
-        self.assertEqual(self.session(sid)["model"], "opencode/nemotron-3.5-super-vl-free")
+        self.assertEqual(self.session(sid)["model"], "acme/base")
         self.assertIn(("POST", "/session"), [c[:2] for c in self.server.calls])
         self.settings({"runtime": "claude"})
         self.server.calls.clear()
         sid = self.spawn("qa")
         self.assertEqual((self.session(sid)["model"], self.server.calls), ("claude-opus-5-5", []))
 
-    def test_the_runtime_command_writes_the_key_only_when_one_runtime_is_installed(self):
+    def test_choosing_the_runtime_stores_the_one_installed_and_leaves_both_or_neither_to_the_user(self):
         path = self.profile / "config" / "settings.json"
-        self.settings({"worker": {"deny_tools": ["x"]}})
-        with self.installed("claude", "opencode"):
-            self.z.cmd_runtime(["--set-installed"])
-        self.assertIn("both installed and an install uses one", self.output.getvalue())
-        self.assertNotIn("runtime", json.loads(path.read_text()))
+        for programs, found in ((("claude", "opencode"), "Claude Code and OpenCode are both installed"), ((), "Neither Claude Code nor OpenCode is installed")):
+            self.settings({"worker": {"deny_tools": ["x"]}})
+            with self.installed(*programs):  # no terminal here: nobody to ask
+                self.dies(lambda: self.z.cmd_runtime(["--choose"]))
+            self.assertIn(f"MISSING  the runtime: {found}, and an install uses one. Choose it: bin/hw-setup --runtime claude|opencode", self.output.getvalue())
+            self.assertNotIn("runtime", json.loads(path.read_text()))
+            with self.installed(*programs), patch.object(self.z, "ask_user", return_value="opencode") as ask:
+                self.z.cmd_runtime(["--choose"])
+            self.assertEqual(ask.call_args.args, (f"{found}, and an install uses one. Which one (claude or opencode)?",))
+            self.assertEqual(json.loads(path.read_text()), {"worker": {"deny_tools": ["x"]}, "runtime": "opencode"})
+        self.settings({})
         with self.installed("opencode"):
-            self.z.cmd_runtime(["--set-installed"])
-        self.assertEqual(json.loads(path.read_text()), {"worker": {"deny_tools": ["x"]}, "runtime": "opencode"})
-        self.settings({"runtime": "claude"})
-        with self.installed("opencode"):  # set once, it is the user's
-            self.z.cmd_runtime(["--set-installed"])
+            self.z.cmd_runtime(["--choose"])
+        self.assertEqual(json.loads(path.read_text()), {"runtime": "opencode"})
+        with self.installed("claude"):  # set once, it is the user's
+            self.z.cmd_runtime(["--choose"])
+        self.assertEqual(json.loads(path.read_text()), {"runtime": "opencode"})
+        with self.installed("opencode"):  # until they name another
+            self.z.cmd_runtime(["--choose", "claude"])
+            self.dies(lambda: self.z.cmd_runtime(["--choose", "pi"]), "'pi' is not a runtime: claude or opencode")
         self.assertEqual(json.loads(path.read_text()), {"runtime": "claude"})
+
+    def test_before_there_is_a_profile_only_a_choice_the_user_made_is_stored_and_the_template_settings_come_with_it(self):
+        (self.profile / "profile.md").unlink()
+        path = self.profile / "config" / "settings.json"
+        path.unlink()
+        with self.installed("opencode"):
+            self.z.cmd_runtime(["--choose"])
+        self.assertIn("runtime  opencode (the only one installed)", self.output.getvalue())
+        self.assertFalse(path.exists())
+        with self.installed("claude", "opencode"):
+            self.z.cmd_runtime(["--choose", "opencode"])
+        template = json.loads((HOME / "profile.template" / "config" / "settings.json").read_text())
+        self.assertEqual(json.loads(path.read_text()), template | {"runtime": "opencode"})  # onboarding keeps the files already there
+
+
+class ModelQuestionTests(CoordinatorCase):
+    """On OpenCode `coordinator` asks once for the model: a session its server creates without one runs the server's
+    own pick, not the user's."""
+
+    def setUp(self):
+        super().setUp()
+        self.config = self.profile / "config" / "opencode.json"
+        self.config.unlink()
+        self.state = self.root / "state"
+        (self.state / "opencode").mkdir(parents=True)
+        self.enterContext(patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state)}))
+
+    def last_used(self, text):
+        (self.state / "opencode" / "model.json").write_text(text)
+
+    def answers(self, *typed):
+        return patch.object(self.z, "ask_user", side_effect=list(typed))
+
+    def test_enter_accepts_the_model_and_variant_the_tui_last_used_and_they_are_stored(self):
+        self.last_used(json.dumps({"recent": [{"providerID": "acme", "modelID": "last/used"}], "variant": {"acme/last/used": "xhigh"}}))
+        with self.answers("", "") as ask:
+            self.z.choose_opencode_model()
+        self.assertEqual([c.args[0] for c in ask.call_args_list],
+                         ["Which model should Herdwright and its workers run on (provider/model, as `opencode models` lists them)? [acme/last/used]",
+                          "Which variant of it (the model's own name for how hard it thinks; nothing: its default)? [xhigh]"])
+        self.assertEqual(json.loads(self.config.read_text()), {"model": "acme/last/used", "variant": "xhigh"})
+        self.assertIn(f"stored: model acme/last/used, variant xhigh in {self.config}", self.output.getvalue())
+        with self.answers() as ask:  # asked once
+            self.z.choose_opencode_model()
+        ask.assert_not_called()
+
+    def test_a_typed_model_wins_and_its_variant_is_not_guessed_from_another_model(self):
+        self.last_used(json.dumps({"recent": [{"providerID": "acme", "modelID": "last"}], "variant": {"acme/last": "xhigh"}}))
+        with self.answers("other/m-2", "") as ask:
+            self.z.choose_opencode_model()
+        self.assertTrue(ask.call_args_list[1].args[0].endswith("nothing: its default)?"))
+        self.assertEqual(json.loads(self.config.read_text()), {"model": "other/m-2"})
+        self.config.unlink()
+        with self.answers("other/m-2", "low"):
+            self.z.choose_opencode_model()
+        self.assertEqual(json.loads(self.config.read_text()), {"model": "other/m-2", "variant": "low"})
+
+    def test_without_an_answer_or_a_terminal_nothing_is_guessed_and_the_coordinator_does_not_open(self):
+        self.last_used(json.dumps({"recent": [{"providerID": "acme", "modelID": "last"}]}))
+        with self.installed("opencode"):  # no terminal: the model the TUI last used is offered, never taken
+            self.dies(lambda: self.z.cmd_coordinator([]), f"no model is set for OpenCode in {self.config}",
+                      "Run `bin/hw coordinator` in a terminal and answer its question, or `bin/hw configure --model <provider/model>`")
+        for state in ("", "not json", json.dumps({"recent": []}), json.dumps({"recent": [{"providerID": "a b", "modelID": "x"}]})):
+            self.last_used(state)
+            with self.answers(""):  # Enter with nothing to accept
+                self.dies(self.z.choose_opencode_model, "no model is set for OpenCode")
+        with self.answers("nemotron"):
+            self.dies(self.z.choose_opencode_model, "an OpenCode model is written provider/model, not 'nemotron'")
+        self.assertFalse(self.config.exists())
+        self.assertEqual((self.processes, self.tui), ([], []))
+
+    def test_the_answer_opens_the_coordinator_on_that_model(self):
+        with self.installed("opencode"), self.answers("acme/m-9", "high"), self.assertRaises(SystemExit):
+            self.z.cmd_coordinator([])
+        self.assertIn("starting the coordinator on acme/m-9 (high)", self.output.getvalue())
+        created = next(body for method, path, body in self.server.calls if (method, path) == ("POST", "/session"))
+        self.assertEqual(created["model"], {"providerID": "acme", "id": "m-9", "variant": "high"})
 
 
 class KitTests(CoordinatorCase):
+    def test_a_model_without_a_variant_is_written_alone_and_no_model_is_refused(self):
+        (self.profile / "config" / "opencode.json").write_text(json.dumps({"model": "acme/m-1"}))
+        config = json.loads((self.z.coordinator_kit()["config_dir"] / "opencode.json").read_text())
+        self.assertEqual((config["model"], "agents" in config), ("acme/m-1", False))
+        (self.profile / "config" / "opencode.json").write_text("{}")
+        self.dies(self.z.coordinator_kit, "no model is set for OpenCode")
+
     def test_the_config_dir_holds_model_variant_permissions_instructions_and_the_guard(self):
         (self.profile / "config" / "opencode.json").write_text(json.dumps({"model": "acme/m-1", "variant": "minimal"}))
         kit = self.z.coordinator_kit()
@@ -156,13 +249,13 @@ class OpenTests(CoordinatorCase):
         self.assertEqual(process.env["HW_COORDINATOR"], str(self.record))
         created = next(body for method, path, body in self.server.calls if (method, path) == ("POST", "/session"))
         self.assertEqual(created, {"location": {"directory": str(HOME)}, "title": "hw",
-                                   "model": {"providerID": "opencode", "id": "nemotron-3.5-super-vl-free", "variant": "xhigh"}})
+                                   "model": {"providerID": "acme", "id": "base", "variant": "xhigh"}})
         self.assertRegex(self.server.prompts()[0], r"exactly this command: hw-pretool-canary [0-9a-f]{8}\n")
         record = json.loads(self.record.read_text())
         self.assertEqual({k: record[k] for k in ("runtime", "session", "server", "server_pid", "guard", "model", "variant")},
                          {"runtime": "opencode", "session": "ses_test1", "server_pid": os.getpid(), "guard": "live",
                           "server": {"url": kit["server"]["url"], "password": kit["server"]["password"]},
-                          "model": "opencode/nemotron-3.5-super-vl-free", "variant": "xhigh"})
+                          "model": "acme/base", "variant": "xhigh"})
         self.assertEqual(stat.S_IMODE(self.record.stat().st_mode), 0o600)  # it holds the server's password
 
     def test_a_session_whose_guard_is_not_proven_is_not_recorded(self):
@@ -189,6 +282,17 @@ class CommandTests(CoordinatorCase):
         self.assertTrue(recorded)  # while the TUI ran
         self.assertTrue(self.processes[0].stopped)
         self.assertFalse(self.record.exists())
+
+    def test_a_live_coordinator_of_the_code_before_the_rename_stops_it_before_anything_is_renamed_or_started(self):
+        cache = self.profile / ".cache"
+        cache.mkdir(exist_ok=True)
+        (cache / "zed.lock").write_text(json.dumps({"pane": None, "agent_session": "ses_old", "pid": os.getpid()}))
+        (self.profile / "db" / "hw.db").rename(self.profile / "db" / "zed.db")
+        with self.installed("opencode"):
+            self.dies(lambda: self.z.cmd_coordinator([]), f"OLD COORDINATOR STILL RUNNING: {cache / 'zed.lock'} is held by a live session")
+        self.assertEqual((self.processes, self.tui), ([], []))
+        self.assertTrue((cache / "zed.lock").exists())
+        self.assertFalse((self.profile / "db" / "hw.db").exists())
 
     def test_a_second_coordinator_is_refused_while_one_is_open_and_the_first_keeps_its_record(self):
         """S338: a second run overwrote the record of the open, lock-holding session and deleted it on exit."""
