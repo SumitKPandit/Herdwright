@@ -49,8 +49,8 @@ decision, for example:
 
 ## Work to a plan
 
-Your first output is the plan file your brief names (a checklist of steps, each with a "done when"
-and a rough time). Work through it in order and tick steps as they finish; Herdwright reads progress from
+Your first output is your plan file: a build's is the one your brief names, a review's or QA's is its own, named
+in your first prompt (a checklist of steps, each with a "done when" and a rough time). Work through it in order and tick steps as they finish; Herdwright reads progress from
 it. If you must change it, write down why. A step taking twice its estimate is a reason to stop and
 tell Herdwright, not to keep going.
 
