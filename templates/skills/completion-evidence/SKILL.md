@@ -14,7 +14,7 @@ describes the code as it was when it ran: after any code change, run it again.
   its manifests, CI config and instructions, with where you found each. For each: the command, the exit code and what
   it printed. A failure is accepted only if the brief, or an answer Zed relayed, accepted that exact failure.
 - **Requirements:** for each requirement and scenario the brief states, the test and assertion that check it, and the
-  result.
+  result. Where the repository has no tests for the changed code, say so; that alone fails nothing.
 - **QA cases:** the full list, each with its result and evidence. An empty list, a blocked case or a case that did not
   run cannot pass.
 - **Not checked:** each piece of work you skipped, marked `required` or `not-applicable`, with the reason. Never infer
@@ -26,7 +26,11 @@ describes the code as it was when it ran: after any code change, run it again.
   failure that was not accepted, and the plan is ticked. That is "implemented, awaiting review and QA", not finished
   work: say so, and list what you noticed but did not change.
 - A review or QA gives `clean` only when its work is complete and current: every requirement or case checked, none
-  failed, nothing `required` left unchecked. Anything else is `blockers`, with the findings file.
+  failed, nothing `required` left unchecked.
+- `blockers`, with the findings file, is for what was checked and failed: in a review a `[blocker]` finding, in QA a
+  case that failed or is blocked.
+- A review that could not be completed, with no `[blocker]` found, gives no verdict: `ZED:BLOCKED` or `ZED:QUESTION`,
+  as below.
 - A decision that is missing: `ZED:QUESTION`. An ambiguous, unrelated or missing answer is not a resolution; ask again.
 - A capability, setup, check or piece of evidence that is unavailable: `ZED:BLOCKED`, naming what is missing. Do not
   run later steps as though it had passed.

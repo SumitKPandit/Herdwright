@@ -189,7 +189,7 @@ class DraftTests(unittest.TestCase):
         self.assertIn(refused, "\n".join(self.problems(GOOD_DRAFT.replace(" Ground: bug.", ""))))
         for taste in ("Ground: naming.", "Ground: readability.", "Ground: rule.", "Ground: score 6."):
             self.assertIn(refused, "\n".join(self.problems(GOOD_DRAFT.replace("Ground: bug.", taste))), taste)
-        for ground in ("Ground: requirement.", "Ground: rule 7.", "ground: Bug;"):
+        for ground in ("Ground: requirement.", "Ground: rule 7.", "ground: Bug;", "**Ground:** bug.", "**Ground: rule 7**"):
             self.assertEqual(self.problems(GOOD_DRAFT.replace("Ground: bug.", ground)), [], ground)
 
     def test_a_finding_that_does_not_block_needs_no_ground(self):

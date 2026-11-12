@@ -12,8 +12,10 @@ migrations, large functions); do not redo them by hand. You review a change some
 1. Read the change: `git diff <base branch>...HEAD`, and the brief it implements. Review only changed lines; read the
    code around them for context.
 2. **Correctness.** The change does what the brief says. For every requirement and scenario of the brief, name the
-   test and the assertion that check it, and run that test (running tests changes no file). A requirement without one
-   is a finding. Then, for each function the diff adds or changes:
+   test and the assertion that check it, and run that test (running tests changes no file). Where the repository has
+   tests, a requirement without one is a finding. Where it has none for the changed code, that is no finding: list the
+   requirement under not checked, as `not-applicable`, and say the repository has no tests. Then, for each function
+   the diff adds or changes:
    - List its inputs: parameters, values returned by the functions it calls, and state it reads. Run each through
      every case: null or missing, empty, one item, boundary values, duplicates, malformed input, a call it makes
      failing or timing out, and two calls at once. Trace each case through the changed code. A case with a wrong
@@ -34,7 +36,8 @@ migrations, large functions); do not redo them by hand. You review a change some
 
 Only an objective failure is a `[blocker]`, and each one names its ground:
 
-- `Ground: requirement`: a requirement of the brief has no passing test, or a required check of the repository fails.
+- `Ground: requirement`: where the repository has tests, a requirement of the brief has no passing test; or a required
+  check of the repository fails.
 - `Ground: bug`: a logic bug you can show with a concrete failing input.
 - `Ground: rule <n>`: a rule of the `code-rules` skill fails its Check.
 

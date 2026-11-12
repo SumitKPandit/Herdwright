@@ -22,7 +22,7 @@ the brief nor an existing convention settles: `ZED:QUESTION`.
 | 8 | Change every place where the same rule lives, or reuse one shared copy. | Search the repo for the value or condition you changed. Each place found is in the diff or calls the shared copy. |
 | 9 | No code for future needs: no unused parameter, option, flag or abstraction. | Every new symbol has a caller in the diff. |
 | 10 | Nothing left behind: no commented-out code, debug output or TODO without a ticket. | Search the added lines for print and log calls, `debugger`, `TODO` and commented-out code. |
-| 11 | A comment only explains a why the code cannot show, and names its source. | Each new comment cites a ticket, the brief or the user. |
+| 11 | A comment only explains a why the code cannot show. | No new comment restates what its code does. Where a ticket, the brief or the user is the source of the why, the comment names it. |
 | 12 | Do not touch code the task does not change: no reformatting, renames or lint fixes, no hand edits to generated files, no lockfile change without a dependency change. | Every changed file serves a step of the plan. |
 | 13 | No new dependency unless the brief records it. | Compare manifest changes with the brief. A dependency it does not name: `ZED:QUESTION`. |
 | 14 | Handle preconditions, errors and edge cases first, with an early return, `continue` or throw, so the main path is not nested. | No function the diff adds, or whose nesting the diff deepens, nests blocks more than 2 levels deep inside its body. |

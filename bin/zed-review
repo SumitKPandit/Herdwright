@@ -14,9 +14,9 @@ Usage
       refuses a review draft that has a finding without `file:line`, a severity or a suggested change, a blocker
       without its ground, no verdict, a verdict that contradicts the findings, or anything addressed to a PR (the
       draft is for Zed, never posted). Only an objective failure is a blocker, so each one names its ground:
-      `requirement` (a requirement without a passing test, or a failing required check), `bug` (a logic bug shown with
-      a failing input) or `rule <n>` (a code rule that fails its check). Whether the ground is true is the reviewer's
-      judgement; that it is named is checked.
+      `requirement` (where the repository has tests, a requirement without a passing test; or a failing required
+      check), `bug` (a logic bug shown with a failing input) or `rule <n>` (a code rule that fails its check). Whether
+      the ground is true, and whether rule <n> exists, is the reviewer's judgement; that it is named is checked.
       Draft shape:
         - [blocker] path/file.py:42 what is wrong. Ground: requirement | bug | rule <n>. Fix: the change that would fix it
         - [should-fix|nit] path/file.py:10 what would improve. Fix: the change
@@ -249,7 +249,7 @@ def cmd_prep(a):
 SEVERITIES = ("blocker", "should-fix", "nit")
 FINDING = re.compile(r"^\s*(?:[-*]|\d+[.)])\s*\[(?P<sev>[^\]]*)\]\s*(?P<rest>.*)$")
 LOCATION = re.compile(r"[\w@./\\-]+\.\w+:\d+")
-GROUND = re.compile(r"\bground\s*:\s*(?:requirement|bug|rule\s+\d+)\b", re.I)  # the objective failures that may block
+GROUND = re.compile(r"\bground(?:\*\*)?\s*:\s*(?:\*\*)?\s*(?:requirement|bug|rule\s+\d+)\b", re.I)  # the objective failures that may block
 SUGGESTION = re.compile(r"\b(fix|suggest(?:ion|ed)?|change to|replace with|instead)\s*:", re.I)
 VERDICT = re.compile(r"^\s*(?:\*\*)?verdict(?:\*\*)?\s*:\s*(?:\*\*)?(\S+?)(?:\*\*)?\s*$", re.I)
 OUTWARD = re.compile(r"\bgh\s+pr\b|/pulls?/\d+/(?:reviews|comments)|^\s*/(?:approve|lgtm)\b", re.I | re.M)
