@@ -13,10 +13,15 @@ parse problem or an unexpected payload allows the call.
 
 For the coordinator it denies:
   * Edit / Write / NotebookEdit / patch of a file outside Zed's home, the profile and the temp dirs
-  * Bash: git commit/push/rebase/merge/cherry-pick/reset/revert/add/apply/am/tag/stash in a repo outside Zed's home,
-    a persistent top-level `cd` outside Zed's home (it silently changes where later commands run), writes
-    (`>`, `>>`, rm, mv, cp, touch, mkdir, tee, sed -i, perl -i) to paths outside the allowed roots, however the path
-    is given: absolute, or relative to the call's working directory (OpenCode's `workdir`) or to a `cd` before it
+  * Bash: git commit/push/rebase/merge/cherry-pick/reset/revert/add/apply/am/tag/stash/clean/checkout/switch in a repo
+    outside Zed's home, a `cd` or `pushd` in the command line's own shell that leads outside the allowed roots (it
+    silently changes where later commands run), and writes to paths outside them: a redirect (`>`, `>>`, `>|`, `&>`,
+    `&>>`, `>&`, also after a heredoc), rm, mv, cp, touch, mkdir, tee, ln, chmod, chown, sed -i, perl -i, `dd of=`, a
+    `find` that deletes or runs one of these. The path may be absolute, or relative to the call's working directory
+    (OpenCode's `workdir`) or to a `cd` before it; the command may stand after a compound command's opener (`{`,
+    `then`, `do`, `!`) or a wrapper (`command`, `env`, `sudo`, `xargs`, `time`, `nice`, `nohup`, `exec`).
+    Not followed: a path the shell expands (`$DIR/x`, `cd $X`), and a write made by another program (`bash -c`,
+    `python3 -c`, `npm install`, a script).
   * an edit-tool call that names no file (it cannot be checked)
   * Agent / Workflow tools (delegate with `bin/zed spawn`; pass --allow-subagents to permit them)
 Reads are never blocked. One call is denied in every session: a shell command starting with `zed-pretool-canary`,
@@ -36,7 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 import zeddeny  # noqa: E402
 import zedlib  # noqa: E402
-from zedshell import CD_COMMANDS, FILE_WRITERS, GIT_WRITE, REDIRECTS, cd_target, git_target, inside, scope_dir, scoped_commands, tokens  # noqa: E402
+from zedshell import CD_COMMANDS, GIT_WRITE, cd_target, command_words, git_target, inside, redirect_targets, scope_dir, scoped_commands, tokens, write_targets  # noqa: E402
 
 
 def allowed_roots(zed_home=None, profile=None):
@@ -66,28 +71,26 @@ def bash_problem(cmd, cwd, roots):
 
     for words, scope in cmds:
         here = scope_dir(dirs, scope)
-        words = [w for w in words if not re.fullmatch(r"\w+=.*", w)] if words and re.fullmatch(r"\w+=.*", words[0]) else words
+        words = command_words(words)
         if not words:
             continue
-        if words[0] in CD_COMMANDS:
-            if words[0] == "cd" and scope == () and len(words) > 1 and words[1] != "-" and outside(words[1], here):
-                return f"don't `cd` into {words[1]}: it silently changes where later commands run. Use absolute paths or `git -C` for reads, and delegate changes to a worker (bin/zed spawn)."
+        name = Path(words[0]).name
+        if name in CD_COMMANDS:
             dirs[scope] = cd_target(words, here)
+            if scope == () and dirs[scope] is not None and not inside(dirs[scope], roots, "/"):
+                return f"don't `{name}` into {dirs[scope]}: it silently changes where later commands run. Use absolute paths or `git -C` for reads, and delegate changes to a worker (bin/zed spawn)."
             continue
-        if words[0] == "git":
+        if name == "git":
             sub, target = git_target(words, here)
             if sub in GIT_WRITE and target is not None and outside(target, here):
                 return f"`git {sub}` in {target}: project repos are changed only by workers (bin/zed spawn). Zed commits only in its own repo."
-        for i, w in enumerate(words):
-            if w in REDIRECTS and i + 1 < len(words) and not words[i + 1].startswith("&") and outside(words[i + 1], here):
-                return f"writing to {words[i + 1]} is outside Zed's repo/profile/tmp: that is a worker's job."
-        name = Path(words[0]).name
-        in_place = name in ("sed", "perl") and any(re.fullmatch(r"-\w*i\w*", w) or w.startswith("-i") for w in words[1:])
-        if name in FILE_WRITERS or in_place:
-            for w in words[1:]:
-                if not w.startswith("-") and outside(w, here):
-                    where = w if os.path.isabs(os.path.expanduser(w)) else f"{w} in {here}"
-                    return f"`{name}` on {where}: outside Zed's repo/profile/tmp. Project files are changed by workers (bin/zed spawn)."
+        for target in redirect_targets(words):
+            if outside(target, here):
+                return f"writing to {target} is outside Zed's repo/profile/tmp: that is a worker's job."
+        for w in write_targets(words):
+            if outside(w, here):
+                where = w if os.path.isabs(os.path.expanduser(w)) else f"{w} in {here}"
+                return f"`{name}` on {where}: outside Zed's repo/profile/tmp. Project files are changed by workers (bin/zed spawn)."
     return None
 
 

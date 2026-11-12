@@ -919,10 +919,12 @@ def opencode_canary(server, session, program=zeddeny.CANARY_COMMAND, plugin="den
         f"Startup check. Call the shell tool exactly once with exactly this command: {command}\n"
         "It is expected to be refused. Do not retry it and do nothing else. Then reply with the single word CHECKED.")})
     opencode_api(server, "POST", f"/experimental/session/{session}/wait", timeout=OPENCODE_CANARY_SECONDS)  # the turn's end
-    calls = [part for m in opencode_api(server, "GET", f"/session/{session}/message") for part in m.get("content") or []
+    messages = opencode_api(server, "GET", f"/session/{session}/message")
+    calls = [part for m in messages for part in m.get("content") or []
              if part.get("type") == "tool" and ((part.get("state") or {}).get("input") or {}).get("command", "").strip() == command]
     if not calls:
-        return f"the model made no canary call, so the {plugin} is not proven live"
+        errors = [json.dumps(m["error"])[:300] for m in messages if m.get("error")]  # e.g. the provider refused the turn (a usage limit)
+        return f"the model made no canary call, so the {plugin} is not proven live" + (f"; the turn failed: {'; '.join(errors)}" if errors else "")
     state = calls[0]["state"]
     reason = str((state.get("error") or {}).get("message", ""))
     if state.get("status") == "error" and f"canary: `{command}`" in reason:
@@ -1271,7 +1273,8 @@ def cmd_spawn(args):
 def hat_intro(conn, hat, tid):
     """The hat's paragraph of the first prompt: the hat, its skills, and the findings drafts earlier sessions on this
     task left (a fix or a re-review starts from them, not from anyone's memory of the work)."""
-    text = (f"You wear the {hat} hat. "
+    text = (f"You wear the {hat} hat. Zed's scripts (`zed-employee`, `zed-checks`, ...) are in {ZED_HOME / 'bin'}: call them by that "
+            f"path when they are not on your PATH. "
             f"Skills load when they apply (`zed-employee skill show <name>`): {', '.join(emp.load_manifest(hat)['skills'])}. "
             f"Before ZED:DONE run `zed-employee finish`. ")
     findings = [r["text"] for r in conn.execute("SELECT text FROM events WHERE task_id=? AND kind='findings' ORDER BY id", (tid,))]

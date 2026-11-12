@@ -141,8 +141,19 @@ class SetupCase(unittest.TestCase):
         (self.repo / "profile" / "profile.md").write_text("# A profile\n")
         self.git("checkout", "-q", "-b", "profile/me")
         r = self.setup()
-        self.assertRegex(r.stdout, r"(?m)^ok +profile/ present \(branch: profile/me\)$")
+        self.assertRegex(r.stdout, rf"(?m)^ok +profile present at {self.repo}/profile \(branch: profile/me\)$")
         self.assertNotIn("no profile yet", r.stdout)
+
+    def test_a_profile_kept_elsewhere_is_found_through_its_variable(self):
+        """S339: the script looked under the checkout only, said "no profile yet" and wrote no runtime."""
+        elsewhere = self.root / "my-profile"
+        (elsewhere / "config").mkdir(parents=True)
+        (elsewhere / "profile.md").write_text("# A profile\n")
+        self.env |= {"ZED_PROFILE_DIR": str(elsewhere)}
+        r = self.setup(runtimes=("opencode",))
+        self.assertRegex(r.stdout, rf"(?m)^ok +profile present at {elsewhere} ")
+        self.assertNotIn("no profile yet", r.stdout)
+        self.assertEqual(json.loads((elsewhere / "config" / "settings.json").read_text()), {"runtime": "opencode"})
 
 
 if __name__ == "__main__":

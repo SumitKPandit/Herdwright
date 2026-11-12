@@ -3,12 +3,23 @@ commands, find the git subcommand and its repo, and test whether a path lies ins
 import os
 import re
 import shlex
+from itertools import dropwhile, takewhile
 from pathlib import Path
 
-GIT_WRITE = {"commit", "push", "rebase", "merge", "cherry-pick", "reset", "revert", "add", "apply", "am", "tag", "stash", "rm", "mv", "restore"}
-FILE_WRITERS = {"rm", "mv", "cp", "touch", "mkdir", "tee", "ln", "rmdir", "truncate"}
-OPERATORS = {"&&", "||", ";", "|", "&", "(", ")"}
-REDIRECTS = {">", ">>", ">|"}
+GIT_WRITE = {"commit", "push", "rebase", "merge", "cherry-pick", "reset", "revert", "add", "apply", "am", "tag", "stash", "rm", "mv", "restore",
+             "clean", "checkout", "switch"}
+FILE_WRITERS = {"rm", "mv", "cp", "touch", "mkdir", "tee", "ln", "rmdir", "truncate", "chmod", "chown"}
+PIPES = {"|", "|&"}
+OPERATORS = {"&&", "||", ";", "&", "(", ")"} | PIPES
+REDIRECTS = {">", ">>", ">|", "&>", "&>>", ">&"}
+# What may stand before a simple command's program: the opener of a compound command, and programs that run the
+# command that follows them, each with its options that take a value
+OPENERS = {"{", "then", "do", "else", "elif", "if", "while", "until", "!"}
+WRAPPERS = {"builtin": (), "command": (), "exec": ("-a",), "nohup": (), "time": (), "nice": ("-n",), "env": ("-u", "-C"),
+            "sudo": ("-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-U"), "doas": ("-u", "-C"),
+            "xargs": ("-n", "-I", "-P", "-L", "-s", "-d", "-E", "-a")}
+ASSIGNMENT = re.compile(r"\w+=.*")
+MODE = re.compile(r"[0-7]{3,4}|[ugoa]*[-+=][rwxXstugo]*(,[ugoa]*[-+=][rwxXstugo]*)*")  # chmod's first argument
 
 
 def inside(path, roots, cwd):
@@ -18,14 +29,22 @@ def inside(path, roots, cwd):
     return any(p == r or r in p.parents for r in roots)
 
 
+HEREDOC = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?([^\n]*)\n.*?\n\s*\1\s*(?=\n|$)", re.S)
+
+
 def strip_heredocs(cmd):
-    return re.sub(r"<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n.*?\n\s*\1\s*(?=\n|$)", "\n", cmd, flags=re.S)
+    """`cmd` without its here-documents' bodies. The rest of the line that opens one stays: `cat <<EOF > file` writes
+    `file`. A line may open several."""
+    while True:
+        cmd, found = HEREDOC.subn(lambda m: f" {m.group(2)}\n", cmd, count=1)
+        if not found:
+            return cmd
 
 
 def tokens(cmd):
     lex = shlex.shlex(strip_heredocs(cmd).replace("\n", " ; "), posix=True, punctuation_chars=True)
     lex.whitespace_split = False
-    lex.wordchars += "${}"  # keep `$E` / `${E}` one word, so `git -C $E commit` reads as a git commit in an unknown repo
+    lex.wordchars += "${}+:@%"  # keep `$E` / `${E}` one word, so `git -C $E commit` reads as a git commit in an unknown repo
     # shlex returns a run of punctuation as one word (`);`, `))`): a parenthesis is an operator of its own
     return [part for t in lex for part in (re.findall(r"[()]|[^()]+", t) if re.fullmatch(r"[();<>|&]+", t) else [t])]
 
@@ -45,8 +64,8 @@ def scoped_commands(toks):
 
     for t in toks:
         if t in OPERATORS:
-            flush(piped or t in ("|", "&"))
-            piped = t == "|"
+            flush(piped or t in PIPES or t == "&")
+            piped = t in PIPES
             if t == "(":
                 count += 1
                 stack.append(stack[-1] + (count,))
@@ -58,9 +77,49 @@ def scoped_commands(toks):
     return cmds
 
 
-def split_commands(toks):
-    """[(words, depth_zero)] — as scoped_commands; depth_zero is True for a command in the command line's own shell."""
-    return [(words, scope == ()) for words, scope in scoped_commands(toks)]
+def command_words(words):
+    """A simple command's own words, the program first: without the variable assignments, the compound command's
+    opener (`{`, `then`, `do`, `!` ...) and the wrappers (`command`, `env`, `sudo`, `xargs` ...) before it. So
+    `if true; then FOO=1 env touch x; fi` reads as `touch x`. [] when nothing is left (`do`, `fi`, `}` alone)."""
+    while words:
+        name = Path(words[0]).name
+        if ASSIGNMENT.fullmatch(words[0]) or words[0] in OPENERS:
+            words = words[1:]
+        elif name in WRAPPERS:
+            words = words[1:]
+            while words and (words[0].startswith("-") or (name == "env" and ASSIGNMENT.fullmatch(words[0]))):
+                words = words[1 + (words[0] in WRAPPERS[name]):]
+        else:
+            break
+    return words
+
+
+def redirect_targets(words):
+    """The files the redirections among `words` write: the word after `>`, `>>`, `>|`, `&>`, `&>>` or `>&`, unless
+    that names a file descriptor (`>&2`, `2>&1`, `>&-`)."""
+    return [t for w, t in zip(words, words[1:]) if w in REDIRECTS and not (w == ">&" and re.fullmatch(r"\d+|-", t))]
+
+
+def write_targets(words):
+    """The paths the simple command `words` (its own words: `command_words`) writes by what it is, redirections
+    aside: the arguments of a file-writing program (rm, cp, touch, chmod ... and sed/perl in place), `dd of=`, and the
+    start paths of a `find` that deletes or runs such a program."""
+    if not words:
+        return []
+    name, args = Path(words[0]).name, [w for w in words[1:] if not w.startswith("-")]
+    if name == "chmod":
+        return list(dropwhile(lambda w: MODE.fullmatch(w) or w == ",", args))  # the tokenizer cuts a mode at its commas
+    if name == "chown":
+        return args[1:]
+    if name in FILE_WRITERS or (name in ("sed", "perl") and any(re.fullmatch(r"-\w*i\w*", w) or w.startswith("-i") for w in words[1:])):
+        return args
+    if name == "dd":
+        return [w[3:] for w in words[1:] if w.startswith("of=")]
+    if name == "find":
+        runs = [words[i + 1:] for i, w in enumerate(words) if w in ("-exec", "-execdir", "-ok", "-okdir")]
+        if "-delete" in words or any(write_targets(command_words(run)) for run in runs):
+            return list(takewhile(lambda w: not w.startswith(("-", "(", "!")), words[1:])) or ["."]
+    return []
 
 
 def scope_dir(dirs, scope):
@@ -82,14 +141,15 @@ def unresolved(path):
 
 def cd_target(words, cwd):
     """Where the `cd`, `pushd` or `popd` command `words` leaves a shell that stood in `cwd`; None when that cannot be
-    known (a target the shell expands, `cd -`, `popd`, a bare `cd`, an unknown `cwd` with a relative target)."""
+    known (a target the shell expands, `cd -`, `popd`, a bare `pushd`, which swaps the two directories on top of the
+    stack, an unknown `cwd` with a relative target). A bare `cd` leads home."""
     args = [w for w in words[1:] if w != "--" and not re.fullmatch(r"-[LPe@]+", w)]
     if args and not unresolved(args[0]) and args[0] != "-":
         d = Path(os.path.expanduser(args[0]))
         if d.is_absolute() or cwd is not None:
             return os.path.realpath(d if d.is_absolute() else Path(cwd) / d)
         return None
-    return cwd if not args and Path(words[0]).name == "pushd" else None
+    return os.path.realpath(os.path.expanduser("~")) if not args and Path(words[0]).name == "cd" else None
 
 
 def git_target(words, cwd):

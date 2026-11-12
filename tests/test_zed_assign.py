@@ -126,6 +126,7 @@ class SpawnTests(AssignCase):
         self.assertEqual(hook["command"], str(HOME / "bin" / "zed-deny"))
         prompt = self.mock_prompt_worker.call_args.args[1]
         self.assertIn("You wear the build hat.", prompt)
+        self.assertIn(f"are in {HOME / 'bin'}: call them by that path when they are not on your PATH", prompt)  # S339: no bin/ on a worker's PATH
         self.assertIn("zed-employee finish", prompt)
         self.assertIn(str(out / "build-t20-rules.md"), prompt)
 
@@ -285,6 +286,8 @@ class FakeOpenCodeServer:
             command = re.search(r"zed-(deny|pretool)-canary \w+", self.prompts()[0]).group(0)
             if self.guard == "silent":
                 return [{"type": "assistant", "content": [{"type": "text", "text": "CHECKED"}]}]
+            if self.guard == "refused":  # the turn never ran: the message carries the provider's error
+                return [{"type": "assistant", "content": [], "error": {"type": "provider", "message": "429 usage limit reached"}}]
             denied = self.guard == "live"
             state = {"status": "error" if denied else "completed", "input": {"command": command}}
             if denied:
@@ -407,6 +410,12 @@ class OpenCodeTests(AssignCase):
     def test_a_model_that_makes_no_canary_call_proves_nothing(self):
         self.server.guard = "silent"
         self.refused_start("the model made no canary call, so the deny plugin is not proven live")
+
+    def test_a_turn_the_provider_refused_is_reported_with_its_error(self):
+        """S339: a usage limit showed only as "the model made no canary call"."""
+        self.server.guard = "refused"
+        self.refused_start("the model made no canary call, so the deny plugin is not proven live; the turn failed: ")
+        self.assertIn("429 usage limit reached", self.output.getvalue())
 
     def test_a_server_that_does_not_answer_fails_the_worker(self):
         self.server.up = False

@@ -148,7 +148,37 @@ class DecideTests(unittest.TestCase):
         emp_dir = self.profile / "briefs"
         for command in (f"{{ cd {emp_dir}; touch sub/x; }}", f"if true; then cd {emp_dir}; touch sub/x; fi"):
             self.assertIn("denied", self.bash("review", command), command)
-        self.assertIn("cannot be checked", self.bash("review", "cd && touch x"))
+        self.assertIsNone(self.bash("review", "cd && touch x"))  # a bare `cd` leads home, outside the worktree
+        self.assertIn("cannot be checked", self.bash("review", f"pushd {self.wt} && pushd {self.evidence} && pushd && touch x"))
+
+    def test_an_opener_or_a_wrapper_before_a_write_does_not_hide_it(self):
+        """S341: the worker guard looked past `{`, `then`, `do`, `command`; not past `env`, `sudo`, `xargs`, `!`, `time`."""
+        for command in ("{ touch a.py; }", "if true; then touch a.py; fi", "for f in a b; do rm a.py; done", "while true; do rm a.py; done",
+                        "command touch a.py", "builtin command touch a.py", "env touch a.py", "env FOO=1 touch a.py", "sudo rm a.py",
+                        "sudo -u bob rm a.py", "xargs rm a.py", "! rm a.py", "time rm a.py", "nice -n 5 touch a.py", "FOO=1 nohup touch a.py"):
+            self.assertIn("denied", self.bash("review", command), command)
+        for command in ("env gh pr comment 1 -b x", "if true; then gh pr comment 1 -b x; fi"):
+            self.assertIn("anything outward", self.bash("review", command), command)
+        for command in ("if true; then ls; fi", "env FOO=1 ls a.py", "command -v touch", f"env touch {self.evidence}/a.txt"):
+            self.assertIsNone(self.bash("review", command), command)
+
+    def test_every_redirect_and_pipe_operator_is_read(self):
+        """S341: `&>`, `&>>`, `>&` and `|&` stayed inside a command's words, so the write after them was not seen."""
+        for command in ("echo x &> a.py", "echo x &>> a.py", "echo x >& a.py", "ls |& tee a.py", "ls |& (cd src && tee a.py)"):
+            self.assertIn("denied", self.bash("review", command), command)
+        for command in ("echo x >&2", "echo x 2>&1", "ls 2>&1 | cat", "echo x >&-", f"echo x &> {self.evidence}/out.txt"):
+            self.assertIsNone(self.bash("review", command), command)
+
+    def test_writes_that_are_not_a_file_writers_first_word(self):
+        """S342: a heredoc with the redirect after it, git clean and checkout, chmod, dd and a deleting find passed."""
+        for command in ("cat <<EOF > a.py\nx\nEOF", "cat <<'EOF' >> a.py\nx\nEOF\nls", "chmod +x a.py", "chmod -R 755 src", "chown bob a.py",
+                        "dd if=/dev/zero of=a.py", "find . -name '*.py' -delete", "find src -exec rm {} \\;", "find . -exec sed -i s/a/b/ {} +"):
+            self.assertIn("denied", self.bash("review", command), command)
+        for command in ("git clean -fd", "git checkout -- .", "git switch main"):
+            self.assertIn("this hat does not change the repo", self.bash("review", command), command)
+        for command in (f"cat <<EOF > {self.evidence}/a.txt\nrm a.py\nEOF", f"chmod +x {self.evidence}/run.sh", f"dd if=a.py of={self.evidence}/a",
+                        "find . -name '*.py'", "find . -exec grep -l x {} \\;", f"find {self.evidence} -delete", "cat <<EOF\n> a.py\nEOF"):
+            self.assertIsNone(self.bash("review", command), command)
 
     def test_a_command_ending_in_a_shell_keyword_or_a_semicolon_is_checked_not_crashed(self):
         for command in ("for c in a b; do", "while true; do", "if true; then", "echo x;", "echo x; do", "ls ; ; then"):
