@@ -96,6 +96,12 @@ class SessionPlanTests(unittest.TestCase):
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript("CREATE TABLE sessions (id INTEGER PRIMARY KEY, task_id INTEGER, external INTEGER DEFAULT 0, hat TEXT, plan TEXT)")
 
+    def test_a_readers_plan_name_is_the_one_its_matcher_knows_and_a_build_plan_is_not(self):
+        """The name and the matcher live together: `hw-plan` skips readers' plans by the same format spawn names them by."""
+        for hat in ("review", "qa"):
+            self.assertTrue(hwlib.READER_PLAN.fullmatch(hwlib.reader_plan_name(hat, 121, 393)), hat)
+        self.assertFalse(hwlib.READER_PLAN.fullmatch("T121-zed-plan.md"))
+
     def session(self, hat, plan, text, external=0):
         path = self.dir / plan
         path.write_text(text)

@@ -286,6 +286,14 @@ def brief_plan_file(brief_text):
     return Path(m.group(1)) if m else None
 
 
+READER_PLAN = re.compile(r"T\d+-(review|qa)-S\d+-plan\.md")  # the file name `reader_plan_name` builds
+
+
+def reader_plan_name(hat, task_id, sid):
+    """A review's or QA's own plan file name, named like its findings: two readers on one task never share a plan."""
+    return f"T{task_id}-{hat}-S{sid}-plan.md"
+
+
 AUTHOR_SESSION = "(hat IS NULL OR hat = 'build')"  # a session that implements: the build hat and sessions from before hats existed
 
 

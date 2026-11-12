@@ -1457,7 +1457,7 @@ def session_plan_path(hat, tid, sid, repo, brief):
     review or QA reads the build's brief too, but two of them on one task must not share a plan: each would pick the
     other's step labels and finish would count the other's open steps, so each gets its own, named like its findings."""
     if hat in ("review", "qa"):
-        return PROFILE_DIR / "briefs" / f"T{tid}-{hat}-S{sid}-plan.md"
+        return PROFILE_DIR / "briefs" / hwlib.reader_plan_name(hat, tid, sid)
     return hwlib.brief_plan_file(brief.read_text()) or PROFILE_DIR / "briefs" / f"T{tid}-{repo}-plan.md"
 
 
