@@ -180,6 +180,12 @@ class DraftTests(unittest.TestCase):
         self.assertIn("2 verdict lines", "\n".join(self.problems(GOOD_DRAFT + "Verdict: clean\n")))
         self.assertIn("must be 'clean' or 'blockers'", "\n".join(self.problems(GOOD_DRAFT.replace("blockers\n", "approve\n").replace("Verdict: blockers", "Verdict: approve"))))
 
+    def test_a_location_in_a_file_without_an_extension_is_a_location(self):
+        for where in ("bin/hw:120", "./Makefile:3", "bin/hw-review:251"):
+            self.assertEqual(self.problems(GOOD_DRAFT.replace("app/guard.py:42", where)), [], where)
+        for text in ("step:3", "the guard"):  # a word before a number is not a place in the code
+            self.assertIn("no file:line", "\n".join(self.problems(GOOD_DRAFT.replace("app/guard.py:42", text))), text)
+
     def test_verdict_must_agree_with_the_findings(self):
         self.assertIn("verdict is clean but a finding is a blocker", self.problems(GOOD_DRAFT.replace("Verdict: blockers", "Verdict: clean")))
         self.assertIn("verdict is blockers but no finding is a blocker", self.problems(GOOD_DRAFT.replace("[blocker]", "[should-fix]")))

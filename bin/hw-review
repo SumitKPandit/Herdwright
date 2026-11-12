@@ -248,7 +248,7 @@ def cmd_prep(a):
 
 SEVERITIES = ("blocker", "should-fix", "nit")
 FINDING = re.compile(r"^\s*(?:[-*]|\d+[.)])\s*\[(?P<sev>[^\]]*)\]\s*(?P<rest>.*)$")
-LOCATION = re.compile(r"[\w@./\\-]+\.\w+:\d+")
+LOCATION = re.compile(r"[\w@./\\-]+\.\w+:\d+|[\w@.\\-]*(?:/[\w@.\\-]+)+:\d+")  # a file with an extension, or a path (bin/hw:120)
 GROUND = re.compile(r"\bground(?:\*\*)?\s*:\s*(?:\*\*)?\s*(?:requirement|bug|rule\s+\d+)\b", re.I)  # the objective failures that may block
 SUGGESTION = re.compile(r"\b(fix|suggest(?:ion|ed)?|change to|replace with|instead)\s*:", re.I)
 VERDICT = re.compile(r"^\s*(?:\*\*)?verdict(?:\*\*)?\s*:\s*(?:\*\*)?(\S+?)(?:\*\*)?\s*$", re.I)
@@ -272,7 +272,7 @@ def check_draft(text):
         if f["sev"] not in SEVERITIES:
             problems.append(f"{where}: severity must be one of {', '.join(SEVERITIES)} (got '{f['sev'] or 'empty'}')")
         if not LOCATION.search(f["text"]):
-            problems.append(f"{where}: no file:line (like app/guard.py:42)")
+            problems.append(f"{where}: no file:line (like app/guard.py:42 or bin/hw:120)")
         if f["sev"] == "blocker" and not GROUND.search(f["text"]):
             problems.append(f"{where}: a blocker names its ground (write 'Ground: requirement', 'Ground: bug' or 'Ground: rule <n>')")
         if not SUGGESTION.search(f["text"]):
