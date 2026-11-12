@@ -146,8 +146,9 @@ class OpenCode(FakeCase):
         admitted = self.api("POST", f"/session/{session}/prompt", {"text": f"Call the shell tool exactly once with exactly this command: {command}\nThen stop."})
         self.assertTrue(admitted["id"].startswith("msg_"))
         self.api("POST", f"/experimental/session/{session}/wait")
-        user, reply = self.api("GET", f"/session/{session}/message")
-        self.assertEqual((user["id"], user["type"], reply["type"]), (admitted["id"], "user", "assistant"))
+        idle, reply, user = self.api("GET", f"/session/{session}/message")  # newest first, as OpenCode v2.2.7 lists them
+        self.assertEqual((user["id"], user["type"], reply["type"], idle["type"]), (admitted["id"], "user", "assistant", "idle"))
+        self.assertEqual(self.api("GET", f"/session/{session}/message?limit=1"), [idle])
         return reply["content"][0]["state"]
 
     def test_the_server_is_up_when_pane_run_returns_asks_for_its_password_and_ends_with_its_pane(self):

@@ -111,6 +111,8 @@ class PretoolTests(unittest.TestCase):
                         "timeout 5 rm c.txt", "timeout -k 1 5s rm c.txt", "stdbuf -oL touch c.txt", "true;>c.txt", "find -L . -name x -delete"):
             self.assertIsNotNone(decide("shell", command=command, workdir="/code/proj"), command)
             self.assertIsNone(bash(command), command)  # in Herdwright's own repo
+        for command in ("find -EX /code/proj -name x -delete", "find -EXd -- /code/proj -delete", "find -sEf /code/proj -exec rm {} ;"):
+            self.assertIsNotNone(bash(command), command)  # T121: BSD's grouped options hid the project path, so "." was checked
         for command in ("{ cd /code/proj && touch c.txt; }", "if true; then cd /code/proj; touch c.txt; fi", "builtin cd /code/proj && touch c.txt",
                         "cd -P /code/proj", "pushd /code/proj", "cd"):
             self.assertIn("it silently changes where later commands run", bash(command), command)

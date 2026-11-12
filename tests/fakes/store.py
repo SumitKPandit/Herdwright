@@ -91,6 +91,20 @@ def set_status(agent, status):
         agent["seq"] += 1
 
 
+def idle_message():
+    """The message OpenCode v2.2.7 lists when a turn of a session has ended."""
+    return {"id": f"msg_{uuid.uuid4().hex[:12]}", "type": "idle", "outcome": "succeeded"}
+
+
+def end_turn(pane):
+    """The agent in `pane` ends its turn: it rests, and the OpenCode session its TUI is on lists the turn's end."""
+    agent = pane["agent"]
+    set_status(agent, agent["launch"].get("rest", "idle"))
+    session = (pane.get("opencode") or {}).get(agent["launch"].get("session"))
+    if session is not None:
+        session["messages"].append(idle_message())
+
+
 def find_agent(state, ref):
     """(pane_id, pane) of the agent named `ref` (or living in pane `ref`), or (None, None)."""
     for pane_id, pane in state["panes"].items():

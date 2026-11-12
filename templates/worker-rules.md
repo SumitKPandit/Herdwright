@@ -49,8 +49,8 @@ decision, for example:
 
 ## Work to a plan
 
-Your first output is the plan file your brief names (a checklist of steps, each with a "done when"
-and a rough time). Work through it in order and tick steps as they finish; Herdwright reads progress from
+Your first output is your plan file: a build's is the one your brief names, a review's or QA's is its own, named
+in your first prompt (a checklist of steps, each with a "done when" and a rough time). Work through it in order and tick steps as they finish; Herdwright reads progress from
 it. If you must change it, write down why. A step taking twice its estimate is a reason to stop and
 tell Herdwright, not to keep going.
 
@@ -61,8 +61,8 @@ its own plan is ticked; `finish` ticks the plan's last line itself when it is ex
 about merging, pushing or raising a PR may stay open, because it happens after review and QA. Mark it by
 putting `[after-review]` in its title, or start the title with the action ("Merge the branch", "Push to
 origin", "Raise a draft PR against main"); a title that merely contains the word ("Push notification
-handler") is an ordinary step. Your session's plan is the file your brief's Plan section names; it is
-recorded when you are started and shown with your hat ("review 2/5").
+handler") is an ordinary step. Your session's plan is the file your brief's Plan section names (a review or QA: its own
+file, which your first prompt names); it is recorded when you are started and shown with your hat ("review 2/5").
 
 One build session writes a worktree at a time, and reviews and QA never edit or commit: a review or QA
 that changed the code is its author and `finish` refuses its verdict.

@@ -18,7 +18,7 @@ Acts, one key each:
   {"say": text}                       print text
   {"block": KIND, "text": text}       print a `HW:<KIND>` block (QUESTION, DONE, BLOCKED)
   {"status": line}                    append a line to the status file named in the first prompt
-  {"plan": [step, ..]}                write the plan file the brief names: those steps, then the fixed finish line
+  {"plan": [step, ..]}                write the plan file the first prompt names, else the brief's: those steps, then the finish line
   {"tick": n | "all"}                 tick step n, or every step but the finish line
   {"write": path, "text": text}       write a file in the working folder
   {"git": [args]}                     run git there
@@ -115,7 +115,8 @@ def facts_from(prompt):
     def first(test):
         return next((p for p in paths if test(p)), None)
     return {"status_file": first(lambda p: p.endswith(".log")), "rules": first(lambda p: p.endswith("-rules.md")),
-            "brief": first(lambda p: "/briefs/" in p and p.endswith(".md")), "home": home.group(1) if home else None}
+            "brief": first(lambda p: "/briefs/" in p and p.endswith(".md") and not p.endswith("-plan.md")),
+            "plan": first(lambda p: p.endswith("-plan.md")), "home": home.group(1) if home else None}
 
 
 def keys(pane_id, pressed):
@@ -186,7 +187,10 @@ def work(pane_id):
 
 
 def plan_file(facts):
-    """The plan file the brief tells its worker to write (the same reading `bin/hw` records at spawn)."""
+    """The plan file the first prompt names (a review's or QA's own), else the one the brief tells its worker to write
+    (the same reading `bin/hw` records at spawn)."""
+    if facts.get("plan"):
+        return Path(facts["plan"])
     m = re.search(r"`([^`\s]+-plan\.md)`", Path(facts["brief"]).read_text())
     return Path(m.group(1))
 

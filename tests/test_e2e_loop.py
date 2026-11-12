@@ -143,10 +143,13 @@ class Spawn(LoopCase):
 class Watch(LoopCase):
     def reported_once(self, first, *needles):
         """`first` is what the watcher printed for a new event. Checks that it is E1 and holds `needles`, that a later
-        watcher shows the same event again and raises nothing new, and that it is gone once acknowledged."""
+        watcher shows the same event again once a whole turn of the coordinator has ended without the ack, and
+        raises nothing new, and that it is gone once acknowledged."""
         for needle in ("[E1] ", *needles):
             self.assertIn(needle, first)
         self.assertNotIn("[E2]", first)
+        self.assertNotIn("[E1]", self.w.watch_ticks(2))  # not while the turn its wake started runs
+        self.w.turns_pass()
         again = self.w.watch_ticks(2)
         self.assertIn("[E1] (again, un-acked since", again)
         self.assertNotIn("[E2]", again)
@@ -157,6 +160,7 @@ class Watch(LoopCase):
     def test_a_question_is_reported_once_until_acknowledged(self):
         s = self.w.started(BRANCH, turns=[ask("Red or blue? I recommend red.", "Round or square corners?")])
         first = self.w.watch_once().stdout
+        self.w.turns_pass()
         self.assertIn("[E1] ", self.w.watch_once().stdout)  # `watch --once` returns with it again while it is un-acked
         self.assertIn("[E1] ", self.w.start().stdout)  # and a coordinator session is told at its start
         self.reported_once(first, "HW:QUESTION", "Q1: Red or blue? I recommend red.", "Q2: Round or square corners?")

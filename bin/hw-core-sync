@@ -82,6 +82,15 @@ def plan(branch, skips):
     return steps
 
 
+def empty_pick(worktree):
+    """The commit a stopped cherry-pick in `worktree` is on, when it stopped because the commit changes nothing there
+    (no conflict, nothing staged or changed); None otherwise."""
+    head = git("rev-parse", "--verify", "--quiet", "CHERRY_PICK_HEAD", cwd=worktree, check=False).stdout.strip()
+    if head and not git("status", "--porcelain", "--untracked-files=no", cwd=worktree).stdout.strip():
+        return head
+    return None
+
+
 def unsynced(branch):
     """Core commits made on this branch that are not on main yet: [(sha, subject, commit_epoch)], oldest first."""
     return [(sha, subject, int(git("log", "-1", "--format=%ct", sha).stdout))
@@ -153,12 +162,17 @@ def main():
             die(f"could not check out {CORE_BRANCH} in a temporary worktree "
                 f"(is it checked out elsewhere?):\n{r.stderr}")
         try:
-            r = git("cherry-pick", "-x", *picks, cwd=tmp, check=False)
+            r, empty = git("cherry-pick", "-x", *picks, cwd=tmp, check=False), []
+            while r.returncode != 0 and (sha := empty_pick(tmp)):
+                empty.append(sha)  # its change is on main already, though `git cherry` could not tell: nothing to pick
+                r = git("cherry-pick", "--skip", cwd=tmp, check=False)
             if r.returncode != 0:
                 git("cherry-pick", "--abort", cwd=tmp, check=False)
                 die(f"cherry-pick onto {CORE_BRANCH} failed and was aborted; {CORE_BRANCH} is unchanged:\n"
                     f"{r.stdout}{r.stderr}")
-            print(f"\ncherry-picked {len(picks)} commit(s) onto {CORE_BRANCH}")
+            for sha in empty:
+                print(f"skipped {sha[:9]}: its change is already on {CORE_BRANCH} (the cherry-pick was empty)")
+            print(f"\ncherry-picked {len(picks) - len(empty)} commit(s) onto {CORE_BRANCH}")
             if a.push:
                 git("push", a.remote, CORE_BRANCH, cwd=tmp)
                 print(f"pushed {CORE_BRANCH} to {a.remote}")

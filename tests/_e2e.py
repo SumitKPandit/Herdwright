@@ -295,7 +295,8 @@ class World:
             time.sleep(0.05)
 
     def age_wakes(self, seconds=600):
-        """Stand in for waiting: the long-lived watcher shows an un-acked event again five minutes after it last did."""
+        """Stand in for waiting: time passes since each event was last shown (a wake typed into the pane is shown
+        again five minutes on; one admitted by the server only once a turn has ended with it)."""
         path = self.profile / ".cache" / "wake-queue.json"
         with open(path.with_suffix(".guard"), "w") as guard:  # the lock `bin/hw` takes around the queue
             fcntl.flock(guard, fcntl.LOCK_EX)
@@ -304,11 +305,22 @@ class World:
                 event["shown_at"] -= seconds
             path.write_text(json.dumps(queue))
 
+    def turns_pass(self, turns=2):
+        """Stand in for the coordinator's turns (Claude Code: its prompt hook and Stop hook count them): `turns` whole
+        turns end, so an un-acked event is due to be shown again (bin/hw wake_queue)."""
+        path = self.profile / ".cache" / "wake-queue.json"
+        with open(path.with_suffix(".guard"), "w") as guard:  # the lock `bin/hw` takes around the queue
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            queue = json.loads(path.read_text())
+            queue["turn"], queue["running"] = queue.get("turn", 0) + turns, False
+            path.write_text(json.dumps(queue))
+
     def rest(self, name="hw"):
-        """A coordinator's turn ends: it is idle, as herdr reports its runtime after a turn."""
+        """A coordinator's turn ends: it is idle, as herdr reports its runtime after a turn, and on OpenCode its
+        session lists the turn's end."""
         with store.locked(self.herdr) as state:
             _, pane = store.find_agent(state, name)
-            store.set_status(pane["agent"], pane["agent"]["launch"].get("rest", "idle"))
+            store.end_turn(pane)
 
     # ------------------------------------------------------------ reading the record and the world
 

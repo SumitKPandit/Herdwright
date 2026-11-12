@@ -44,7 +44,7 @@ def find_plan(ref):
                 return plan
         except sqlite3.Error:  # a DB from before sessions.plan
             pass
-        found = sorted(hwlib.BRIEFS_DIR.glob(f"{ref}-*-plan.md"))
+        found = sorted(f for f in hwlib.BRIEFS_DIR.glob(f"{ref}-*-plan.md") if not hwlib.READER_PLAN.fullmatch(f.name))
         return found[0] if found else None
     p = Path(ref)
     return p if p.exists() else None

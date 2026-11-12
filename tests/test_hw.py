@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import re
 import os
 from pathlib import Path
 import sqlite3
@@ -529,6 +530,110 @@ class HwTests(unittest.TestCase):
             self.assertEqual(code, 0)
             cmd_watch.assert_not_called()
 
+    # T115 on main, ported (T121): an event is shown again by Herdwright's turns, not at a watcher's start or by a timer
+
+    def stop(self, **kw):
+        """The Stop hooks of a turn's end, as Claude Code runs them: returns arm's exit code."""
+        self.hook("stop-guard", **kw)
+        return self.hook("arm", **kw)[0]
+
+    def stop_with_the_real_watcher(self):
+        """A Stop whose arm hook runs the real one-shot watcher (no worker tracked, so it goes idle at once): where
+        4666ee2 showed un-acked events again, at the watcher's start."""
+        real = self.z.cmd_watch
+        with patch.object(self.z, "require_lock"), patch.object(self.z, "claim_watcher", return_value=True), \
+                patch.object(self.z, "live_agents", return_value={}), patch.object(self.z.time, "sleep"):
+            return self.hook("arm", watch=real)[0]
+
+    def shown_again(self):
+        return re.findall(r"\[E(\d+)\] \(again", self.output.getvalue())
+
+    def test_an_event_delivered_mid_turn_and_acked_in_the_next_turn_is_never_shown_again(self):
+        """The two real cases on main (E596, E597): delivered while a turn ran, acked in the next one, any delay."""
+        self.hook("turn-start")  # the user's prompt starts a turn
+        self.z.queue_add(["S352 T107 qa-t107 · status file: HW:DONE"])  # a background watcher reports mid-turn
+        self.assertEqual(self.stop_with_the_real_watcher(), 0)  # the running turn ends: Herdwright has not read it yet
+        self.assertEqual(self.shown_again(), [])
+        self.hook("turn-start")
+        with patch.object(self.z, "require_lock"):
+            self.z.cmd_ack(["E1"])
+        for _ in range(3):
+            self.assertEqual(self.stop_with_the_real_watcher(), 0)
+            self.hook("turn-start")
+        self.assertEqual(self.shown_again(), [])
+
+    def test_an_event_never_acked_is_shown_at_the_end_of_the_next_full_turn_whatever_else_arrives(self):
+        self.z.queue_turn_started()
+        self.z.queue_add(["S1 asks"])  # mid-turn
+        self.assertEqual(self.stop(), 0)
+        self.z.queue_add(["S2 asks", "S3 asks"])  # one wake reaches the idle Herdwright and starts the next turn
+        self.z.queue_add(["S4 asks"])  # arrives while that turn runs: it is read only in the turn after
+        self.assertEqual(self.stop(), 2)  # that turn ends with none acked: those it had in front of it are due
+        self.assertEqual(self.shown_again(), ["1", "2", "3"])
+
+    def test_an_event_that_woke_an_idle_herdwright_is_due_after_the_one_turn_it_started(self):
+        """S368 finding 1: an idle delivery waited a second Stop."""
+        self.z.queue_end_turn()
+        self.z.queue_add(["S1 asks"])  # the Stop hook's watcher wakes the idle Herdwright with it
+        self.assertEqual(self.stop(), 2)
+        self.assertEqual(self.shown_again(), ["1"])
+
+    def test_a_stop_blocked_by_another_hook_is_one_turn_not_two(self):
+        """S368 finding 2: Claude Code fires Stop again in the same turn when a Stop hook blocked the first."""
+        self.z.queue_turn_started()
+        self.z.queue_add(["S1 asks"])  # mid-turn
+        self.assertEqual(self.stop(), 0)
+        self.assertEqual(self.stop(data={"stop_hook_active": True}), 0)  # the same turn's second Stop counts nothing
+        self.assertEqual(self.shown_again(), [])
+        self.z.queue_turn_started()
+        self.assertEqual(self.stop(), 2)  # the next full turn does
+        self.assertEqual(self.shown_again(), ["1"])
+
+    def test_a_stop_with_no_tracked_work_still_counts_its_turn(self):
+        """T121 review S393: arm returned before counting when no work was tracked, so `running` stayed set and the
+        count lagged the real turns."""
+        self.z.queue_turn_started()
+        self.assertEqual(self.stop(tracked=False), 0)
+        with self.z.wake_queue() as q:
+            self.assertEqual((q["turn"], q["running"]), (1, False))
+        self.assertEqual(self.stop(tracked=False, lock=False), 0)  # a read-only session's Stop is not Herdwright's turn
+        with self.z.wake_queue() as q:
+            self.assertEqual(q["turn"], 1)
+
+    def test_an_ack_between_the_stop_and_the_print_wins(self):
+        self.z.queue_end_turn()
+        self.z.queue_add(["S1 asks"])
+
+        def ack_meanwhile(seconds):
+            with patch.object(self.z, "require_lock"):
+                self.z.cmd_ack(["E1"])
+        with patch.object(self.z.time, "sleep", side_effect=ack_meanwhile):
+            code, cmd_watch = self.hook("arm")
+        self.assertEqual((code, self.shown_again()), (0, []))
+        cmd_watch.assert_called_once()  # nothing to show again: the hook arms the watcher as usual
+
+    def test_turn_start_marks_a_turn_only_for_the_lock_holder_and_an_old_queue_counts_its_first_stop(self):
+        self.z.WAKE_QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.z.WAKE_QUEUE_PATH.write_text(json.dumps({"next": 2, "events": [  # as the queue is on the day this lands
+            {"id": 1, "ts": "2026-11-12 09:43", "text": "S1 asks", "shown": 1, "shown_at": 1, "acked": False}]}))
+        self.assertEqual(self.stop(), 2)
+        self.assertEqual(self.shown_again(), ["1"])
+        self.assertEqual(self.hook("turn-start", lock=False)[0], 0)
+        with self.z.wake_queue() as q:
+            self.assertTrue(q["running"])  # the re-show woke Herdwright: that turn counts
+            q["running"] = False
+        self.hook("turn-start", lock=False)
+        with self.z.wake_queue() as q:
+            self.assertFalse(q["running"])  # a read-only session's prompts are not Herdwright's turns
+        self.hook("turn-start")
+        with self.z.wake_queue() as q:
+            self.assertTrue(q["running"])
+
+    def test_start_lists_every_unacked_event_at_once(self):
+        self.z.queue_turn_started()
+        self.z.queue_add(["S1 asks", "S2 asks"])
+        self.assertEqual([e["id"] for e in self.z.queue_pending()], [1, 2])
+
     def test_broken_hook_never_blocks(self):
         code, _ = self.hook("arm", watch=lambda args: 1 / 0)
         self.assertEqual(code, 1)
@@ -627,8 +732,11 @@ class HwTests(unittest.TestCase):
     def test_wake_queue_keeps_events_until_acked_and_never_loops_forever(self):
         self.assertEqual(self.z.queue_add(["S1 finished", "S2 asks"]), ["[E1] S1 finished", "[E2] S2 asks"])
         with patch.object(self.z, "require_lock"):
+            self.end_turns(2)
             self.assertEqual(len(self.z.queue_represent()), 2)  # shown a 2nd time (a crash lost the 1st)
+            self.end_turns(1)
             self.assertEqual(len(self.z.queue_represent()), 2)  # a 3rd
+            self.end_turns(5)
             self.assertEqual(self.z.queue_represent(), [])  # capped: a forgotten ack can't loop the hook
             self.assertEqual(len(self.z.queue_pending()), 2)  # but `start` still lists them
             self.z.cmd_ack(["E1"])
@@ -638,9 +746,16 @@ class HwTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 self.z.cmd_ack(["E99"])
 
+    def end_turns(self, n):
+        """`n` turns of Herdwright begin (the user's prompt) and end (Stop)."""
+        for _ in range(n):
+            self.z.queue_turn_started()
+            self.z.queue_end_turn()
+
     def test_watch_represents_unacked_events_before_anything_else(self):
         self.session()
         self.z.queue_add(["S1 T1 qa asked something"])
+        self.end_turns(2)
         with patch.object(self.z, "require_lock"), patch.object(self.z, "claim_watcher", return_value=True), \
                 patch.object(self.z, "live_agents", side_effect=AssertionError("must not poll")):
             self.assertTrue(self.z.cmd_watch(["--once"]))

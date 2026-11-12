@@ -108,7 +108,11 @@ class OnClaudeCode(ConfigureCase):
                            ("--max-sessions takes a number of sessions, 1 or more, not 'many'", ("--max-sessions", "many")),
                            ("usage: hw configure [--model <model>]", ("--model",)),
                            ("usage: hw configure [--model <model>]", ("--colour", "red")),
-                           ("usage: hw configure [--model <model>]", ("--clear", "runtime")),
+                           ("--clear takes one of model, effort, variant, max-sessions, not 'runtime'", ("--clear", "runtime")),
+                           ("model is given twice in one command: say once whether to set it or to clear it",
+                            ("--model", "opus", "--clear", "model")),
+                           ("model is given twice in one command", ("--clear", "model", "--model", "opus")),
+                           ("effort is given twice in one command", ("--effort", "low", "--effort", "high")),
                            ("the model is a word, not ' '", ("--model", " "))):
             self.refused(text, *args)
             self.assertIsNone(self.stored(), args)
