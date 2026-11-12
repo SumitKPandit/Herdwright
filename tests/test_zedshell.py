@@ -52,7 +52,9 @@ class WordTests(unittest.TestCase):
                 ("rm -rf a b", [], ["a", "b"]), ("install -m 755 a b", [], ["755", "a", "b"]), ("rsync -a a b", [], ["a", "b"]), ("chmod -R u+x , g-w a", [], ["a"]), ("chmod 755 a b", [], ["a", "b"]), ("chown bob:staff a", [], ["a"]),
                 ("sed -i.bak s/a/b/ f", [], ["s/a/b/", "f"]), ("sed s/a/b/ f", [], []), ("dd if=a of=b bs=1", [], ["b"]),
                 ("find a b -name x -delete", [], ["a", "b"]), ("find -delete", [], ["."]),
-                ("find -L a -name x -delete", [], ["a"]), ("find -H -O2 -D tree a b -delete", [], ["a", "b"]), ("find -P -delete", [], ["."]), ("find a -exec rm {}", [], ["a"]),
+                ("find -L a -name x -delete", [], ["a"]), ("find -H -O2 -D tree a b -delete", [], ["a", "b"]), ("find -P -delete", [], ["."]),
+                ("find -E -X -d -s -x a -delete", [], ["a"]), ("find -f a -E b -delete", [], ["a", "b"]),  # BSD's (macOS)
+                ("find a -exec rm {}", [], ["a"]),
                 ("find a -exec grep x {}", [], []), ("ls a", [], [])):
             words = command.split()
             self.assertEqual((redirect_targets(words), write_targets(words)), (redirects, writes), command)

@@ -133,7 +133,7 @@ def main(argv):
     with store.locked() as state:
         state["calls"].append(argv)
     refuses = store.home() / "herdr-refuses"
-    if refuses.exists() and any(line and " ".join(argv).startswith(line) for line in refuses.read_text().splitlines()):
+    if refuses.exists() and any(line and argv[:len(line.split())] == line.split() for line in refuses.read_text().splitlines()):
         return fail("refused", "herdr refuses this command")
     groups = {"workspace": workspace, "pane": pane, "agent": agent}
     if len(argv) < 2 or argv[0] not in groups:

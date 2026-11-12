@@ -23,6 +23,7 @@ WRAPPERS = {"builtin": (), "command": (), "exec": ("-a",), "nohup": (), "time": 
             "stdbuf": ("-i", "-o", "-e"), "setsid": (), "caffeinate": ("-t", "-w")}
 WRAPPER_ARGUMENTS = {"timeout": 1, "gtimeout": 1}  # words of its own a wrapper takes before the command: the duration
 ASSIGNMENT = re.compile(r"\w+=.*")
+FIND_OPTIONS = {"-H", "-L", "-P", "-D", "-E", "-X", "-d", "-s", "-x", "-f"}  # GNU's and BSD's, before the paths; -D and -f take a word
 MODE = re.compile(r"[0-7]{3,4}|[ugoa]*[-+=][rwxXstugo]*(,[ugoa]*[-+=][rwxXstugo]*)*")  # chmod's first argument
 
 
@@ -132,10 +133,11 @@ def write_targets(words):
     if name == "find":
         runs = [words[i + 1:] for i, w in enumerate(words) if w in ("-exec", "-execdir", "-ok", "-okdir")]
         if "-delete" in words or any(write_targets(command_words(run)) for run in runs):
-            rest = words[1:]
-            while rest and (rest[0] in ("-H", "-L", "-P", "-D") or rest[0].startswith("-O")):  # its options stand before the paths
-                rest = rest[1 + (rest[0] == "-D"):]
-            return list(takewhile(lambda w: not w.startswith(("-", "(", "!")), rest)) or ["."]
+            rest, named = words[1:], []
+            while rest and (rest[0] in FIND_OPTIONS or rest[0].startswith("-O")):  # its options stand before the paths
+                named += rest[1:2] if rest[0] == "-f" else []
+                rest = rest[1 + (rest[0] in ("-D", "-f")):]
+            return named + list(takewhile(lambda w: not w.startswith(("-", "(", "!")), rest)) or ["."]
     return []
 
 

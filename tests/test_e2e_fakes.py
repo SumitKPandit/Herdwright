@@ -114,7 +114,7 @@ class Agent(FakeCase):
 
 class OpenCode(FakeCase):
     """The fake OpenCode: its server in a pane (`herdr pane run`), then its TUI on a session of that server."""
-    PASSWORD = "secret"
+    SERVER_KEY = "fake"  # the fake server's OPENCODE_PASSWORD
 
     def serve(self, plugin=None):
         """A pane with a server in it, its config directory holding `plugin` (the text of plugins/guard/index.js)."""
@@ -123,15 +123,15 @@ class OpenCode(FakeCase):
             (config / "plugins" / "guard").mkdir(parents=True)
             (config / "plugins" / "guard" / "index.js").write_text(plugin)
         ws = self.result("workspace", "create", "--cwd", str(self.w.root), "--label", "a task", "--no-focus",
-                         "--env", f"OPENCODE_CONFIG_DIR={config}", "--env", f"OPENCODE_PASSWORD={self.PASSWORD}")
+                         "--env", f"OPENCODE_CONFIG_DIR={config}", "--env", f"OPENCODE_PASSWORD={self.SERVER_KEY}")
         self.pane, self.port = ws["root_pane"]["pane_id"], free_port()
         self.result("pane", "run", self.pane, f"opencode serve --hostname 127.0.0.1 --port {self.port} > /dev/null 2>&1 &")
         return ws
 
-    def api(self, method, path, body=None, password=PASSWORD):
-        token = base64.b64encode(f"opencode:{password}".encode()).decode()
+    def api(self, method, path, body=None, key=SERVER_KEY):
+        basic = base64.b64encode(f"opencode:{key}".encode()).decode()
         request = urllib.request.Request(f"http://127.0.0.1:{self.port}/api{path}", method=method, data=json.dumps(body or {}).encode(),
-                                         headers={"authorization": f"Basic {token}", "content-type": "application/json"})
+                                         headers={"authorization": f"Basic {basic}", "content-type": "application/json"})
         with urllib.request.urlopen(request, timeout=20) as r:
             return json.loads(r.read())["data"]
 
@@ -154,7 +154,7 @@ class OpenCode(FakeCase):
         ws = self.serve()
         self.assertIn("fake OpenCode", self.api("GET", "/info")["version"])
         with self.assertRaises(urllib.error.HTTPError) as refused:
-            self.api("GET", "/info", password="wrong")
+            self.api("GET", "/info", key="wrong")
         self.assertEqual(refused.exception.code, 401)
         pid = self.w.pane(self.pane)["server"]["pid"]
         self.result("workspace", "close", ws["workspace"]["workspace_id"])

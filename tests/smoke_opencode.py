@@ -449,9 +449,11 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
         """What the coordinator's guard decides about a tool call of `session`, with no model asked for it: the program
         the installed plugin names is run as the plugin runs it (the call on stdin, the plugin's environment). Returns
         the reason it denies, or "" when it lets the call through."""
-        plugin = (kit["config_dir"] / "plugins" / "zed-pretool" / "index.js").read_text()
-        program = json.loads(re.search(r'spawnSync\(("(?:[^"\\]|\\.)*")', plugin).group(1))
-        env = json.loads(re.search(r"^const ENV = (\{.*\});$", plugin, re.M).group(1))
+        path = kit["config_dir"] / "plugins" / "zed-pretool" / "index.js"
+        plugin = path.read_text()
+        program, env = re.search(r'spawnSync\(("(?:[^"\\]|\\.)*")', plugin), re.search(r"^const ENV = (\{.*\});$", plugin, re.M)
+        self.assertTrue(program and env, f"{path}: no `spawnSync(\"<program>\"` or no `const ENV = {{...}};` line to read the guard's call from")
+        program, env = json.loads(program.group(1)), json.loads(env.group(1))
         call = {"tool_name": tool, "tool_input": tool_input, "cwd": str(HOME), "session_id": session}
         r = subprocess.run([program], input=json.dumps(call), capture_output=True, text=True, env=self.env | env, timeout=60)
         if r.returncode:
@@ -564,8 +566,11 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
         for what, _, tool_input, why, ask in cases:
             made_calls, asked = self.asked_call(session, ask + " It may be refused: do not retry it.", next(iter(tool_input.values())), tries=1)
             for c in made_calls:
-                self.say(f"the model's own call: {what}", f"{json.dumps(c['state']['input'])[:200]}; permission asked: {asked} -> {c['state']['status']} {reason(c)}")
-                self.assertEqual(c["state"]["status"], "error", what)
+                exact = tool_input.items() <= c["state"]["input"].items()  # another input (no workdir, say) is another call: the guard may rightly allow it
+                self.say(f"the model's own call: {what}" + ("" if exact else " (not the call asked for: not counted)"),
+                         f"{json.dumps(c['state']['input'])[:200]}; permission asked: {asked} -> {c['state']['status']} {reason(c)}")
+                if exact:
+                    self.assertEqual(c["state"]["status"], "error", what)
             if not made_calls:
                 self.say(f"the model's own call: {what}", "not made by the model (not required)")
         self.assertEqual(sorted(p.name for p in self.project.iterdir()), [".git", "keep.txt"])  # nothing created, nothing deleted
@@ -680,7 +685,7 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
             time.sleep(1)
         self.track_a_session_whose_pane_is_gone()
         seen = {m["id"] for m in self.api("GET", f"/session/{session}/message")}
-        self.record.write_text(json.dumps(record | {"server": record["server"] | {"password": "not-the-password"}}))  # the watcher's call will be refused
+        self.record.write_text(json.dumps(record | {"server": record["server"] | {"password": "wrong"}}))  # the watcher's call will be refused
         env = self.env | {"OPENCODE_SESSION_ID": session, "ZED_COORDINATOR": str(self.record), "HERDR_PANE_ID": pane}
         digest = subprocess.run([sys.executable, str(HOME / "bin" / "zed"), "start"], env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(digest.returncode, 0, digest.stderr)

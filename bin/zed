@@ -1284,9 +1284,10 @@ def cmd_spawn(args):
 def hat_intro(conn, hat, tid):
     """The hat's paragraph of the first prompt: the hat, its skills, and the findings drafts earlier sessions on this
     task left (a fix or a re-review starts from them, not from anyone's memory of the work)."""
-    text = (f"You wear the {hat} hat. Zed's scripts (`zed-employee`, `zed-checks`, ...) are in {ZED_HOME / 'bin'}: call them by that "
-            f"path when they are not on your PATH. "
+    text = (f"You wear the {hat} hat. "
             f"Skills load when they apply (`zed-employee skill show <name>`): {', '.join(emp.load_manifest(hat)['skills'])}. "
+            f"Zed's scripts (`zed-employee`, `zed-checks`, ...) are in {ZED_HOME / 'bin'}: call them by that path when they are "
+            f"not on your PATH. "
             f"Before ZED:DONE run `zed-employee finish`. ")
     findings = [r["text"] for r in conn.execute("SELECT text FROM events WHERE task_id=? AND kind='findings' ORDER BY id", (tid,))]
     if findings:
@@ -1372,10 +1373,11 @@ def cmd_relay(args):
     answers = [(question(conn, ref), ans.strip()) for ref, ans in zip(args[::2], args[1::2])]
     if blank := [f"Q{q['id']}" for q, ans in answers if not ans]:
         die(f"no answer given for {', '.join(blank)}")
-    has = [q["id"] for q, ans in answers if q["status"] == "answered" and q["answer"] == ans and q["delivered_at"]]
+    has = [q for q, ans in answers if q["status"] == "answered" and q["answer"] == ans and q["delivered_at"]]
+    for q in has:  # a question no session asked has no worker to name
+        print(f"Q{q['id']}: already answered in these words" + (" and given to the worker; not sent again" if q["session_id"] else ""))
     if has:
-        print(", ".join(f"Q{i}" for i in has) + ": already answered in these words and given to the worker; not sent again")
-        answers = [(q, ans) for q, ans in answers if q["id"] not in has]
+        answers = [(q, ans) for q, ans in answers if q not in has]
         if not answers:
             return
     by_session = {}
@@ -2546,7 +2548,8 @@ def arm_watcher():
     what the watcher before this one said last (why it ended) and does not grow for ever."""
     path = PROFILE_DIR / ".cache" / "watch.log"
     if path.exists() and path.stat().st_size > WATCH_LOG_BYTES:
-        path.write_bytes(path.read_bytes()[-WATCH_LOG_BYTES // 2:])
+        kept = path.read_bytes()[-WATCH_LOG_BYTES // 2:]
+        path.write_bytes(kept.partition(b"\n")[2] or kept)  # from its first whole line
     with open(path, "a") as log:
         subprocess.Popen([sys.executable, str(ZED_HOME / "bin" / "zed"), "watch", "--daemon"], stdout=log, stderr=subprocess.STDOUT,
                          start_new_session=True)

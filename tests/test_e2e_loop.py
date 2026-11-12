@@ -346,6 +346,11 @@ class Answers(LoopCase):
         self.assertIn("recorded Q1", self.w.zed("relay", "Q1", "Red after all.").stdout)  # other words are a new answer
         self.assertEqual(len(self.w.agent(s["agent"])["prompts"]), 3)
 
+    def test_a_repeated_answer_to_a_question_no_session_asked_names_no_worker(self):
+        self.w.zed("q", "add", "-", "Tea or coffee?")
+        self.w.zed("relay", "Q1", "Tea.")
+        self.assertEqual(self.w.zed("relay", "Q1", "Tea.").stdout.strip(), "Q1: already answered in these words")
+
     def test_an_answer_is_never_prompted_to_a_session_of_the_users_own(self):
         """`relay` and `prompt` refuse an external session; the watcher leaves it alone as well."""
         s = self.asked(ask("Red or blue?"))
