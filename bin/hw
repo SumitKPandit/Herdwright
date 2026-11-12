@@ -1314,6 +1314,7 @@ def cmd_spawn(args):
     except (hwgates.Refused, emp.HatError) as e:
         die(f"refused: {e}")
     sid = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM sessions").fetchone()[0]  # the session's env names it
+    plan = session_plan_path(hat, tid, sid, kv["repo"], brief)
     kind = kv.get("kind") or t["worktype"]
     if hat_kind in (runtime_config("claude").get("effort_by_kind") or {}) and "kind" not in kv:
         kind = hat_kind  # the hat's own kind, when claude.json has an effort for it
@@ -1399,7 +1400,7 @@ def cmd_spawn(args):
         (sid, tid, kv["repo"], kv["base"], kv["branch"], str(worktree), agent, ws_id, pane_id, runtime_session,
          # an OpenCode worker that failed its start checks is never briefed; a Claude one may wait on a dialog Herdwright answers
          "failed" if failure and runtime == "opencode" else "running", model, effort, str(brief), str(scratch) if scratch else None, hat,
-         str(hwlib.brief_plan_file(brief.read_text()) or PROFILE_DIR / "briefs" / f"T{tid}-{kv['repo']}-plan.md"),
+         str(plan),
          hwlib.core_tree(worktree) if hat in hwgates.GATE_HATS else None, ts, ts))
     sid = cur.lastrowid
     conn.execute("UPDATE tasks SET status='active' WHERE id=? AND status IN ('intake','parked')", (tid,))
@@ -1430,7 +1431,7 @@ def cmd_spawn(args):
             f"{rules} your brief at {brief}, then "
             f"{PROFILE_DIR}/knowledge/repos/{kv['repo']}.md if it exists. "
             f"Your status file is {STATUS_DIR}/S{sid}.log (see 'Report status' in your rules). ")
-    text += hat_intro(conn, hat, tid)
+    text += hat_intro(conn, hat, tid, plan)
     if scratch:
         text += (f"Your scratch folder is {scratch}: keep every clone, download and temporary file there and nowhere "
                  f"else in the project; Herdwright deletes it when your session closes. ")
@@ -1451,14 +1452,26 @@ def cmd_spawn(args):
     return sid
 
 
-def hat_intro(conn, hat, tid):
-    """The hat's paragraph of the first prompt: the hat, its skills, and the findings drafts earlier sessions on this
-    task left (a fix or a re-review starts from them, not from anyone's memory of the work)."""
+def session_plan_path(hat, tid, sid, repo, brief):
+    """The plan file a new session writes and `hw-employee finish` checks. A build's is the one its brief names. A
+    review or QA reads the build's brief too, but two of them on one task must not share a plan: each would pick the
+    other's step labels and finish would count the other's open steps, so each gets its own, named like its findings."""
+    if hat in ("review", "qa"):
+        return PROFILE_DIR / "briefs" / f"T{tid}-{hat}-S{sid}-plan.md"
+    return hwlib.brief_plan_file(brief.read_text()) or PROFILE_DIR / "briefs" / f"T{tid}-{repo}-plan.md"
+
+
+def hat_intro(conn, hat, tid, plan=None):
+    """The hat's paragraph of the first prompt: the hat, its skills, a review's or QA's own plan file, and the findings
+    drafts earlier sessions on this task left (a fix or a re-review starts from them, not from anyone's memory of the work)."""
     text = (f"You wear the {hat} hat. "
             f"Skills load when they apply (`hw-employee skill show <name>`): {', '.join(emp.load_manifest(hat)['skills'])}. "
             f"Herdwright's scripts (`hw-employee`, `hw-checks`, ...) are in {HW_HOME / 'bin'}: call them by that path when they are "
             f"not on your PATH. "
             f"Before HW:DONE run `hw-employee finish`. ")
+    if hat in ("review", "qa") and plan:
+        text += (f"Your plan file is {plan}, your own: write your plan there, not in the file the brief's Plan section "
+                 f"names, which is the build's. ")
     findings = [r["text"] for r in conn.execute("SELECT text FROM events WHERE task_id=? AND kind='findings' ORDER BY id", (tid,))]
     if findings:
         text += "Findings drafts from earlier sessions on this task, read them: " + "; ".join(findings) + ". "

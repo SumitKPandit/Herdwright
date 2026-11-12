@@ -156,10 +156,8 @@ class SpawnTests(AssignCase):
         build_plan.parent.mkdir(exist_ok=True)
         build_plan.write_text("- [x] 1. a. Done when: x\n- [ ] 2. Raise PR\n")
         self.finish(self.spawn("build"))
-        review_plan = self.profile / "briefs" / "T20-review-plan.md"
-        review_plan.write_text("- [x] 1. Read the diff\n")
-        self.brief.write_text(f"# Brief\n\n## Plan\n- write `{review_plan}` first\n\n## Definition of done\n- done\n")
         review = self.session(self.spawn("review"))
+        Path(review["plan"]).write_text("- [x] 1. Read the diff\n")
         self.assertEqual(self.z.session_plan_progress(self.conn, review), (1, 1))  # not the task's build progress (1, 2)
         hw_plan = _load.load("hw-plan")
         self.assertEqual(hw_plan.find_plan("T20"), build_plan)  # the review plan is never the task's plan
@@ -180,13 +178,34 @@ class SpawnTests(AssignCase):
         (self.profile / "briefs").mkdir(exist_ok=True)
         (self.profile / "briefs" / "T20-api-plan.md").write_text("- [x] 1. a. Done when: x\n- [ ] 2. Raise PR\n")
         self.finish(build)
-        review_plan = self.profile / "briefs" / "T20-review-plan.md"
-        review_plan.write_text("- [x] 1. Read the diff\n- [ ] 2. Run hw-employee finish and report (HW:DONE)\n")
-        self.brief.write_text(f"# Brief\n\n## Plan\n- write `{review_plan}` first\n\n## Definition of done\n- done\n")
         review = self.spawn("review")
+        review_plan = self.profile / "briefs" / f"T20-review-S{review}-plan.md"
         self.assertEqual(self.session(review)["plan"], str(review_plan))
+        review_plan.write_text("- [x] 1. Read the diff\n- [ ] 2. Run hw-employee finish and report (HW:DONE)\n")
         self.finish(review, "blockers")
         self.assertEqual(self.session(self.spawn("qa"))["hat"], "qa")  # the review plan's open step is not the build's
+
+    def test_a_review_and_a_qa_on_one_brief_each_write_and_are_measured_by_their_own_plan(self):
+        """T121: both read the build's brief, so both were given its plan file: a reviewer's finish was refused for
+        QA's open steps, and each picked the other's step labels."""
+        build = self.spawn("build")
+        build_plan = Path(self.session(build)["plan"])
+        build_plan.parent.mkdir(exist_ok=True)
+        build_plan.write_text("- [x] 1. a. Done when: x\n- [ ] 2. Raise PR\n")
+        self.finish(build)
+        review, qa = self.spawn("review"), self.spawn("qa")
+        plans = {hat: Path(self.session(sid)["plan"]) for hat, sid in (("review", review), ("qa", qa))}
+        self.assertEqual(plans, {"review": self.profile / "briefs" / f"T20-review-S{review}-plan.md",
+                                 "qa": self.profile / "briefs" / f"T20-qa-S{qa}-plan.md"})
+        for hat, sid in (("review", review), ("qa", qa)):
+            prompt = next(c.args[1] for c in self.mock_prompt_worker.call_args_list if f"session S{sid} " in c.args[1])
+            self.assertIn(f"Your plan file is {plans[hat]}, your own", prompt)
+        plans["review"].write_text("- [x] 1. Read the diff. Done when: read\n- [ ] 2. Run hw-employee finish and report (HW:DONE)\n")
+        plans["qa"].write_text("- [ ] 1. Run the cases. Done when: run\n- [ ] 2. Run hw-employee finish and report (HW:DONE)\n")
+        self.assertIsNone(hwlib.session_plan_problem(self.session(review), skip_finish=True))  # QA's open step is not the reviewer's
+        self.assertIn("Run the cases", hwlib.session_plan_problem(self.session(qa), skip_finish=True))
+        self.assertEqual(self.z.task_plan_progress(self.conn, 20), (1, 1))  # the build's alone (its PR step waits for the merge)
+        self.assertEqual(_load.load("hw-plan").find_plan("T20"), build_plan)
 
     def test_a_build_is_refused_while_a_reader_is_open_and_readers_may_share(self):
         self.finish(self.spawn("build"))
@@ -244,16 +263,15 @@ class WatcherAndStartTests(AssignCase):
         (self.profile / "briefs").mkdir(exist_ok=True)
         (self.profile / "briefs" / "T20-api-plan.md").write_text("- [x] 1. a. Done when: x\n- [x] 2. b. Done when: y\n- [ ] 3. Raise PR\n")
         self.finish(build)
-        review_plan = self.profile / "briefs" / "T20-review-plan.md"
-        review_plan.write_text("- [x] 1. Read the diff\n- [ ] 2. Run the suite\n- [ ] 3. Run hw-employee finish and report (HW:DONE)\n")
-        self.brief.write_text(f"# Brief\n\n## Plan\n- write `{review_plan}` first\n\n## Definition of done\n- done\n")
         self.spawn("review")
+        (self.profile / "briefs" / "T20-review-S2-plan.md").write_text(
+            "- [x] 1. Read the diff\n- [ ] 2. Run the suite\n- [ ] 3. Run hw-employee finish and report (HW:DONE)\n")
         digest = "\n".join(self.z.render_brief(self.conn, live={}))
         self.assertIn("S2 T20 review-t20 running/GONE · review 1/3", digest)  # not the build plan's 2/2
         status = self.z.render_status(self.conn, live={})
         self.assertIn("plan `T20-api-plan.md`: 2/2 steps done (+1 awaiting merge/PR)", status)  # the task shows its build plan only
-        self.assertIn("S2 review plan `T20-review-plan.md`: 1/3 steps done", status)
-        self.assertNotIn("plan `T20-review-plan.md`", status.replace("S2 review plan `T20-review-plan.md`", ""))
+        self.assertIn("S2 review plan `T20-review-S2-plan.md`: 1/3 steps done", status)
+        self.assertNotIn("plan `T20-review-S2-plan.md`", status.replace("S2 review plan `T20-review-S2-plan.md`", ""))
 
     def test_start_reports_the_crew_but_no_employee_board(self):
         labels = []

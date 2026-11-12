@@ -36,6 +36,9 @@ DONE_WHEN = re.compile(r"done when", re.I)
 ESTIMATE = re.compile(r"~\s*(\d+(?:\.\d+)?)\s*(min|m|h|hr|hrs|hour|hours)\b", re.I)
 
 
+READER_PLAN = re.compile(r"T\d+-(review|qa)-S\d+-plan\.md")  # a review's or QA's own plan (bin/hw session_plan_path)
+
+
 def find_plan(ref):
     if re.fullmatch(r"T\d+", ref):
         conn = hwlib.db_readonly()
@@ -44,7 +47,7 @@ def find_plan(ref):
                 return plan
         except sqlite3.Error:  # a DB from before sessions.plan
             pass
-        found = sorted(hwlib.BRIEFS_DIR.glob(f"{ref}-*-plan.md"))
+        found = sorted(f for f in hwlib.BRIEFS_DIR.glob(f"{ref}-*-plan.md") if not READER_PLAN.fullmatch(f.name))
         return found[0] if found else None
     p = Path(ref)
     return p if p.exists() else None
