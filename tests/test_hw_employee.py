@@ -132,5 +132,22 @@ class DbTests(ProfileCase):
         self.assertEqual(row, ("juno", "abc", None, None))  # the old columns stay, unused; the old verdict matches no tree
 
 
+class OldDatabaseTests(unittest.TestCase):
+    """A profile from before the rename to Herdwright still calls its database `zed.db` until `bin/hw start` renames it."""
+
+    def test_a_worker_command_does_not_create_an_empty_database_in_front_of_the_old_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old, new = Path(tmp) / "zed.db", Path(tmp) / "hw.db"
+            old.write_bytes(b"")
+            with patch.object(hwlib, "OLD_DB_PATH", old), patch.object(hwlib, "DB_PATH", new):
+                with self.assertRaises(SystemExit) as refused:
+                    emp.connect()
+                self.assertEqual(refused.exception.code, f"hw-employee: this profile is from before the rename to Herdwright: its database "
+                                                         f"is still {old}. Run `bin/hw start` first: it renames the profile's old names once.")
+                self.assertFalse(new.exists())
+                old.rename(new)  # what `start` does
+                emp.connect().close()
+
+
 if __name__ == "__main__":
     unittest.main()
