@@ -212,7 +212,10 @@ class OldNamesInACheckout(LoopCase):
                            text=True, cwd=self.checkout, env=self.w.env())
         self.assertEqual((r.returncode, r.stdout), (0, f"marked {self.head[:9]} as synced for profile/ada\n"), r.stderr)
         self.assertIn("OLD NAME LEFT ALONE: git refs refs/zed/core-sync/profile/ada and refs/hw/core-sync/profile/ada both exist; "
-                      "refs/hw/core-sync/profile/ada is the one in use.", self.start().splitlines())  # as for any old name beside its new one
+                      "refs/hw/core-sync/profile/ada is the one in use. Once the old one is not needed, drop it: "
+                      "`git update-ref -d refs/zed/core-sync/profile/ada`.", self.start().splitlines())  # as for any old name beside its new one
+        self.git("update-ref", "-d", "refs/zed/core-sync/profile/ada")  # the step the line names
+        self.assertNotIn("refs/zed/core-sync/profile/ada", self.start())
 
     def test_on_its_own_profile_start_renames_the_sync_point_of_its_branch_once_and_no_other(self):
         env = self.own_profile()
@@ -225,7 +228,8 @@ class OldNamesInACheckout(LoopCase):
         self.git("update-ref", "refs/hw/core-sync/profile/ada", self.head)
         before = refs(self.checkout)
         self.assertIn("OLD NAME LEFT ALONE: git refs refs/zed/core-sync/profile/ada and refs/hw/core-sync/profile/ada both exist; "
-                      "refs/hw/core-sync/profile/ada is the one in use.", self.start(**self.own_profile()).splitlines())
+                      "refs/hw/core-sync/profile/ada is the one in use. Once the old one is not needed, drop it: "
+                      "`git update-ref -d refs/zed/core-sync/profile/ada`.", self.start(**self.own_profile()).splitlines())
         self.assertEqual(refs(self.checkout), before)
 
     def test_an_old_variable_is_not_read_and_start_names_it(self):

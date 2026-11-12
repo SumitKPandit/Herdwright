@@ -134,7 +134,8 @@ Herdwright ships no model, no effort and no variant, and never picks one for you
 
 The coordinator's own model is whatever its session runs: on Claude Code the model you start `claude` with, which
 workers do not inherit; on OpenCode the stored model.
-<!-- note: observed with Claude Code; the OpenCode half is tested in test_hw_coordinator.py -->
+<!-- note: observed with Claude Code; the OpenCode half is tested -->
+<!-- test: test_hw_coordinator.py::KitTests.test_the_config_dir_holds_model_variant_permissions_instructions_and_the_guard -->
 
 ## What the guards are, and what they are not
 

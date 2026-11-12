@@ -37,7 +37,7 @@ The no-assumption rule applies in full: write down only what the user said or wh
 3. **Create the profile branch and files.**
    - `git switch main && git switch -c profile/<name>` (`<name>`: short, lowercase, e.g. first name).
    - `cp -Rn profile.template/. profile/` (`-n`: a config file `bin/hw-setup` or `bin/hw coordinator` already
-     wrote there stays), then fill `profile/profile.md`, `rules.md`,
+     wrote there stays; it exits 1 when it kept a file, which is expected), then fill `profile/profile.md`, `rules.md`,
      `knowledge/domain.md` (rename to the product if you like), `knowledge/people.md`,
      `config/projects.json` and `config/settings.json` from the answers. Delete placeholder lines
      you have no answer for, and the guidance comments once a file is filled. Keep

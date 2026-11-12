@@ -10,7 +10,7 @@ case "$1" in
     echo "default until you tell the assistant otherwise (bin/hw configure). Safe to re-run; what is set stays."
     echo "  hw-setup [--runtime claude|opencode]"
     exit 0;;
-  --runtime) chosen=$2;;
+  --runtime) [ -n "$2" ] && [ $# -eq 2 ] || { echo "usage: hw-setup [--runtime claude|opencode]" >&2; exit 2; }; chosen=$2;;
   ?*) echo "usage: hw-setup [--runtime claude|opencode]" >&2; exit 2;;
 esac
 cd "$(dirname "$0")/.." || exit 1

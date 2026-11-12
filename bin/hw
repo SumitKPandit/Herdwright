@@ -76,6 +76,13 @@ MODEL_CONFIG = {"claude": (CLAUDE_CONFIG_PATH, ("model", "effort")), "opencode":
 OPENCODE_MODEL = re.compile(r"[^/\s]+/\S+")  # provider/model
 PROFILE_TEMPLATE = HW_HOME / "profile.template"
 # Claude Code started with no model runs the user's own default. OpenCode does not: see choose_opencode_model().
+# What applies to a choice the user has not made, per runtime: `configure` shows it per key, `start` in one line.
+MODEL_UNSET = {
+    "claude": {"model": "not set: Claude Code's own default applies", "effort": "not set: Claude Code's own default applies"},
+    "opencode": {"model": "NOT SET: `bin/hw coordinator` asks for it, or --model <provider/model>",
+                 "variant": "not set: the model's default variant applies"}}
+NOTHING_SET = {"claude": "model and effort are Claude Code's own defaults",
+               "opencode": "model NOT SET: `bin/hw coordinator` asks for it, or `bin/hw configure --model <provider/model>`"}
 NO_OPENCODE_MODEL = ("no model is set for OpenCode (config/opencode.json), and a session created without one runs whatever "
                      "OpenCode's server picks, not the user's choice. Ask the user which model to use, then "
                      "`bin/hw configure --model <provider/model>` (`bin/hw coordinator` asks for it when none is set).")
@@ -257,7 +264,8 @@ def migrate_old_sync_ref():
     if not sha:
         return []
     if hwlib.git(HW_HOME, "rev-parse", "--verify", "--quiet", new).returncode == 0:
-        return [f"OLD NAME LEFT ALONE: git refs {old} and {new} both exist; {new} is the one in use."]
+        return [f"OLD NAME LEFT ALONE: git refs {old} and {new} both exist; {new} is the one in use. "
+                f"Once the old one is not needed, drop it: `git update-ref -d {old}`."]
     if PROFILE_DIR != (HW_HOME / "profile").resolve():
         return [f"OLD NAME LEFT ALONE: git ref {old} ({sha[:9]}): the profile in use is outside this checkout, so no ref "
                 f"of it is renamed. If this checkout's branch belongs to that profile, record its sync point under the "
@@ -555,11 +563,12 @@ def pick_model(kind):
     """(model, effort) for a new Claude Code session, None for what is not set: claude.json's model, and its effort
     for this kind of work (effort_by_kind), never above claude.json's effort, which is the ceiling when it is set."""
     cfg = runtime_config("claude")
-    cap = model_choice("claude").get("effort")
+    chosen = model_choice("claude")
+    cap = chosen.get("effort")
     effort = (cfg.get("effort_by_kind") or {}).get(kind or "") or cap
     if effort in EFFORTS and cap and EFFORTS.index(effort) > EFFORTS.index(cap):
         effort = cap
-    return model_choice("claude").get("model"), effort
+    return chosen.get("model"), effort
 
 
 def running_count(conn, runtime):
@@ -2894,6 +2903,9 @@ def choose_opencode_model():
     answer = ask_user("Which model should Herdwright and its workers run on (provider/model, as `opencode models` lists them)?"
                       + (f" [{last_model}]" if last_model else ""))
     model = answer or (last_model if answer is not None else None)
+    if not model and answer == "":
+        die(f"a model is needed: OpenCode's server has no default that is yours. `opencode models` lists them; "
+            "run `bin/hw coordinator` again and type one (provider/model).")
     if not model:
         die(f"no model is set for OpenCode in {OPENCODE_CONFIG_PATH}, and OpenCode's server has no default that is yours. "
             "Run `bin/hw coordinator` in a terminal and answer its question, or `bin/hw configure --model <provider/model>`.")
@@ -2944,9 +2956,7 @@ def configure_report(runtime):
     path, keys = MODEL_CONFIG[runtime]
     chosen, cap = model_choice(runtime), runtime_config(runtime).get("max_running")
     lines = [f"runtime       {runtime} ({RUNTIME_NAMES[runtime]})"]
-    unset = {"model": "not set: Claude Code's own default applies" if runtime == "claude" else "NOT SET: `bin/hw coordinator` asks for it, or --model <provider/model>",
-             "effort": "not set: Claude Code's own default applies", "variant": "not set: the model's default variant applies"}
-    lines += [f"{key:<13} {chosen.get(key) or unset[key]}" for key in keys]
+    lines += [f"{key:<13} {chosen.get(key) or MODEL_UNSET[runtime][key]}" for key in keys]
     lines.append("max sessions  " + (f"{cap} open {RUNTIME_NAMES[runtime]} sessions at once, Herdwright's and yours included" if cap is not None else "not set: no limit"))
     return lines + [f"stored in     {path}"]
 
@@ -2956,7 +2966,7 @@ def cmd_configure(args):
     — show, set or clear what the user chose for the sessions Herdwright starts: the model, its effort (Claude Code)
     or variant (OpenCode), and how many sessions may be open at once. Herdwright ships no model, effort or variant:
     what is not set is not passed, so Claude Code's own default applies; OpenCode needs a model, which `coordinator`
-    asks for once. Stored in the profile's config for the
+    asks for once, before a variant can be set. Stored in the profile's config for the
     install's runtime; every spawn after it uses it. --clear <key> (model, effort, variant, max-sessions) removes a
     choice. Prints what now holds."""
     runtime = install_runtime()
@@ -2987,7 +2997,7 @@ def cmd_configure(args):
             values["max_running"] = values.pop("max-sessions")
         if runtime == "opencode" and "model" in values and values["model"] is None:
             die("OpenCode needs a model: set another one with --model <provider/model> instead of clearing it")
-        if runtime == "opencode" and not (runtime_config(runtime) | values).get("model"):
+        if runtime == "opencode" and values.keys() & {"model", "variant"} and not (runtime_config(runtime) | values).get("model"):
             die(NO_OPENCODE_MODEL)
         store_config(path, values)
     print("\n".join(configure_report(runtime)))
@@ -3047,7 +3057,7 @@ def cmd_start(args):
            f"runtime: {runtime}" + (f" · session {record['session']} · guard proven live at {record['started_at']}" if record else ""),
            f"lock: {'held by this session' if holds_lock() else describe(lock) if lock else 'none'}"]
     chosen, cap = model_choice(runtime), runtime_config(runtime).get("max_running")
-    out.append("workers: " + (", ".join(f"{key} {value}" for key, value in chosen.items()) or "model and effort are Claude Code's own defaults")
+    out.append("workers: " + (", ".join(f"{key} {value}" for key, value in chosen.items()) or NOTHING_SET[runtime])
                + (f" · at most {cap} sessions open" if cap is not None else " · no session limit") + " (change: bin/hw configure)")
     watcher = watcher_alive()
     running = conn.execute("SELECT COUNT(*) FROM sessions WHERE status IN ('running','waiting_user')").fetchone()[0]

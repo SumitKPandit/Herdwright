@@ -181,7 +181,8 @@ class ModelQuestionTests(CoordinatorCase):
         for state in ("", "not json", json.dumps({"recent": []}), json.dumps({"recent": [{"providerID": "a b", "modelID": "x"}]})):
             self.last_used(state)
             with self.answers(""):  # Enter with nothing to accept
-                self.dies(self.z.choose_opencode_model, "no model is set for OpenCode")
+                self.dies(self.z.choose_opencode_model, "a model is needed: OpenCode's server has no default that is yours. "
+                          "`opencode models` lists them; run `bin/hw coordinator` again and type one (provider/model).")
         with self.answers("nemotron"):
             self.dies(self.z.choose_opencode_model, "an OpenCode model is written provider/model, not 'nemotron'")
         self.assertFalse(self.config.exists())

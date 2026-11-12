@@ -27,7 +27,7 @@ class TemplateTests(unittest.TestCase):
 
     def test_no_model_is_written_into_the_code_as_a_fallback(self):
         """The check the test above cannot make: a default that lives in bin/ instead of the template."""
-        models = [m.split("/", 1)[1] for m in ("x/claude-opus", "x/claude-sonnet", "x/claude-haiku", "x/claude-fable", "x/nemotron", "x/gpt-")]
+        models = ["claude-opus", "claude-sonnet", "claude-haiku", "claude-fable", "nemotron", "gpt-"]
         for path in [HOME / "bin" / "hw", HOME / "bin" / "hw-setup", *sorted((HOME / "bin" / "lib").glob("*.py"))]:
             text = path.read_text()
             self.assertEqual([m for m in models if m in text], [], path.name)
@@ -150,13 +150,13 @@ class OnOpenCode(ConfigureCase):
     def test_opencode_needs_a_model_so_none_is_shown_as_not_set_and_it_cannot_be_cleared(self):
         self.assertEqual(self.configure()[1], "model         NOT SET: `bin/hw coordinator` asks for it, or --model <provider/model>")
         self.refused("no model is set for OpenCode", "--variant", "low")
-        self.refused("no model is set for OpenCode", "--max-sessions", "2")
         self.assertIsNone(self.stored())
+        self.configure("--max-sessions", "2")  # the session limit does not depend on the model
         self.configure("--model", "acme/m-1")
         self.refused("OpenCode needs a model: set another one with --model <provider/model> instead of clearing it", "--clear", "model")
         self.refused("an OpenCode model is written provider/model, not 'opus'", "--model", "opus")
         self.refused("OpenCode has no effort: its choices are --model, --variant and --max-sessions", "--effort", "high")
-        self.assertEqual(self.stored(), {"model": "acme/m-1"})
+        self.assertEqual(self.stored(), {"max_running": 2, "model": "acme/m-1"})
 
 
 class StartSaysWhatWorkersRunOn(LoopCase):
@@ -168,6 +168,12 @@ class StartSaysWhatWorkersRunOn(LoopCase):
         said = self.w.hw("configure", "--max-sessions", "2").stdout
         self.assertIn("max sessions  2 open", said)
         self.assertIn(f"workers: {chosen} · at most 2 sessions open (change: bin/hw configure)", self.w.start().stdout.splitlines())
+
+    def test_with_nothing_set_start_says_what_applies_on_this_runtime(self):
+        (self.w.profile / "config" / f"{self.RUNTIME}.json").write_text("{}")
+        said = {"claude": "model and effort are Claude Code's own defaults",
+                "opencode": "model NOT SET: `bin/hw coordinator` asks for it, or `bin/hw configure --model <provider/model>`"}
+        self.assertIn(f"workers: {said[self.RUNTIME]} · no session limit (change: bin/hw configure)", self.w.start().stdout.splitlines())
 
 
 per_runtime(globals(), StartSaysWhatWorkersRunOn)

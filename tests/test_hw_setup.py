@@ -127,6 +127,9 @@ class SetupCase(unittest.TestCase):
         self.assertEqual((r.returncode, r.stderr), (1, "hw: 'pi' is not a runtime: claude or opencode\n"))
         r = self.setup(args=("--model", "opus"))  # models are not setup's business
         self.assertEqual((r.returncode, r.stderr), (2, "usage: hw-setup [--runtime claude|opencode]\n"))
+        for args in (("--runtime",), ("--runtime", ""), ("--runtime", "claude", "extra")):  # one value, nothing else
+            r = self.setup(runtimes=RUNTIMES, args=args)
+            self.assertEqual((r.returncode, r.stderr), (2, "usage: hw-setup [--runtime claude|opencode]\n"), args)
 
     def test_it_asks_nothing_about_models_and_writes_none(self):
         self.profile_settings({"runtime": "claude", "assistant_name": "Ada"})
