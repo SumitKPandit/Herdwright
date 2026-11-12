@@ -10,10 +10,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import agent  # noqa: E402
 
 VERSION = "9.9.9 (fake Claude Code)"
-# the screen: what is printed before a message and before the echo of a prompt, and the input box under an idle CLI
-SCREEN = {"bullet": "⏺ ", "prompt_echo": "> ",
+# the screen, as `herdr agent read` showed Claude Code v2.1.322 on 2026-11-12: a prompt is echoed behind `❯` (its other
+# lines indented), a message behind `⏺`, a finished turn leaves a `✻ ... for 2s` line, and an idle CLI ends in its input box
+SCREEN = {"bullet": "⏺ ", "prompt_echo": "❯ ", "echo_indent": "  ", "turn_end": ["✻ Worked for 1s"],
           "footer": ["─" * 40, "❯ ", "─" * 40, "  ⏵⏵ auto mode on (shift+tab to cycle)"]}
-
 
 def launch(argv):
     p = argparse.ArgumentParser(prog="claude")

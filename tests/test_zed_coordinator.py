@@ -246,8 +246,10 @@ class CommandTests(CoordinatorCase):
 
 
 class StartTests(CoordinatorCase):
-    def start(self, env=None, herdr_session=None, branch="profile/me"):
-        """`bin/zed start` as the shell tool of an OpenCode session runs it: `env` is what that shell carries."""
+    def start(self, env=None, herdr_session=None, branch="profile/me", watcher=None, comes_up=True):
+        """`bin/zed start` as the shell tool of an OpenCode session runs it: `env` is what that shell carries.
+        `watcher`: the pid of the watcher already running; `self.armed` counts the ones `start` started (`comes_up`:
+        whether one it starts gets going)."""
         env = {"OPENCODE_SESSION_ID": "ses_test1", "ZED_COORDINATOR": str(self.record)} if env is None else env
         real_git = self.z.zedlib.git
 
@@ -261,11 +263,43 @@ class StartTests(CoordinatorCase):
         clean = {k: v for k, v in os.environ.items() if not k.startswith(("OPENCODE_", "ZED_", "HERDR_", "CLAUDE"))}
         with patch.dict(os.environ, clean | env, clear=True), patch.object(self.z, "cmd_lock") as lock, \
                 patch.object(self.z, "holds_lock", return_value=True), patch.object(self.z, "live_agents", return_value={}), \
-                patch.object(self.z, "watcher_alive", return_value=None), patch.object(self.z.zedlib, "git", side_effect=git), \
+                patch.object(self.z, "watcher_alive", return_value=watcher), patch.object(self.z.zedlib, "git", side_effect=git), \
+                patch.object(self.z, "arm_watcher", side_effect=lambda: self.armed.append(1) or (4321 if comes_up else None)), \
                 patch.object(self.z, "pane_session", return_value=herdr_session), \
                 patch.object(self.z, "script_findings", return_value=[]):
             self.z.cmd_start([])
         return lock
+
+    armed = []
+
+    def setUp(self):
+        super().setUp()
+        self.armed = []
+
+    def test_the_watchers_log_is_cut_back_when_it_has_grown_and_keeps_its_last_words(self):
+        log = self.profile / ".cache" / "watch.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("x" * 100 + "é\nwhy the last watcher ended\n")
+        with patch.object(self.z, "WATCH_LOG_BYTES", 58), patch.object(self.z.subprocess, "Popen") as popen, \
+                patch.object(self.z, "watcher_alive", return_value=4321):
+            self.assertEqual(self.z.arm_watcher(), 4321)
+            self.assertEqual(log.read_text(), "why the last watcher ended\n")  # the whole lines in the last half of the limit
+            self.assertEqual(popen.call_args.args[0][-2:], ["watch", "--daemon"])
+            log.write_text("short\n")
+            self.z.arm_watcher()
+            self.assertEqual(log.read_text(), "short\n")
+
+    def test_start_starts_the_long_lived_watcher_when_none_runs_and_says_so(self):
+        """OpenCode has no Stop hook to re-arm a watcher: `start` is what starts it, with or without tracked work."""
+        self.proven()
+        self.start()
+        self.assertEqual(self.armed, [1])
+        self.assertIn("watcher: was NOT RUNNING; started now, pid 4321", self.output.getvalue())
+        self.start(watcher=77)
+        self.assertEqual(self.armed, [1])  # one is enough
+        self.assertIn("watcher: alive, pid 77", self.output.getvalue())
+        self.start(comes_up=False)
+        self.assertIn(f"watcher: NOT RUNNING and it did not start: read {self.profile / '.cache' / 'watch.log'}", self.output.getvalue())
 
     def proven(self, **changes):
         self.record.parent.mkdir(parents=True, exist_ok=True)
@@ -324,6 +358,42 @@ class StartTests(CoordinatorCase):
                                                          "skill and do nothing else until it is done.")
 
 
+class WakeTests(CoordinatorCase):
+    """What the long-lived watcher does with an event (tests/test_e2e_wake.py runs it whole; tests/smoke_opencode.py on the real runtime)."""
+    RECORD = {"session": "ses_test1", "server": {"url": "http://127.0.0.1:1", "password": "x"}}
+
+    def test_the_servers_message_id_is_the_receipt(self):
+        receipt = self.z.wake_coordinator(self.RECORD, "w1:p1", ["[E1] S1 asks", "[E2] S2 is gone"])
+        (method, path, body), = self.server.calls
+        self.assertEqual((method, path), ("POST", "/session/ses_test1/prompt"))
+        self.assertEqual(body["text"].splitlines(), [self.z.WAKE_HEADING, "[E1] S1 asks", "[E2] S2 is gone"])
+        self.assertEqual((receipt["via"], receipt["message"]), ("api", "msg_1"))
+        self.assertEqual([c for c in self.herdr_calls if c[0] == "herdr"], [])  # nothing typed
+
+    def test_a_server_that_fails_leaves_the_prompt_to_herdr_and_both_failing_is_said(self):
+        self.server.up = False
+        receipt = self.z.wake_coordinator(self.RECORD, "w1:p1", ["[E1] S1 asks"])
+        self.assertEqual((receipt["via"], receipt["api_error"]), ("herdr", "ConnectionRefusedError: connection refused"))
+        self.assertEqual(self.herdr_calls[-1], ["herdr", "agent", "prompt", "w1:p1", f"{self.z.WAKE_HEADING}\n[E1] S1 asks"])
+        failed = subprocess.CompletedProcess([], 1, "", "agent_not_found")
+        with patch.object(self.z, "run", return_value=failed):
+            receipt = self.z.wake_coordinator(self.RECORD, "w1:p1", ["[E1] S1 asks"])
+        self.assertEqual((receipt["via"], receipt["error"]), (None, "ConnectionRefusedError: connection refused; herdr: agent_not_found"))
+        self.assertIn("this session is in no herdr pane", self.z.wake_coordinator(self.RECORD, None, ["[E1] S1 asks"])["error"])
+
+    def test_a_receipt_is_kept_on_its_events_and_an_event_is_shown_again_only_after_a_while(self):
+        shown = self.z.queue_add(["S1 asks", "S2 is gone"])
+        self.z.queue_receipt(shown[:1], {"via": "api", "message": "msg_9"})
+        first, second = self.z.queue_pending()
+        self.assertEqual((first["wake"], "wake" in second), ({"via": "api", "message": "msg_9"}, False))
+        self.assertEqual(self.z.queue_represent(self.z.REPRESENT_SECONDS), [])  # fresh: the long-lived watcher leaves them
+        with self.z.wake_queue() as q:
+            q["events"][1]["shown_at"] -= self.z.REPRESENT_SECONDS + 1
+        again, = self.z.queue_represent(self.z.REPRESENT_SECONDS)
+        self.assertRegex(again, r"^\[E2\] \(again, un-acked since .*\) S2 is gone$")
+        self.assertEqual(self.z.queue_represent(self.z.REPRESENT_SECONDS), [])
+
+
 class RelayTests(CoordinatorCase):
     def setUp(self):
         super().setUp()
@@ -358,17 +428,25 @@ class RelayTests(CoordinatorCase):
                                     r'- User \([^)]+\), Q%d "Rename the flag\?": "No, keep --dry-run\."\n\n$' % (self.q1, self.q2))
         self.assertIn(f"recorded Q{self.q1}, Q{self.q2}", self.output.getvalue())
 
-    def test_a_working_session_is_not_interrupted_and_nothing_is_recorded(self):
+    def test_a_working_session_is_not_interrupted_and_its_answer_waits_for_it_in_the_record(self):
         self.state.stop()
         with patch.object(self.z, "session_agent_state", return_value="working"):
-            self.dies(lambda: self.z.cmd_relay([f"Q{self.q1}", "use port 9196"]), f"refused: S{self.sid}")
-            self.assertEqual(self.question(self.q1)["status"], "open")
-            self.assertNotIn("9196", self.brief.read_text())
+            self.z.cmd_relay([f"Q{self.q1}", "use port 9196"])
             self.mock_prompt_worker.assert_not_called()
-            self.z.cmd_relay([f"Q{self.q1}", "use port 9196", "--redirect"])
+            q = self.question(self.q1)
+            self.assertEqual((q["status"], q["answer"], q["delivered_at"]), ("answered", "use port 9196", None))  # for it to read
+            self.assertIn('"Which port?": "use port 9196"', self.brief.read_text())
+            self.assertIn(f"S{self.sid} is working, so it was not prompted with Q{self.q1}: it reads them with `zed-employee answers`",
+                          self.output.getvalue())
+            self.z.cmd_relay([f"Q{self.q2}", "No.", "--redirect"])  # meant to interrupt: prompted at once
         self.state.start()
-        self.assertEqual(self.question(self.q1)["status"], "answered")
         self.mock_prompt_worker.assert_called_once()
+        self.assertIsNotNone(self.question(self.q2)["delivered_at"])
+
+    def test_an_answer_prompted_to_an_idle_worker_counts_as_given(self):
+        self.z.cmd_relay([f"Q{self.q1}", "use port 9196"])
+        self.assertIsNotNone(self.question(self.q1)["delivered_at"])
+        self.assertEqual(self.z.zedlib.take_answers(self.conn, self.sid, "now"), [])  # nothing left for the watcher to send again
 
     def second_worker(self):
         """A second session with a question of its own (a copy of the first, in another pane); returns (session, question)."""
@@ -379,24 +457,27 @@ class RelayTests(CoordinatorCase):
         return other, q
 
     def test_two_workers_are_both_checked_before_either_is_prompted(self):
-        """S338: with the second worker `working`, the first had already received its answer and nothing was recorded."""
+        """S338: with the second worker not promptable, the first had already received its answer and nothing was recorded."""
         other, q3 = self.second_worker()
         self.state.stop()
-        with patch.object(self.z, "session_agent_state", side_effect=lambda s: "working" if s["id"] == other else "idle"):
+        with patch.object(self.z, "session_agent_state", side_effect=lambda s: "gone" if s["id"] == other else "idle"):
             self.dies(lambda: self.z.cmd_relay([f"Q{self.q1}", "use port 9196", f"Q{q3}", "eu"]),
-                      f"refused: S{other}", "Nothing was sent and nothing recorded.")
-        self.state.start()
+                      f"S{other} has no live agent", "Nothing was sent and nothing recorded.")
         self.mock_prompt_worker.assert_not_called()
         self.assertEqual([self.question(q)["status"] for q in (self.q1, q3)], ["open", "open"])
         self.assertNotIn("9196", self.brief.read_text())
-        self.z.cmd_relay([f"Q{self.q1}", "use port 9196", f"Q{q3}", "eu"])  # both idle: one prompt each
-        self.assertEqual([c.args[0] for c in self.mock_prompt_worker.call_args_list], ["build-t20", "build-two"])
-        self.assertEqual([self.question(q)["status"] for q in (self.q1, q3)], ["answered", "answered"])
+        with patch.object(self.z, "session_agent_state", side_effect=lambda s: "working" if s["id"] == other else "idle"):
+            self.z.cmd_relay([f"Q{self.q1}", "use port 9196", f"Q{q3}", "eu"])  # one idle, one working: only the idle one is prompted
+        self.state.start()
+        self.assertEqual([c.args[0] for c in self.mock_prompt_worker.call_args_list], ["build-t20"])
+        self.assertEqual([(self.question(q)["status"], self.question(q)["delivered_at"] is None) for q in (self.q1, q3)],
+                         [("answered", False), ("answered", True)])
 
     def test_a_prompt_that_fails_for_the_second_worker_leaves_the_first_recorded_and_not_prompted_again(self):
         other, q3 = self.second_worker()
         self.mock_prompt_worker.side_effect = lambda agent, text: (agent != "build-two", "agent_prompt_stalled")
-        self.dies(lambda: self.z.cmd_relay([f"Q{self.q1}", "use port 9196", f"Q{q3}", "eu"]), f"prompt to S{other} failed: agent_prompt_stalled")
+        self.dies(lambda: self.z.cmd_relay([f"Q{self.q1}", "use port 9196", f"Q{q3}", "eu"]), f"prompt to S{other} failed: agent_prompt_stalled",
+                  f"recorded before this failure: Q{self.q1}. Not sent and not recorded: Q{q3}.")  # S341: what to run again
         self.assertEqual([(self.question(q)["status"], self.question(q)["answer"]) for q in (self.q1, q3)], [("answered", "use port 9196"), ("open", None)])
         self.assertIn('"Which port?": "use port 9196"', self.brief.read_text())
         self.mock_prompt_worker.side_effect = None

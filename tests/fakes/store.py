@@ -7,7 +7,8 @@ in the background and a test acting in the foreground never tear it; `read()` on
   {"next": 1,                                  counter for workspace ids
    "workspaces": {id: {"pane": pane_id, "label": str}},
    "panes": {pane_id: {"workspace_id", "cwd", "env": {..}, "shell_pid": int|None, "foreground": [pid, ..],
-                       "agent": None | {see new_agent}}},
+                       "agent": None | {see new_agent},
+                       "server": {"port", "pid"}, "opencode": {session id: {..}}}},   an OpenCode pane only (bin/opencode)
    "calls": [[argv..], ..]}                    every herdr command received, oldest first
 """
 import contextlib
@@ -20,7 +21,7 @@ from pathlib import Path
 
 VISIBLE_LINES = 40  # what `agent read --source visible` shows: the bottom of the screen
 # what a hat session must not inherit from the coordinator's shell: herdr starts a pane with its own identity
-COORDINATOR_ONLY = ("HERDR_PANE_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID", "OPENCODE_SESSION_ID", "OPENCODE_PID")
+COORDINATOR_ONLY = ("HERDR_PANE_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID", "OPENCODE_SESSION_ID", "OPENCODE_PID", "ZED_COORDINATOR")
 
 
 def home(root=None):
@@ -52,10 +53,15 @@ def agent_event(pane_id, event, payload="", env=None, root=None):
     environment. `env` is the environment of whoever makes it happen (default: this process's)."""
     pane = read(root)["panes"][pane_id]
     agent = pane["agent"]
-    env = {k: v for k, v in (os.environ if env is None else env).items() if k not in COORDINATOR_ONLY}
-    env |= pane["env"] | {"HERDR_PANE_ID": pane_id, "FAKE_AGENT_PANE": pane_id, "FAKE_AGENT_EVENT": event,
-                          "FAKE_AGENT_PAYLOAD": payload}
+    env = pane_env(pane_id, pane, env) | {"FAKE_AGENT_EVENT": event, "FAKE_AGENT_PAYLOAD": payload}
     subprocess.run([agent["kind"], *agent["argv"]], cwd=pane["cwd"], env=env, check=True)
+
+
+def pane_env(pane_id, pane, env=None):
+    """The environment of what runs in a pane: that of whoever starts it (default: this process's) without what
+    identifies a coordinator, the pane's own variables, and the pane's id."""
+    env = {k: v for k, v in (os.environ if env is None else env).items() if k not in COORDINATOR_ONLY}
+    return env | pane["env"] | {"HERDR_PANE_ID": pane_id, "FAKE_AGENT_PANE": pane_id}
 
 
 def new_pane(state, cwd, env=None, label="", shell_pid=None):

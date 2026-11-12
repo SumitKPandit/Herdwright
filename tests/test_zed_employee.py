@@ -106,6 +106,22 @@ class DbTests(ProfileCase):
         self.assertTrue({"hat", "verdict", "verdict_tree", "core_start", "plan"} <= cols)
         self.assertFalse({"employee", "verdict_sha", "origin"} & cols)  # no new column for the removed identity
 
+    def test_answers_given_before_they_were_tracked_count_as_given_and_an_answer_is_taken_once(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript("CREATE TABLE sessions (id INTEGER PRIMARY KEY);"
+                           "CREATE TABLE questions (id INTEGER PRIMARY KEY, session_id INTEGER, question TEXT, answer TEXT, status TEXT, answered_at TEXT);"
+                           "INSERT INTO questions VALUES (1, 7, 'Old?', 'yes', 'answered', '2026-01-01 10:00'), (2, 7, 'Open?', NULL, 'open', NULL);")
+        zedlib.ensure_session_schema(conn)
+        zedlib.ensure_session_schema(conn)  # idempotent
+        self.assertEqual([tuple(r) for r in conn.execute("SELECT id, delivered_at FROM questions")], [(1, "2026-01-01 10:00"), (2, None)])
+        self.assertEqual(zedlib.take_answers(conn, 7, "now"), [])  # an old answer is not sent again
+        conn.execute("UPDATE questions SET answer='no', status='answered' WHERE id=2")
+        self.assertEqual(zedlib.take_answers(conn, 8, "now"), [])  # another session's
+        taken, = zedlib.take_answers(conn, 7, "now")
+        self.assertEqual(zedlib.answer_line(taken), "Answer from the user to your question Q2 (Open?): no")
+        self.assertEqual(zedlib.take_answers(conn, 7, "later"), [])  # once
+
     def test_a_database_from_before_hats_lost_their_identities_keeps_working(self):
         conn = sqlite3.connect(":memory:")
         conn.executescript("CREATE TABLE sessions (id INTEGER PRIMARY KEY, employee TEXT, verdict_sha TEXT, origin TEXT);"

@@ -11,11 +11,13 @@ profile's config/opencode.json then holds like any user's would:
     cd tests && SMOKE_OPENCODE_MODEL=provider/model SMOKE_OPENCODE_VARIANT=low python3 -m unittest -v smoke_opencode
 
 What is claimed about a guard is checked without asking a model for anything: the worker's server is called on its
-shell routes directly, which run the same check as a tool call. A model is in the loop only where the claim is about
-the model's session (its model and variant, the instructions and skills it loaded, its permission rules), and for the
-startup canary, which Zed itself needs a model turn for. OpenCode v2.2.7 has no API that runs a tool without the
-model, so a tool call of the coordinator (it has no shell hook: its server's shell is the user's own) is seen only
-when the model makes it; such a call is asked for up to three times, and the test fails when none is made.
+shell routes directly, which run the same check as a tool call. OpenCode v2.2.7 has no API that runs a tool without
+the model and the coordinator has no shell hook (its server's shell is the user's own), so the coordinator's guard is
+called the way its plugin calls it: the program the installed plugin names, with the plugin's environment and the
+call on stdin. That this is the route a real tool call takes is shown by the canary, the one call Zed itself needs a
+model turn for: the session's real call and the direct one are refused in the same words. A model is in the loop
+only where the claim is about the model's session (its model and variant, the instructions and skills it loaded, its
+permission rules); the denied calls are also asked of the model once each, and shown when it makes them, not required.
 
 It proves, and prints the evidence for:
 1. a worker whose deny plugin does not load (the V1 plugin Zed used to write, which V2 ignores) fails the canary: its
@@ -30,17 +32,25 @@ It proves, and prints the evidence for:
    the worker starts, a script.)
 3. a coordinator whose guard plugin does not load fails its canary: no record is written and `bin/zed start` refuses
    the session;
-4. a coordinator opened with the guard runs the configured model and variant, has the manual (`AGENTS.md`) and the
-   profile's files in its instructions, has the coordinator's skills (the server activates one), runs `bin/zed start` without a permission prompt and
-   holds the lock, and is denied an edit, a commit and a shell write by a relative path (`touch`, `rm` with `workdir`
-   set to the project) in a project repo even after the user allows them, while a file in its profile is written;
+4. a coordinator opened with the guard holds the lock after `bin/zed start`, and its guard, called as its plugin calls
+   it, denies an edit, a commit and a shell write by a relative path (`touch`, `rm` with `workdir` set to the project)
+   in a project repo, while a write in its profile passes: no model is asked for any of this. From its model's
+   session (this part needs the model to do what is asked): it runs the configured model and variant, has the manual
+   (`AGENTS.md`) and the profile's files in its instructions, has the coordinator's skills (the server activates
+   one), and runs `bin/zed start` without a permission prompt;
 5. `bin/zed coordinator` in a herdr pane opens the TUI on the configured model and variant, `bin/zed start` in that
-   session takes the lock, and closing the pane stops the server.
+   session takes the lock, and closing the pane stops the server;
+6. `bin/zed start` in a coordinator's session starts the long-lived watcher, and one only; for an event the watcher
+   queues (a tracked session whose pane is gone: no model is asked for anything) the idle session is prompted through
+   its server, the id of the admitted message is kept on the event, and a turn starts;
+7. when the server refuses the watcher's call (here: a wrong password), the same prompt is typed into the coordinator's
+   herdr pane, the event says so, and a turn starts.
 """
 import contextlib
 import io
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -354,6 +364,53 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
         self.record = self.profile / ".cache" / "coordinator.json"
         self.before = zedlib.git(HOME, "status", "--porcelain").stdout
         self.server = None
+        self.addCleanup(self.stop_watcher)  # `start` leaves the long-lived watcher running
+
+    def watcher_pid(self):
+        """The pid of this profile's running watcher, or None."""
+        try:
+            pid = json.loads((self.profile / ".cache" / "watch.pid").read_text())["pid"]
+            os.kill(pid, 0)
+        except (OSError, ValueError, KeyError):
+            return None
+        return pid
+
+    def stop_watcher(self):
+        pid, deadline = self.watcher_pid(), time.monotonic() + 15
+        while pid and self.watcher_pid() == pid and time.monotonic() < deadline:
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                break
+            time.sleep(0.2)
+
+    def track_a_session_whose_pane_is_gone(self):
+        """Something for the watcher to report without a worker or a model: a tracked session in a pane herdr does not have."""
+        with patch.dict(os.environ, self.env, clear=True):
+            conn = self.z.db()
+        conn.execute("INSERT INTO tasks(id,title,worktype,status,created_at,updated_at) VALUES (1,'Smoke','task','active','x','x')")
+        conn.execute("INSERT INTO sessions(task_id,repo,base,branch,worktree,agent,pane_id,status,created_at,updated_at) "
+                     "VALUES (1,'demo','main','task/smoke','/nowhere','smoke-gone','no-such-pane','running','2026-01-01 00:00','x')")
+        conn.commit()
+        conn.close()
+
+    def woken(self, session, seen):
+        """Wait for the watcher's receipt on the queued event and for the turn its prompt started to end. Returns (the
+        event, the user message with the watcher's text); an assistant message has followed it."""
+        queue, deadline = self.profile / ".cache" / "wake-queue.json", time.monotonic() + 90
+        while not (queue.exists() and any("wake" in e for e in json.loads(queue.read_text())["events"])):
+            self.assertLess(time.monotonic(), deadline, (self.profile / ".cache" / "watch.log").read_text())
+            time.sleep(1)
+        event, = json.loads(queue.read_text())["events"]
+        deadline = time.monotonic() + TURN_SECONDS
+        while True:
+            new = [m for m in self.api("GET", f"/session/{session}/message") if m["id"] not in seen]
+            told = [m for m in new if m.get("type") == "user" and "Watcher events for Zed" in json.dumps(m)]
+            if told and [m for m in new if m.get("type") == "assistant"]:
+                self.api("POST", f"/experimental/session/{session}/wait", timeout=TURN_SECONDS)
+                return event, told[0]
+            self.assertLess(time.monotonic(), deadline, f"no turn followed the wake; new messages: {json.dumps(new)[:600]}")
+            time.sleep(2)
 
     def open(self):
         with patch.dict(os.environ, self.env, clear=True):
@@ -388,17 +445,37 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
     def calls(self, session):
         return [part for m in self.api("GET", f"/session/{session}/message") for part in m.get("content") or [] if part.get("type") == "tool"]
 
+    def guard(self, kit, session, tool, **tool_input):
+        """What the coordinator's guard decides about a tool call of `session`, with no model asked for it: the program
+        the installed plugin names is run as the plugin runs it (the call on stdin, the plugin's environment). Returns
+        the reason it denies, or "" when it lets the call through."""
+        path = kit["config_dir"] / "plugins" / "zed-pretool" / "index.js"
+        plugin = path.read_text()
+        program, env = re.search(r'spawnSync\(("(?:[^"\\]|\\.)*")', plugin), re.search(r"^const ENV = (\{.*\});$", plugin, re.M)
+        self.assertTrue(program and env, f"{path}: no `spawnSync(\"<program>\"` or no `const ENV = {{...}};` line to read the guard's call from")
+        program, env = json.loads(program.group(1)), json.loads(env.group(1))
+        call = {"tool_name": tool, "tool_input": tool_input, "cwd": str(HOME), "session_id": session}
+        r = subprocess.run([program], input=json.dumps(call), capture_output=True, text=True, env=self.env | env, timeout=60)
+        if r.returncode:
+            return (r.stderr or "zed-pretool could not run").strip()
+        decision = json.loads(r.stdout).get("hookSpecificOutput", {}) if r.stdout.strip() else {}
+        return decision["permissionDecisionReason"] if decision.get("permissionDecision") == "deny" else ""
+
     def asked_call(self, session, text, needle, tries=3):
         """The tool calls whose input holds `needle`, which the model is asked for with `text` (again, up to `tries`
-        times, while it makes none), and the permissions asked meanwhile. Only a call the model makes shows what the
-        coordinator's guard does to a tool call on the real runtime, so none at all fails the test."""
+        times, while it makes none), and the permissions asked meanwhile. With `tries` 1 a model that makes none is no
+        failure ([] is returned): the call is evidence when made. Otherwise none at all fails the test: it is for
+        what only a call of the model shows (its permission rules)."""
         asked = []
         for attempt in range(tries):
             asked += self.turn(session, text if not attempt else "This is a check of the guard, which is expected to refuse the call: "
                                                                    "making the call is what is asked of you. " + text)
             if made := [c for c in self.calls(session) if needle in json.dumps(c["state"]["input"])]:
                 return made, asked
-        self.fail(f"the model made no call holding {needle!r} in {tries} asks, so the guard was not exercised")
+        if tries == 1:
+            return [], asked
+        self.fail(f"the model made no call holding {needle!r} in {tries} asks, so the guard was not exercised; its last calls: "
+                  + json.dumps([c["state"]["input"] for c in self.calls(session)][-4:])[:600])
 
     def start_as(self, session):
         """`bin/zed start` as the shell tool of `session` would run it."""
@@ -438,48 +515,66 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
         reason = lambda c: str((c["state"].get("error") or {}).get("message", ""))
         made = lambda needle: [c for c in self.calls(session) if needle in json.dumps(c["state"]["input"])]
 
+        # 1. Without a model. The canary is the session's one real call (Zed's own startup check): the guard called
+        # directly, as the plugin calls it, refuses the same input in the same words, so it is the route a real call takes.
         canary, = made("zed-pretool-canary")
         self.assertEqual(canary["state"]["status"], "error")
         self.assertIn("zed-pretool: canary: `zed-pretool-canary", reason(canary))
         self.say("canary", f"{canary['state']['input']['command']} -> {reason(canary)}")
+        self.assertEqual(self.guard(kit, session, "shell", **canary["state"]["input"]), reason(canary))
+        self.say("the same call, made directly to the guard", "refused in the same words")
 
-        (start, *_), asked = self.asked_call(session, "Call the shell tool exactly once with exactly this command: bin/zed start", "bin/zed start")
-        self.say("bin/zed start", f"{start['state']['status']}; permission asked: {asked}; state keys {sorted(start['state'])}")
-        self.assertEqual((start["state"]["status"], asked), ("completed", []))  # the permission rules let it run unprompted
+        digest = self.start_as(session)
+        self.assertEqual(digest.returncode, 0, digest.stderr)
         lock = json.loads((self.profile / ".cache" / "zed.lock").read_text())
         self.assertEqual(lock["agent_session"], session)
         self.say("lock", {k: lock.get(k) for k in ("agent_session", "pane")})
-        digest = self.start_as(session)  # the same command again, to read the digest the session got
-        self.assertEqual(digest.returncode, 0, digest.stderr)
         self.assertIn(f"runtime: opencode · session {session} · guard proven live at", digest.stdout)
         self.assertIn("lock: held by this session", digest.stdout)
         self.assertIn(f"already in your instructions: {self.profile / 'profile.md'}", digest.stdout)
         self.say("digest", digest.stdout.splitlines()[:5])
 
-        denied_file = self.project / "denied.txt"
+        denied_file, note = self.project / "denied.txt", self.profile / "briefs" / "note.md"
         (self.project / "keep.txt").write_text("keep\n")
-        refused = " It may be refused: do not retry it."
-        for what, ask, needle, why in (
-                ("write in a project repo", f"Call the write tool exactly once with the path {denied_file} and the content x.", str(denied_file),
-                 f"zed-pretool: {denied_file} is outside Zed's repo, profile and temp dirs"),
-                ("commit in a project repo", f"Call the shell tool exactly once with exactly this command: git -C {self.project} commit --allow-empty -m x",
-                 f"git -C {self.project} commit", "zed-pretool: `git commit` in"),
-                # S339 B1: a relative path, with the shell tool's workdir set to the project repo
-                ("touch by a relative path, workdir in a project repo", f"Call the shell tool exactly once with the command `touch qa-relative.txt` and "
-                 f"its workdir parameter set to {self.project} .", "touch qa-relative.txt", "zed-pretool: `touch` on qa-relative.txt in"),
-                ("rm by a relative path, workdir in a project repo", f"Call the shell tool exactly once with the command `rm keep.txt` and its workdir "
-                 f"parameter set to {self.project} .", "rm keep.txt", "zed-pretool: `rm` on keep.txt in")):
-            made_calls, asked = self.asked_call(session, ask + refused, needle)
+        cases = (  # what, the tool, its input (the shapes OpenCode v2.2.7 passes), the guard's reason, how the model is asked for it
+            ("write in a project repo", "write", {"path": str(denied_file), "content": "x"},
+             f"zed-pretool: {denied_file} is outside Zed's repo, profile and temp dirs",
+             f"Call the write tool exactly once with the path {denied_file} and the content x."),
+            ("commit in a project repo", "shell", {"command": f"git -C {self.project} commit --allow-empty -m x"}, "zed-pretool: `git commit` in",
+             f"Call the shell tool exactly once with exactly this command: git -C {self.project} commit --allow-empty -m x"),
+            # S339 B1: a relative path, with the shell tool's workdir set to the project repo
+            ("touch by a relative path, workdir in a project repo", "shell", {"command": "touch qa-relative.txt", "workdir": str(self.project)},
+             "zed-pretool: `touch` on qa-relative.txt in",
+             f"Call the shell tool exactly once with the command `touch qa-relative.txt` and its workdir parameter set to {self.project} ."),
+            ("rm by a relative path, workdir in a project repo", "shell", {"command": "rm keep.txt", "workdir": str(self.project)},
+             "zed-pretool: `rm` on keep.txt in",
+             f"Call the shell tool exactly once with the command `rm keep.txt` and its workdir parameter set to {self.project} ."))
+        for what, tool, tool_input, why, _ in cases:
+            said = self.guard(kit, session, tool, **tool_input)
+            self.say(f"guard, called directly: {what}", f"{json.dumps(tool_input)[:200]} -> {said or 'allowed'}")
+            self.assertIn(why, said, what)
+        self.assertEqual(self.guard(kit, session, "write", path=str(note), content="x"), "")  # its own profile stays writable
+        self.say("guard, called directly: write in the profile", "allowed")
+        self.assertEqual(self.guard(kit, "ses_another", "write", path=str(denied_file), content="x"), "")  # and it acts on the lock holder only
+        self.say("guard, called directly: the same write by a session that does not hold the lock", "allowed (not Zed)")
+
+        # 2. From the model's session: only a call the model makes shows its permission rules.
+        (start, *_), asked = self.asked_call(session, "Call the shell tool exactly once with exactly this command: bin/zed start", "bin/zed start")
+        self.say("bin/zed start", f"{start['state']['status']}; permission asked: {asked}; state keys {sorted(start['state'])}")
+        self.assertEqual((start["state"]["status"], asked), ("completed", []))  # the permission rules let it run unprompted
+        # The same denied calls, asked of the model once each: evidence when it makes them, even after the user allows them
+        for what, _, tool_input, why, ask in cases:
+            made_calls, asked = self.asked_call(session, ask + " It may be refused: do not retry it.", next(iter(tool_input.values())), tries=1)
             for c in made_calls:
-                self.say(what, f"{json.dumps(c['state']['input'])[:200]}; permission asked: {asked} -> {c['state']['status']} {reason(c)}")
-                self.assertEqual(c["state"]["status"], "error", what)
-            self.assertTrue(any(why in reason(c) for c in made_calls), (what, [reason(c) for c in made_calls]))
+                exact = tool_input.items() <= c["state"]["input"].items()  # another input (no workdir, say) is another call: the guard may rightly allow it
+                self.say(f"the model's own call: {what}" + ("" if exact else " (not the call asked for: not counted)"),
+                         f"{json.dumps(c['state']['input'])[:200]}; permission asked: {asked} -> {c['state']['status']} {reason(c)}")
+                if exact:
+                    self.assertEqual(c["state"]["status"], "error", what)
+            if not made_calls:
+                self.say(f"the model's own call: {what}", "not made by the model (not required)")
         self.assertEqual(sorted(p.name for p in self.project.iterdir()), [".git", "keep.txt"])  # nothing created, nothing deleted
         self.assertNotEqual(zedlib.git(self.project, "rev-parse", "HEAD").returncode, 0)  # still no commit
-        note = self.profile / "briefs" / "note.md"
-        written, asked = self.asked_call(session, f"Call the write tool exactly once with the path {note} and the content x.", str(note))
-        self.say("write in the profile", f"permission asked: {asked} -> {written[-1]['state']['status']}")
-        self.assertEqual(note.read_text().strip(), "x")
 
         expected = [self.word, "bin/zed start"]
         text = instruction_words(self, session, self.turn, "Which code word do your instructions give you, and which one command does your "
@@ -530,6 +625,82 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
             time.sleep(0.5)
         self.assertTrue(subprocess.run(["/bin/ps", "-p", str(record["server_pid"])], capture_output=True).returncode, "the server outlived its pane")
         self.say("server after its pane closed", "gone")
+
+
+    def test_6_an_idle_coordinator_is_woken_through_its_server_with_a_receipt_by_the_one_watcher(self):
+        kit, session, problem = self.open()
+        print("\nwake through the server:")
+        self.assertEqual(problem, "")
+        self.track_a_session_whose_pane_is_gone()
+        seen = {m["id"] for m in self.api("GET", f"/session/{session}/message")}  # the canary turn is over: the session is idle
+        digest = self.start_as(session)
+        self.assertEqual(digest.returncode, 0, digest.stderr)
+        line = next(l for l in digest.stdout.splitlines() if l.startswith("watcher:"))
+        self.say("bin/zed start", line)
+        self.assertRegex(line, r"^watcher: was NOT RUNNING; started now, pid \d+$")
+        pid = self.watcher_pid()
+        self.assertEqual(line.rsplit(" ", 1)[1], str(pid))
+
+        event, told = self.woken(session, seen)
+        self.say("event", f"[E{event['id']}] {event['text']}")
+        self.say("receipt", event["wake"])
+        self.assertEqual((event["wake"]["via"], event["wake"]["message"]), ("api", told["id"]))  # the id the server gave the admitted prompt
+        self.assertIn("smoke-gone", event["text"])
+        self.assertIn(f"[E{event['id']}]", json.dumps(told))
+        self.say("admitted message", f"{told['id']} type {told['type']}; an assistant message followed")
+
+        again = self.start_as(session)
+        self.say("bin/zed start again", next(l for l in again.stdout.splitlines() if l.startswith("watcher:")))
+        self.assertIn(f"watcher: alive, pid {pid}", again.stdout)
+        env = self.env | {"OPENCODE_SESSION_ID": session, "ZED_COORDINATOR": str(self.record)}
+        second = subprocess.run([sys.executable, str(HOME / "bin" / "zed"), "watch", "--daemon"], env=env, capture_output=True, text=True, timeout=60)
+        self.say("a second watcher", f"exit {second.returncode}: {second.stdout.strip()}")
+        self.assertEqual((second.returncode, self.watcher_pid()), (4, pid))
+        self.assertIn(f"WATCH_ALREADY_RUNNING pid {pid}", second.stdout)
+        running = subprocess.run(["/usr/bin/pgrep", "-f", f"watch --daemon"], capture_output=True, text=True).stdout.split()
+        mine = [p for p in running if str(self.profile) in subprocess.run(["/bin/ps", "eww", "-p", p], capture_output=True, text=True).stdout]
+        self.say("watchers of this profile", mine)
+        self.assertEqual(mine, [str(pid)])
+        self.assertEqual(zedlib.git(HOME, "status", "--porcelain").stdout, self.before)
+
+    @unittest.skipUnless(herdr_up(), "herdr is not running")
+    def test_7_when_the_server_refuses_the_wake_is_typed_into_the_coordinators_pane(self):
+        ws = json.loads(subprocess.run(["herdr", "workspace", "create", "--cwd", str(HOME), "--label", "zed wake smoke", "--no-focus",
+                                        "--env", f"ZED_PROFILE_DIR={self.profile}"], capture_output=True, text=True).stdout)["result"]
+        ws_id, pane = ws["workspace"]["workspace_id"], ws["root_pane"]["pane_id"]
+        self.addCleanup(subprocess.run, ["herdr", "workspace", "close", ws_id], capture_output=True)
+        time.sleep(1.5)
+        subprocess.run(["herdr", "pane", "run", pane, f"{HOME}/bin/zed coordinator"], capture_output=True)
+        deadline = time.monotonic() + 240
+        while not self.record.exists():
+            self.assertLess(time.monotonic(), deadline, subprocess.run(["herdr", "pane", "read", pane], capture_output=True, text=True).stdout)
+            time.sleep(2)
+        record = json.loads(self.record.read_text())
+        self.server, session = record["server"], record["session"]
+        print("\nwake typed into the pane:")
+        deadline = time.monotonic() + 60  # the TUI is up once herdr sees an idle OpenCode agent in the pane
+        while (self.z.pane_record(pane) or {}).get("agent_status") != "idle":
+            self.assertLess(time.monotonic(), deadline, "the TUI did not open: "
+                            + subprocess.run(["herdr", "pane", "get", pane], capture_output=True, text=True).stdout)
+            time.sleep(1)
+        self.track_a_session_whose_pane_is_gone()
+        seen = {m["id"] for m in self.api("GET", f"/session/{session}/message")}
+        self.record.write_text(json.dumps(record | {"server": record["server"] | {"password": "wrong"}}))  # the watcher's call will be refused
+        env = self.env | {"OPENCODE_SESSION_ID": session, "ZED_COORDINATOR": str(self.record), "HERDR_PANE_ID": pane}
+        digest = subprocess.run([sys.executable, str(HOME / "bin" / "zed"), "start"], env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(digest.returncode, 0, digest.stderr)
+        self.say("bin/zed start", next(l for l in digest.stdout.splitlines() if l.startswith("watcher:")))
+        lock = json.loads((self.profile / ".cache" / "zed.lock").read_text())
+        self.assertEqual((lock["agent_session"], lock["pane"]), (session, pane))
+
+        event, told = self.woken(session, seen)
+        self.say("event", f"[E{event['id']}] {event['text']}")
+        self.say("receipt", event["wake"])
+        self.assertEqual(event["wake"]["via"], "herdr")
+        self.assertIn("401", event["wake"]["api_error"])
+        self.assertIn(f"[E{event['id']}]", json.dumps(told))
+        self.say("message the TUI submitted", f"{told['id']} type {told['type']}; an assistant message followed")
+        self.record.write_text(json.dumps(record))
 
 
 if __name__ == "__main__":

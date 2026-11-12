@@ -126,6 +126,7 @@ class SpawnTests(AssignCase):
         self.assertEqual(hook["command"], str(HOME / "bin" / "zed-deny"))
         prompt = self.mock_prompt_worker.call_args.args[1]
         self.assertIn("You wear the build hat.", prompt)
+        self.assertIn(f"are in {HOME / 'bin'}: call them by that path when they are not on your PATH", prompt)  # S339: no bin/ on a worker's PATH
         self.assertIn("zed-employee finish", prompt)
         self.assertIn(str(out / "build-t20-rules.md"), prompt)
 
@@ -285,6 +286,8 @@ class FakeOpenCodeServer:
             command = re.search(r"zed-(deny|pretool)-canary \w+", self.prompts()[0]).group(0)
             if self.guard == "silent":
                 return [{"type": "assistant", "content": [{"type": "text", "text": "CHECKED"}]}]
+            if self.guard == "refused":  # the turn never ran: the message carries the provider's error
+                return [{"type": "assistant", "content": [], "error": {"type": "provider", "message": "429 usage limit reached"}}]
             denied = self.guard == "live"
             state = {"status": "error" if denied else "completed", "input": {"command": command}}
             if denied:
@@ -408,6 +411,12 @@ class OpenCodeTests(AssignCase):
         self.server.guard = "silent"
         self.refused_start("the model made no canary call, so the deny plugin is not proven live")
 
+    def test_a_turn_the_provider_refused_is_reported_with_its_error(self):
+        """S339: a usage limit showed only as "the model made no canary call"."""
+        self.server.guard = "refused"
+        self.refused_start("the model made no canary call, so the deny plugin is not proven live; the turn failed: ")
+        self.assertIn("429 usage limit reached", self.output.getvalue())
+
     def test_a_server_that_does_not_answer_fails_the_worker(self):
         self.server.up = False
         with patch.object(self.z, "OPENCODE_SERVER_SECONDS", 0):
@@ -443,33 +452,24 @@ class OpenCodeTests(AssignCase):
         self.assertIn(f'"ZED_WORKTREE": "{self.worktree}"', plugin)
         self.assertIn('const DENY_TOOLS = ["tracker_createIssue"];', plugin)
 
-    def test_session_identity_and_the_auto_armed_watcher_follow_opencode_env(self):
+    def test_session_identity_follows_opencode_env_and_a_claude_start_arms_no_watcher(self):
         with patch.dict(os.environ, {"OPENCODE_SESSION_ID": "oc-1", "OPENCODE_PID": "4242"}, clear=False):
             for k in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_PID"):
                 os.environ.pop(k, None)
             with patch.object(self.z, "pane_session", return_value=None):
                 self.assertEqual((self.z.me()["agent_session"], self.z.me()["pid"]), ("oc-1", 4242))
-            self.conn.execute("INSERT INTO sessions(task_id,repo,base,branch,worktree,agent,status,created_at,updated_at) "
-                              "VALUES (20,'api','main','b','/w','a','running','x','x')")
-            self.conn.commit()
-            armed = []
-            with patch.object(self.z, "holds_lock", return_value=True), patch.object(self.z, "cmd_lock"), \
-                    patch.object(self.z, "live_agents", return_value={}), patch.object(self.z, "queue_pending", return_value=[]), \
-                    patch.object(self.z, "script_findings", return_value=[]), \
-                    patch.object(self.z, "watcher_alive", return_value=None), \
-                    patch.object(self.z, "arm_watcher", side_effect=lambda: armed.append(1) or 99):
-                self.z.cmd_start([])
-            self.assertEqual(armed, [1])
-            self.assertIn("watcher: alive, pid 99", self.output.getvalue())
-            os.environ.pop("OPENCODE_SESSION_ID")  # a Claude Zed relies on its Stop hooks: start does not arm
-            armed.clear()
-            with patch.object(self.z, "holds_lock", return_value=True), patch.object(self.z, "cmd_lock"), \
-                    patch.object(self.z, "live_agents", return_value={}), patch.object(self.z, "queue_pending", return_value=[]), \
-                    patch.object(self.z, "script_findings", return_value=[]), \
-                    patch.object(self.z, "watcher_alive", return_value=None), \
-                    patch.object(self.z, "arm_watcher", side_effect=lambda: armed.append(1)):
-                self.z.cmd_start([])
-            self.assertEqual(armed, [])
+        self.conn.execute("INSERT INTO sessions(task_id,repo,base,branch,worktree,agent,status,created_at,updated_at) "
+                          "VALUES (20,'api','main','b','/w','a','running','x','x')")
+        self.conn.commit()
+        armed = []  # a Claude Zed relies on its Stop hooks: start does not arm (an OpenCode one: test_zed_coordinator)
+        with patch.object(self.z, "holds_lock", return_value=True), patch.object(self.z, "cmd_lock"), \
+                patch.object(self.z, "live_agents", return_value={}), patch.object(self.z, "queue_pending", return_value=[]), \
+                patch.object(self.z, "script_findings", return_value=[]), \
+                patch.object(self.z, "watcher_alive", return_value=None), \
+                patch.object(self.z, "arm_watcher", side_effect=lambda: armed.append(1)):
+            self.z.cmd_start([])
+        self.assertEqual(armed, [])
+        self.assertIn("watcher: NOT RUNNING — arm it: bin/zed watch --once (background)", self.output.getvalue())
 
 
 class RenderedPolicyTests(AssignCase):

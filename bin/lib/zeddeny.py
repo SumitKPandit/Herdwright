@@ -129,7 +129,7 @@ def identity_tampering(words):
     else:
         inner = " ".join(words[1:]) if name == "eval" else ""
     try:
-        return next((p for sub, _ in zedshell.split_commands(zedshell.tokens(inner)) if (p := identity_tampering(sub))), None)
+        return next((p for sub, _ in zedshell.scoped_commands(zedshell.tokens(inner)) if (p := identity_tampering(sub))), None)
     except ValueError:  # unbalanced quotes: fail open, like the rest of this hook
         return None
 
@@ -147,15 +147,9 @@ def shell_problem(cmd, manifest, worktree, profile, cwd):
         cwd = zedshell.scope_dir(dirs, scope)
         if problem := identity_tampering(words):
             return problem
-        words_before = [w for w in words if re.fullmatch(r"CDPATH=.*", w)] if words else []
-        while words and re.fullmatch(r"\w+=.*", words[0]):
-            words = words[1:]
-        if not words:
-            continue
-        if re.fullmatch(r"CDPATH=.*", words_before[0] if words_before else ""):
+        if any(re.fullmatch(r"CDPATH=.*", w) for w in takewhile(zedshell.ASSIGNMENT.fullmatch, words)):
             cwd = dirs[scope] = None  # `CDPATH=x cd y` may land anywhere
-        while words and (Path(words[0]).name in ("builtin", "command") or words[0] in ("{", "then", "do", "else")):
-            words = words[1:]  # a compound command's opener leaves the next word the command
+        words = zedshell.command_words(words)  # a compound command's opener or a wrapper leaves the next word the command
         if not words:
             continue  # only an opener (`do`, `then`) before the next `;`
         if Path(words[0]).name in zedshell.CD_COMMANDS:
@@ -168,10 +162,8 @@ def shell_problem(cmd, manifest, worktree, profile, cwd):
         if prefix := command_denied(words, deny.get("gated", [])):
             if reason := zedgates.gate_reason(worktree):
                 return f"`{prefix}` waits for a clean review and qa of this branch: {reason}"
-        targets = [words[i + 1] for i, w in enumerate(words[:-1]) if w in zedshell.REDIRECTS and not words[i + 1].startswith("&")]
+        targets = zedshell.redirect_targets(words) + zedshell.write_targets(words)
         name = Path(words[0]).name
-        if name in zedshell.FILE_WRITERS or (name in ("sed", "perl") and any(re.fullmatch(r"-\w*i\w*", w) for w in words[1:])):
-            targets += [w for w in words[1:] if not w.startswith("-")]
         for t in targets:
             if unresolved(t) or (cwd is None and not (Path(os.path.expanduser(t)).is_absolute())):
                 return f"writing {t} cannot be checked (the shell expands it or the directory is unknown): use a literal absolute path"

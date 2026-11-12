@@ -102,6 +102,11 @@ missed. Use the **same words** as in the `ZED:` block.
 
 Append with `echo 'needs-decision: …' >> <file>`. Do this **before** you print the block.
 
+Zed does not prompt a session that is working. If you asked a question and carried on with other steps, look for the
+answer between plan steps with one command: `{{ZED_HOME}}/bin/zed-employee answers` prints the user's answers you have
+not read and marks them read. An answer you have not read is prompted to you once you are idle. Check before you ask
+the same question again.
+
 ## Waits cost no turns
 
 Every turn you take resends your whole context, so a wait must cost as few turns as possible.

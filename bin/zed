@@ -797,9 +797,13 @@ def question(conn, ref):
     return q
 
 
-def answer_question(conn, q, ans):
-    """Record the user's answer; the task and the session stop waiting once none of their questions is open."""
-    conn.execute("UPDATE questions SET answer=?, status='answered', answered_at=? WHERE id=?", (ans, now(), q["id"]))
+def answer_question(conn, q, ans, delivered=False):
+    """Record the user's answer; the task and the session stop waiting once none of their questions is open.
+    `delivered`: the session that asked was just prompted with it. Otherwise it is left for that session to read
+    (`zed-employee answers`), and the watcher prompts it once it is idle (deliver_answers). A question no session asked
+    has nobody to deliver to."""
+    conn.execute("UPDATE questions SET answer=?, status='answered', answered_at=?, delivered_at=? WHERE id=?",
+                 (ans, now(), now() if delivered or not q["session_id"] else None, q["id"]))
     if q["task_id"]:
         log_event(conn, q["task_id"], "answer", f"Q{q['id']}: {ans}")
         touch_task(conn, q["task_id"])
@@ -830,7 +834,10 @@ def cmd_q(args):
                 parts.append(a)
         print(f"Q{add_question(conn, tid, sid, ' '.join(parts))}")
     elif sub == "answer":
-        answer_question(conn, question(conn, rest[0]), " ".join(rest[1:]))
+        q = question(conn, rest[0])
+        answer_question(conn, q, " ".join(rest[1:]))
+        if q["session_id"]:
+            print(f"recorded Q{q['id']}: S{q['session_id']} reads it with `zed-employee answers`, or the watcher prompts it once it is idle")
     elif sub == "list":
         for q in conn.execute("SELECT * FROM questions WHERE status='open' ORDER BY id"):
             ids = [f"{p}{q[k]}" for p, k in (("Q", "id"), ("T", "task_id"), ("S", "session_id")) if q[k] is not None]
@@ -919,10 +926,12 @@ def opencode_canary(server, session, program=zeddeny.CANARY_COMMAND, plugin="den
         f"Startup check. Call the shell tool exactly once with exactly this command: {command}\n"
         "It is expected to be refused. Do not retry it and do nothing else. Then reply with the single word CHECKED.")})
     opencode_api(server, "POST", f"/experimental/session/{session}/wait", timeout=OPENCODE_CANARY_SECONDS)  # the turn's end
-    calls = [part for m in opencode_api(server, "GET", f"/session/{session}/message") for part in m.get("content") or []
+    messages = opencode_api(server, "GET", f"/session/{session}/message")
+    calls = [part for m in messages for part in m.get("content") or []
              if part.get("type") == "tool" and ((part.get("state") or {}).get("input") or {}).get("command", "").strip() == command]
     if not calls:
-        return f"the model made no canary call, so the {plugin} is not proven live"
+        errors = [json.dumps(m["error"])[:300] for m in messages if m.get("error")]  # e.g. the provider refused the turn (a usage limit)
+        return f"the model made no canary call, so the {plugin} is not proven live" + (f"; the turn failed: {'; '.join(errors)}" if errors else "")
     state = calls[0]["state"]
     reason = str((state.get("error") or {}).get("message", ""))
     if state.get("status") == "error" and f"canary: `{command}`" in reason:
@@ -1092,6 +1101,7 @@ def cmd_brief(args):
             print(f"  line {n}: {FILL.search(line).group(0)}")
 
 
+SPAWN_SHELL_SECONDS = 1.5  # what spawn gives a new pane's shell to reach its prompt before a CLI is started in it
 SPAWN_KEYS = {"repo", "base", "branch", "brief", "name", "model", "effort", "kind", "from", "hat", "runtime"}
 
 def cmd_spawn(args):
@@ -1199,7 +1209,7 @@ def cmd_spawn(args):
     ws = herdr_json(["workspace", "create", "--cwd", str(worktree), "--label", label, "--no-focus",
                      *[a for e in env for a in ("--env", e)]])["result"]
     ws_id, pane_id = ws["workspace"]["workspace_id"], ws["root_pane"]["pane_id"]
-    time.sleep(1.5)  # let the shell reach its prompt
+    time.sleep(SPAWN_SHELL_SECONDS)
     runtime_session = None
     if runtime == "opencode":
         runtime_session, failure = start_opencode(agent, pane_id, worktree, kit, model, effort)
@@ -1234,6 +1244,9 @@ def cmd_spawn(args):
         die(f"S{sid}: {failure}" + (f"\nNo brief was handed over and S{sid} is marked failed; its workspace {ws_id} is left open "
                                     f"to inspect (server log: {kit['opencode_server']['log']}). Remove it with: bin/zed close S{sid}"
                                     if runtime == "opencode" else ""))
+
+    if coordinator_record() and not watcher_alive():  # OpenCode: tracked work never without the long-lived watcher
+        arm_watcher()
 
     # 3. hand over the brief
     require_lock()
@@ -1273,6 +1286,8 @@ def hat_intro(conn, hat, tid):
     task left (a fix or a re-review starts from them, not from anyone's memory of the work)."""
     text = (f"You wear the {hat} hat. "
             f"Skills load when they apply (`zed-employee skill show <name>`): {', '.join(emp.load_manifest(hat)['skills'])}. "
+            f"Zed's scripts (`zed-employee`, `zed-checks`, ...) are in {ZED_HOME / 'bin'}: call them by that path when they are "
+            f"not on your PATH. "
             f"Before ZED:DONE run `zed-employee finish`. ")
     findings = [r["text"] for r in conn.execute("SELECT text FROM events WHERE task_id=? AND kind='findings' ORDER BY id", (tid,))]
     if findings:
@@ -1341,12 +1356,15 @@ def note_decision(brief, line):
 
 def cmd_relay(args):
     """relay <Q> <answer> [<Q> <answer> …] [--redirect] — the user's answers to workers' questions, in one command and
-    in this order: every worker concerned is checked first (one that is `working` refuses the whole command unless
-    --redirect: nothing is sent and nothing recorded); then each worker is prompted with its answers verbatim (one
-    prompt per worker) and, once its prompt went through, its answers are recorded (as `q answer`) and noted in its
-    brief. A prompt that fails stops the command there: the workers before it are prompted and recorded, that one and
-    those after it are neither, so running the command again for them repeats nothing. A question no session asked
-    is only recorded."""
+    in this order: every worker concerned is checked first (one without a live agent refuses the whole command:
+    nothing is sent and nothing recorded); then each worker that is not `working` is prompted with its answers
+    verbatim (one prompt per worker) and, once its prompt went through, its answers are recorded (as `q answer`) and
+    noted in its brief. A `working` worker is not interrupted: its answers are recorded and noted, it reads them
+    between steps with `zed-employee answers`, and the watcher prompts it with what it has not read once it is idle
+    (--redirect prompts it at once instead). A prompt that fails stops the command there: the workers before it are
+    done, that one and those after it are neither prompted nor recorded, so running the command again for them repeats
+    nothing: an answer its worker already has in the same words is named and not sent again. A question no session
+    asked is only recorded."""
     redirect, args = "--redirect" in args, [a for a in args if a != "--redirect"]
     if not args or len(args) % 2:
         die('relay <Q> "<answer>" [<Q> "<answer>" …] [--redirect]: one quoted answer after each question id')
@@ -1355,25 +1373,44 @@ def cmd_relay(args):
     answers = [(question(conn, ref), ans.strip()) for ref, ans in zip(args[::2], args[1::2])]
     if blank := [f"Q{q['id']}" for q, ans in answers if not ans]:
         die(f"no answer given for {', '.join(blank)}")
+    has = [q for q, ans in answers if q["status"] == "answered" and q["answer"] == ans and q["delivered_at"]]
+    for q in has:  # a question no session asked has no worker to name
+        print(f"Q{q['id']}: already answered in these words" + (" and given to the worker; not sent again" if q["session_id"] else ""))
+    if has:
+        answers = [(q, ans) for q, ans in answers if q not in has]
+        if not answers:
+            return
     by_session = {}
     for q, ans in answers:
         by_session.setdefault(q["session_id"], []).append((q, ans))
     sessions = {sid: resolve_session(conn, sid) for sid in by_session if sid is not None}
-    if problems := [problem for s in sessions.values() if (problem := prompt_problem(s, redirect)[1])]:
+    states = {sid: prompt_problem(s, redirect=True) for sid, s in sessions.items()}  # `working` is no problem here: see below
+    if problems := [problem for _, problem in states.values() if problem]:
         die("; ".join(problems) + ". Nothing was sent and nothing recorded.")
+    recorded, left = [], []
     for sid, pairs in by_session.items():  # a session's record follows its own prompt: a later failure cannot undo or repeat it
         s = sessions.get(sid)
-        if s:
-            parts = [f"Answer from the user to your question Q{q['id']} ({q['question'].splitlines()[0][:120]}): {ans}" for q, ans in pairs]
-            send_prompt(conn, s, "\n".join(parts) + "\nContinue.", redirect, "relay: " + ", ".join(f"Q{q['id']}" for q, _ in pairs))
+        ids = ", ".join(f"Q{q['id']}" for q, _ in pairs)
+        busy = bool(s) and states[sid][0] == "working" and not redirect
+        if s and not busy:
+            try:
+                send_prompt(conn, s, "\n".join(zedlib.answer_line(q, ans) for q, ans in pairs) + "\nContinue.", redirect, f"relay: {ids}")
+            except SystemExit:
+                print(f"zed: recorded before this failure: {', '.join(recorded) or 'nothing'}. Not sent and not recorded: "
+                      + ", ".join(f"Q{q['id']}" for q, _ in answers if f"Q{q['id']}" not in recorded) + ".", file=sys.stderr)
+                raise
         for q, ans in pairs:
-            answer_question(conn, q, ans)
+            answer_question(conn, q, ans, delivered=not busy)
+            recorded.append(f"Q{q['id']}")
             if s and s["brief"] and Path(s["brief"]).is_file():
                 said = " ".join(ans.split())  # one list item, whatever line breaks the answer has
                 note_decision(Path(s["brief"]), f"- User ({now()}), Q{q['id']} \"{q['question'].splitlines()[0][:160]}\": \"{said}\"")
+        if busy:
+            left.append(f"S{sid} is working, so it was not prompted with {ids}: it reads them with `zed-employee answers`, "
+                        "or the watcher prompts it once it is idle")
         conn.commit()
         write_status(conn)
-    print("recorded " + ", ".join(f"Q{q['id']}" for q, _ in answers))
+    print("\n".join(["recorded " + ", ".join(recorded), *left]))
 
 
 def cmd_relay_post(args):
@@ -1676,7 +1713,9 @@ def limit_line(screen, last=25):
 # ---------------------------------------------------------------- worker reports
 
 BLOCK_START = re.compile(r"^ZED:(QUESTION|DONE|BLOCKED)\s*$")
-BLOCK_END = re.compile(r"^(```|[─━╭╰❯⏵✻✢✽]|.*\besc to\b)")  # closing fence or the CLI's prompt/footer chrome
+# what ends a block: a closing fence, or the CLI's chrome under a message. Claude Code: its rulers, prompt and footer.
+# OpenCode (v2.2.7): the line naming agent, model and time ("Build · <model> · 1.6s"), then the barred input box.
+BLOCK_END = re.compile(r"^(```|[─━╭╰❯⏵✻✢✽┃╹]|.*\besc to\b|\S+ · .+ · \d+(\.\d+)?(ms|s|m|h)\b)")
 BLOCK_MAX_LINES = 80           # a marker with more text than this after it is old output, not a final report
 DONE_FIELDS = ("Summary", "Branch", "PR", "QA", "Follow-ups", "Learnings")
 NO_QA = re.compile(r"^\W*(none|n/?a|not (run|done|tested)|skipped|no qa|-)?\W*$", re.I)
@@ -1783,9 +1822,30 @@ def block_known(conn, s, block):
                for t in block["items"])
 
 
-def record_block(conn, s, block):
-    """Do the DB bookkeeping for a worker's report (what `check-workers` did by hand) and return the
-    text to put in the watcher event."""
+def asked_again(conn, s, block, seen, from_status):
+    """A worker that asks again, in the same words, what the user has already answered is answered from the record:
+    the answer counts as not given, so the worker reads it (`zed-employee answers`) or the watcher prompts it once it is
+    idle, and the user is not asked twice. Returns the ids of the questions asked again. A block on the screen that
+    only repeats what the status file just said (`seen`) is the same asking, not another one."""
+    if block["kind"] == "DONE":
+        return []
+    prefix = "BLOCKED: " if block["kind"] == "BLOCKED" else ""
+    ids = [r["id"] for t in block["items"]
+           if (r := conn.execute("SELECT id FROM questions WHERE session_id=? AND question=? AND status='answered'", (s["id"], prefix + t)).fetchone())]
+    if not ids or (not from_status and set(ids) <= set(seen.pop("asked_again", []))):
+        return ids
+    if from_status:
+        seen["asked_again"] = ids
+    conn.execute(f"UPDATE questions SET delivered_at=NULL WHERE id IN ({','.join('?' * len(ids))})", ids)
+    log_event(conn, s["task_id"], "auto", f"S{s['id']} asked {', '.join(f'Q{i}' for i in ids)} again; the user has answered: "
+                                          "the answer goes to it again from the record")
+    return ids
+
+
+def record_block(conn, s, block, again=()):
+    """Do the DB bookkeeping for a worker's report (what `check-workers` did by hand) and return the text to put in
+    the watcher event, or None when there is nothing for Zed in it: every question in it is one of `again`
+    (asked_again), which the record answers."""
     sid, tid = s["id"], s["task_id"]
     if block["kind"] in ("QUESTION", "BLOCKED"):
         out = []
@@ -1793,9 +1853,11 @@ def record_block(conn, s, block):
             if block["kind"] == "BLOCKED":
                 text = f"BLOCKED: {text}"
             known = conn.execute("SELECT id FROM questions WHERE session_id=? AND question=?", (sid, text)).fetchone()
+            if known and known["id"] in again:
+                continue
             qid = known["id"] if known else add_question(conn, tid, sid, text)
             out.append(f"Q{qid}{' (already recorded)' if known else ''}: {text}")
-        return f"ZED:{block['kind']}\n" + "\n".join(out)
+        return f"ZED:{block['kind']}\n" + "\n".join(out) if out else None
     f = block["fields"]
     summary = f.get("Summary", "").strip()
     if not conn.execute("SELECT 1 FROM events WHERE task_id=? AND kind='done' AND text=?", (tid, summary)).fetchone():
@@ -1832,9 +1894,10 @@ def settle_turn(conn, s, screen, alerts, line, seq):
     if block and seen.get("block") != block["fingerprint"]:
         seen["block"], seen["nudges"] = block["fingerprint"], 0
         seen.pop("lapse", None)
-        if block_known(conn, s, block):  # already reported from the worker's status file
+        again = asked_again(conn, s, block, seen, from_status=False)
+        if block_known(conn, s, block):  # already reported from the worker's status file, or answered from the record
             return None
-        return f"{line}\n{record_block(conn, s, block)}"
+        return f"{line}\n{record_block(conn, s, block, again)}"
     hit = limit_line(screen)
     if hit:
         if seen.get("limit") == hit:
@@ -1864,9 +1927,10 @@ def scan_working(conn, s, alerts):
     seen["block"], seen["nudges"] = block["fingerprint"], 0
     seen.pop("pending")
     seen.pop("lapse", None)
+    again = asked_again(conn, s, block, seen, from_status=False)
     if block_known(conn, s, block):
         return None
-    return f"S{s['id']} T{s['task_id']} {s['agent']} · new ZED:{block['kind']} while still working\n{record_block(conn, s, block)}"
+    return f"S{s['id']} T{s['task_id']} {s['agent']} · new ZED:{block['kind']} while still working\n{record_block(conn, s, block, again)}"
 
 
 PR_POLL_SECONDS = 300  # how often the watcher looks at a session's open PR (gh: no model tokens)
@@ -1924,16 +1988,47 @@ def lapse_tick(s, state, seq, alerts):
                     "(read its screen; it may be waiting on something or lost)")
 
 
+def deliver_answers(conn, s, seq, alerts):
+    """Prompt an idle worker with the user's answers it has not read (it asked and carried on, and `relay` left it
+    alone; or the answer came by `q answer`). Each answer is claimed before the prompt is sent, so one the worker reads
+    at the same moment is not sent as well. Returns an event line when the prompt did not go through, whichever way it
+    failed (herdr refusing ends `prompt_worker` with `die`): the claim is given back at once, so the answers stay
+    recorded and unread, and are not tried again until the worker's state changes."""
+    seen = alerts.setdefault(s["id"], {})
+    if seen.get("answers_failed") == seq:
+        return None
+    taken = zedlib.take_answers(conn, s["id"], now())
+    if not taken:
+        return None
+    conn.commit()  # the claim is visible to the worker's own `zed-employee answers` before the prompt is on its way
+    ids = ", ".join(f"Q{q['id']}" for q in taken)
+    try:
+        ok, error = prompt_worker(s["agent"], "\n".join(zedlib.answer_line(q) for q in taken) + "\nContinue.")
+    except (Exception, SystemExit) as e:
+        ok, error = False, "herdr refused (its reason is in the watcher's output)" if isinstance(e, SystemExit) else f"{type(e).__name__}: {e}"
+    if ok:
+        seen.pop("answers_failed", None)
+        log_event(conn, s["task_id"], "prompt", f"S{s['id']} answers it had not read, sent by the watcher: {ids}")
+        return None
+    seen["answers_failed"] = seq
+    conn.execute(f"UPDATE questions SET delivered_at=NULL WHERE id IN ({','.join('?' * len(taken))})", [q["id"] for q in taken])
+    conn.commit()  # given back now: an error later in this look must not leave them marked as given
+    return (f"S{s['id']} T{s['task_id']} {s['agent']} · the answers to {ids} could not be prompted to it ({error.strip()[:200]}): "
+            "they stay recorded for `zed-employee answers`; read its screen")
+
+
 _watcher_lock = None  # held open for the life of this watcher; the kernel drops it when the process dies
 
 
 MAX_SHOWS = 3  # an un-acked wake is re-presented by `watch` until it has been shown this many times
+REPRESENT_SECONDS = 300  # the long-lived watcher shows an event again when it is still un-acked this long after it was last shown
 
 
 @contextlib.contextmanager
 def wake_queue():
-    """The durable wake queue ({"next": n, "events": [{"id", "ts", "text", "shown", "acked"}]}), under a file lock
-    because the watcher appends while Zed acks. Changes are saved on exit."""
+    """The durable wake queue ({"next": n, "events": [{"id", "ts", "text", "shown", "shown_at", "acked", "wake"}]}),
+    under a file lock because the watcher appends while Zed acks. Changes are saved on exit. `shown_at` is when the
+    event was last shown (epoch); `wake` is the receipt of the long-lived watcher's last prompt for it (wake_coordinator)."""
     WAKE_QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(WAKE_QUEUE_PATH.with_suffix(".guard"), "w") as guard:
         fcntl.flock(guard, fcntl.LOCK_EX)
@@ -1947,21 +2042,31 @@ def queue_add(lines):
     out = []
     with wake_queue() as q:
         for text in lines:
-            q["events"].append({"id": q["next"], "ts": now(), "text": text, "shown": 1, "acked": False})
+            q["events"].append({"id": q["next"], "ts": now(), "text": text, "shown": 1, "shown_at": time.time(), "acked": False})
             out.append(f"[E{q['next']}] {text}")
             q["next"] += 1
     return out
 
 
-def queue_represent():
+def queue_represent(older_than=0):
     """Un-acked events to show again (a handling turn that crashed or hit a limit never acked them). Each is
     re-presented at most MAX_SHOWS times in total so a forgotten ack can't wake Zed forever; `zed start` lists
-    them regardless."""
+    them regardless. `older_than`: only those last shown at least that many seconds ago (the long-lived watcher asks
+    on every look; a one-shot watcher shows them all once, when it starts)."""
     with wake_queue() as q:
-        again = [e for e in q["events"] if not e["acked"] and e["shown"] < MAX_SHOWS]
+        again = [e for e in q["events"] if not e["acked"] and e["shown"] < MAX_SHOWS and time.time() - e.get("shown_at", 0) >= older_than]
         for e in again:
-            e["shown"] += 1
+            e["shown"], e["shown_at"] = e["shown"] + 1, time.time()
         return [f"[E{e['id']}] (again, un-acked since {e['ts']}) {e['text']}" for e in again]
+
+
+def queue_receipt(lines, receipt):
+    """Keep `receipt` (wake_coordinator) on the queued events among `lines`."""
+    ids = {int(m.group(1)) for line in lines if (m := re.match(r"\[E(\d+)\]", line))}
+    with wake_queue() as q:
+        for e in q["events"]:
+            if e["id"] in ids:
+                e["wake"] = receipt
 
 
 def queue_pending():
@@ -2017,21 +2122,51 @@ def claim_watcher():
     return True
 
 
+WAKE_HEADING = "Watcher events for Zed. Handle each one, then retire it with `bin/zed ack E<id>`:"
+
+
+def wake_coordinator(record, pane, lines):
+    """Start a turn of the coordinator's OpenCode session (`record`: what `bin/zed coordinator` wrote) with `lines`,
+    from outside it: its server admits the prompt to the session's inbox and returns the message's id, which is the
+    receipt. When the call fails the text is typed into the coordinator's herdr `pane` instead (`herdr agent prompt`),
+    which proves less: only that it was submitted. Returns the receipt: {"via": "api", "message": <id>} | {"via": "herdr",
+    "api_error"} | {"via": None, "error"}, each with "at"."""
+    text = "\n".join([WAKE_HEADING, *lines])
+    try:
+        admitted = opencode_api(record["server"], "POST", f"/session/{record['session']}/prompt", {"text": text})
+        return {"via": "api", "message": admitted["id"], "at": now()}
+    except Exception as e:  # also a server that dies mid-answer (http.client): the watcher must outlive it
+        error = f"{type(e).__name__}: {e}"
+    typed = run(["herdr", "agent", "prompt", pane, text], check=False) if pane else None
+    if typed is not None and typed.returncode == 0:
+        return {"via": "herdr", "api_error": error, "at": now()}
+    return {"via": None, "error": f"{error}; herdr: {(typed.stderr or typed.stdout).strip() if typed else 'this session is in no herdr pane'}", "at": now()}
+
+
 def cmd_watch(args):
-    """Emit one line whenever a managed worker changes to a state that needs Zed's attention. Run it under the
-    Monitor tool, or as `watch --once`, which exits after the first event(s) and remembers what it has reported so
-    a re-armed watch only reports new changes. Exits (3) when this session loses the Zed lock."""
-    once = "--once" in args
+    """Emit one line whenever a managed worker changes to a state that needs Zed's attention. Three ways to run it:
+      watch            under the Monitor tool: prints events until stopped
+      watch --once     exits after the first event(s) and remembers what it has reported, so a re-armed watch only
+                       reports new changes (Claude Code: the Stop hook re-arms it after every turn)
+      watch --daemon   OpenCode, which has no such hook: one long-lived process, started by `start`. For every new
+                       event, and for one still un-acked REPRESENT_SECONDS after it was last shown, it wakes the
+                       coordinator's session through its server (wake_coordinator) and keeps the receipt on the event.
+                       It ends when the coordinator's server is gone.
+    One watcher per profile. Exits (3) when this session loses the Zed lock."""
+    once, daemon = "--once" in args, "--daemon" in args
     until_idle = "--exit-when-idle" in args  # the Stop hook's watcher gives up when no work is tracked any more
     idle_ticks, tracked = 0, True
     rest = [a for a in args if not a.startswith("--")]
     interval = float(rest[0]) if rest else 3.0
     db().close()
     require_lock()
+    record, pane = (coordinator_record(), me()["pane"]) if daemon else (None, None)
+    if daemon and not record:
+        die("`watch --daemon` wakes an OpenCode coordinator through its server: it runs in a session opened by `bin/zed coordinator`")
     if not claim_watcher():
         print(f"WATCH_ALREADY_RUNNING pid {watcher_alive()}: one watcher is enough; it will wake Zed.", flush=True)
         sys.exit(4)
-    again = queue_represent()
+    again = [] if daemon else queue_represent()  # the long-lived watcher was started by `start`, which lists them itself
     for line in again:
         print(line, flush=True)
     if once and again:
@@ -2044,9 +2179,15 @@ def cmd_watch(args):
     while True:
         if not holds_lock():
             h = read_lock()
-            print("LOCK LOST: " + (f"another session took over as Zed ({describe(h)})" if h else "the Zed lock was released")
-                  + ". Stop acting as Zed: no watcher, relaying or commits; read-only from now on.", flush=True)
+            lost = ("LOCK LOST: " + (f"another session took over as Zed ({describe(h)})" if h else "the Zed lock was released")
+                    + ". Stop acting as Zed: no watcher, relaying or commits; read-only from now on.")
+            print(lost, flush=True)
+            if daemon and server_alive(record):
+                wake_coordinator(record, pane, [lost])
             sys.exit(3)
+        if daemon and not server_alive(record):
+            print("COORDINATOR GONE: its OpenCode server has stopped, so there is no session to wake. The watcher ends.", flush=True)
+            return False
         events = []
         try:
             conn = db()
@@ -2063,8 +2204,9 @@ def cmd_watch(args):
                 for block in status_blocks(new_status_lines(s, alerts)):
                     alerts[s["id"]]["nudges"] = 0
                     alerts[s["id"]].pop("lapse", None)
-                    events.append(f"S{s['id']} T{s['task_id']} {s['agent']} · status file: ZED:{block['kind']}\n"
-                                  + record_block(conn, s, block))
+                    report = record_block(conn, s, block, asked_again(conn, s, block, alerts[s["id"]], from_status=True))
+                    if report:
+                        events.append(f"S{s['id']} T{s['task_id']} {s['agent']} · status file: ZED:{block['kind']}\n{report}")
                 snapshot = {"state": state, "sequence": a.get("state_change_seq") if a else None}
                 if prev.get(key) != snapshot:
                     line = None
@@ -2090,6 +2232,8 @@ def cmd_watch(args):
                     prev[key] = snapshot
                 if state == "working" and (line := scan_working(conn, s, alerts)):
                     events.append(line)
+                if state in ("idle", "done") and not s["external"] and (line := deliver_answers(conn, s, snapshot["sequence"], alerts)):
+                    events.append(line)
                 lapse = lapse_tick(s, state, snapshot["sequence"], alerts)
                 if lapse:
                     kind, text = lapse
@@ -2105,11 +2249,18 @@ def cmd_watch(args):
             conn.close()
         except Exception as e:  # keep the watch alive through transient failures
             print(f"watch error: {e}", file=sys.stderr, flush=True)
-        for line in queue_add(events):
-            print(line, flush=True)
+        shown = queue_add(events) + (queue_represent(REPRESENT_SECONDS) if daemon else [])
+        # What this look has seen is saved as soon as its events are queued, before the wake (a call that can take
+        # long): a watcher stopped in between would have its successor read the same reports and raise them again.
         WATCH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         WATCH_STATE_PATH.write_text(json.dumps(prev))
         alerts_path.write_text(json.dumps(alerts))
+        for line in shown:
+            print(line, flush=True)
+        if daemon and shown:
+            receipt = wake_coordinator(record, pane, shown)
+            queue_receipt(shown, receipt)
+            print(f"woke the coordinator: {json.dumps(receipt)}", flush=True)
         if once and events:
             return True
         idle_ticks = 0 if tracked else idle_ticks + 1
@@ -2388,10 +2539,19 @@ def script_findings(label, script, *args, limit=6):
     return [f"{label}:", *(f"  {l[:200]}" for l in lines[:limit]), *([f"  … {len(lines) - limit} more (bin/{script})"] if len(lines) > limit else [])]
 
 
+WATCH_LOG_BYTES = 1_000_000  # the long-lived watcher's log is cut back to its last half of this when it has grown past it
+
+
 def arm_watcher():
-    """Start one detached `watch --once` for this profile and return its pid once it holds the watcher lock (or None)."""
-    with open(PROFILE_DIR / ".cache" / "watch.log", "w") as log:
-        subprocess.Popen([str(ZED_HOME / "bin" / "zed"), "watch", "--once"], stdout=log, stderr=subprocess.STDOUT,
+    """Start the detached long-lived watcher of an OpenCode coordinator (`watch --daemon`) for this profile and return
+    its pid once it holds the watcher lock (or None). What it prints is in the profile's .cache/watch.log, which keeps
+    what the watcher before this one said last (why it ended) and does not grow for ever."""
+    path = PROFILE_DIR / ".cache" / "watch.log"
+    if path.exists() and path.stat().st_size > WATCH_LOG_BYTES:
+        kept = path.read_bytes()[-WATCH_LOG_BYTES // 2:]
+        path.write_bytes(kept.partition(b"\n")[2] or kept)  # from its first whole line
+    with open(path, "a") as log:
+        subprocess.Popen([sys.executable, str(ZED_HOME / "bin" / "zed"), "watch", "--daemon"], stdout=log, stderr=subprocess.STDOUT,
                          start_new_session=True)
     for _ in range(20):
         time.sleep(0.25)
@@ -2574,9 +2734,13 @@ def cmd_start(args):
            f"lock: {'held by this session' if holds_lock() else describe(lock) if lock else 'none'}"]
     watcher = watcher_alive()
     running = conn.execute("SELECT COUNT(*) FROM sessions WHERE status IN ('running','waiting_user')").fetchone()[0]
-    if not watcher and running and holds_lock() and os.environ.get("OPENCODE_SESSION_ID"):
-        watcher = arm_watcher()  # OpenCode has no blocking Stop hook to re-arm it after each turn: arm it here
-    out.append(f"watcher: {'alive, pid ' + str(watcher) if watcher else 'NOT RUNNING' + (' — arm it: bin/zed watch --once (background)' if running else '')}")
+    if record and holds_lock():  # OpenCode has no Stop hook to re-arm a watcher after each turn: one long-lived watcher
+        started = None if watcher else arm_watcher()
+        out.append(f"watcher: alive, pid {watcher}" if watcher else
+                   f"watcher: was NOT RUNNING; started now, pid {started}" if started else
+                   f"watcher: NOT RUNNING and it did not start: read {PROFILE_DIR / '.cache' / 'watch.log'}")
+    else:
+        out.append(f"watcher: {'alive, pid ' + str(watcher) if watcher else 'NOT RUNNING' + (' — arm it: bin/zed watch --once (background)' if running else '')}")
     out.append(context_line())
     reading = ", ".join(str(p) for p in start_reading() if p.exists())
     out.append(f"already in your instructions: {reading}" if record else f"read now: {reading}")
@@ -2621,7 +2785,8 @@ def cmd_help(args):
                                      the way to prompt a worker: refused while it is `working` unless --redirect
   relay <Q> "<answer>" [<Q> "<answer>" …] [--redirect]
                                      the user's answers in one step: prompt each worker verbatim, record the answers,
-                                     note them in the session's brief
+                                     note them in the session's brief. A working worker is not prompted: it reads
+                                     its answers (`zed-employee answers`), or the watcher prompts it once it is idle
   relay-post <S|agent> <words-file> --action "<exact action>" [--redirect] [--print]
                                      relay the user's OK to post: their words verbatim + the exact action
   gate check <sha|branch> [dir]      exit 1 unless the commit's code (profile/ ignored) has a clean review and qa by non-authors (read-only)
@@ -2632,7 +2797,10 @@ def cmd_help(args):
                                      turn-end guard; act only in the session holding the lock
   ack <E-id>... | ack --all          retire handled watcher events; un-acked ones are shown again by `watch`
                                      (up to 3 times) and always by `start`
-  watch [interval-seconds] [--once]  run under Monitor, or `watch --once` as a background shell; exits after the first event(s)
+  watch [interval-seconds] [--once | --daemon]
+                                     run under Monitor, or `watch --once` as a background shell: exits after the first
+                                     event(s). --daemon (OpenCode; `start` runs it): long-lived, wakes the coordinator's
+                                     session through its server for each event and keeps the receipt
   doctor [--quiet]                   check the always-loaded context budget (4000 words; context_budget_words in
                                      config/settings.json); exits 1 when over. The pre-commit hook runs it
   status [--brief]                   (regenerate + print STATUS.md; --brief: only what needs attention)
@@ -2653,8 +2821,12 @@ COMMANDS = {"task": cmd_task, "log": cmd_log, "q": cmd_q, "spawn": cmd_spawn, "s
             "prompt": cmd_prompt, "relay": cmd_relay, "relay-post": cmd_relay_post, "gate": cmd_gate, "merge": cmd_merge, "close": cmd_close, "adopt": cmd_adopt, "watch": cmd_watch, "status": cmd_status,
             "brief": cmd_brief, "landed": cmd_landed, "doctor": cmd_doctor, "ack": cmd_ack, "hook": cmd_hook, "paths": cmd_paths, "start": cmd_start, "coordinator": cmd_coordinator, "runtime": cmd_runtime, "lock": cmd_lock, "help": cmd_help}
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+def main(argv):
+    if not argv or argv[0] not in COMMANDS:
         cmd_help([])
-        sys.exit(0 if len(sys.argv) < 2 else 2)
-    COMMANDS[sys.argv[1]](sys.argv[2:])
+        sys.exit(0 if not argv else 2)
+    COMMANDS[argv[0]](argv[1:])
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

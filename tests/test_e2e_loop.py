@@ -1,7 +1,8 @@
 """The core loop, end to end: the real `bin/zed` (and `zed-employee`, `zed-guard`) against a fake herdr and a fake
 agent CLI (tests/fakes/), in a throwaway profile and a throwaway git repo (tests/_e2e.py).
 
-One named test per claim:
+One named test per claim. Every class runs once per runtime (`WatchOnClaude`, `WatchOnOpenCode`, ...): the same
+tests, with the coordinator and the workers on Claude Code, then on OpenCode.
 
 | Claim                                                             | Test                                                                 |
 |-------------------------------------------------------------------|----------------------------------------------------------------------|
@@ -23,6 +24,12 @@ One named test per claim:
 | A DONE without QA is flagged                                      | Watch.test_a_done_without_qa_is_flagged                              |
 | An answer is relayed verbatim and recorded; a working worker is   | Relay.test_an_answer_is_relayed_verbatim_and_recorded_and_a_working_ |
 | not interrupted                                                   | worker_is_not_interrupted                                            |
+| A worker that asked and kept working reads its answer without     | Answers.test_a_worker_that_asked_and_kept_working_reads_its_answer_  |
+| being interrupted, and is not sent it as well                     | without_being_interrupted                                            |
+| An answer a busy worker did not read is prompted to it once, when | Answers.test_an_answer_a_busy_worker_did_not_read_is_prompted_once_  |
+| it is idle                                                        | when_it_is_idle                                                      |
+| A question asked again after its answer is answered from the      | Answers.test_a_question_asked_again_is_answered_from_the_record_and_ |
+| record and does not reach the user twice                          | not_put_to_the_user_again                                            |
 | Closing refuses unlanded work                                     | Close.test_closing_refuses_unlanded_work                             |
 | Closing removes a landed worktree                                 | Close.test_closing_removes_a_landed_worktree                         |
 | A second coordinator cannot take the lock silently                | Lock.test_a_second_coordinator_cannot_take_the_lock_silently         |
@@ -34,7 +41,7 @@ One named test per claim:
 import subprocess
 import unittest
 
-from _e2e import BASE, REPO, RUN_ZED, LoopCase, ask, done
+from _e2e import BASE, REPO, RUN_ZED, LoopCase, ask, done, per_runtime
 
 BRANCH = "task/demo"
 FINISH = {"run": ["{bin}/zed-employee", "finish"]}
@@ -105,9 +112,13 @@ class Spawn(LoopCase):
         brief = self.w.profile / "briefs" / f"T{s['tid']}-{REPO}.md"
         self.assertEqual(agent["facts"]["brief"], str(brief))
         self.assertEqual(agent["facts"]["status_file"], str(self.w.profile / ".cache" / "status" / f"{s['session']}.log"))
-        self.assertEqual(agent["facts"]["rules"], agent["launch"]["rules"])  # the rules it is told to read are the ones it runs under
-        with open(agent["launch"]["rules"]) as rules:
-            self.assertIn("Hat: build", rules.read())
+        rules = self.w.worker_rules(s["agent"])
+        self.assertIn("Hat: build", rules.read_text())
+        if self.RUNTIME == "claude":
+            self.assertEqual(agent["facts"]["rules"], str(rules))  # the rules it is told to read are the ones it runs under
+        else:  # OpenCode loaded them as an instruction file: the brief names no second copy
+            self.assertIn("Your worker rules are already in your instructions", agent["prompts"][0])
+            self.assertIsNone(agent["facts"]["rules"])
 
         # the worktree is guarded: its own branch takes a commit, a protected one does not
         (worktree / "a.txt").write_text("a\n")
@@ -120,6 +131,8 @@ class Spawn(LoopCase):
         self.assertIn("refusing to commit on protected branch", r.stderr)
 
     def test_the_trust_dialog_of_a_new_worktree_is_accepted(self):
+        if self.RUNTIME != "claude":
+            self.skipTest("the folder-trust dialog is Claude Code's: OpenCode v2.2.7 opened a new folder without one")
         s = self.w.started(BRANCH, start={"dialog": TRUST_DIALOG})
         agent = self.w.agent(s["agent"])
         self.assertEqual(agent["keys"], [["down", "enter"]])
@@ -261,6 +274,121 @@ class Relay(LoopCase):
         self.w.zed("prompt", s["session"], "--redirect", "Stop and do something else")
         self.assertEqual(self.w.agent(s["agent"])["queued"], ["Stop and do something else"])
         self.assertEqual(self.w.events("prompt"), ["S1 prompted by Zed", "S1 prompted by Zed (redirect)"])
+
+
+class Answers(LoopCase):
+    """On 2026-11-11 a worker asked, went on with other steps, and waited over an hour for an answer the user had
+    given: nothing prompts a working session, and it asked again."""
+    ASKING = {"status": "needs-decision: Red or blue?"}  # in its status file only: the turn goes on
+    READ = {"run": ["{bin}/zed-employee", "answers"]}
+    GIVEN = "Answer from the user to your question Q1 (Red or blue?): Blue, as on the home page.\nContinue."
+
+    def asked(self, *turns):
+        """A worker that has asked Q1 as `turns` say, the question reported and acknowledged."""
+        s = self.w.started(BRANCH, turns=list(turns))
+        self.assertIn("Q1: Red or blue?", self.w.watch_once().stdout)
+        self.w.ack_all()
+        return s
+
+    def relay(self):
+        return self.w.zed("relay", "Q1", "Blue, as on the home page.").stdout
+
+    def delivered(self):
+        return self.w.rows("SELECT status, delivered_at IS NOT NULL AS given FROM questions")
+
+    def test_a_worker_that_asked_and_kept_working_reads_its_answer_without_being_interrupted(self):
+        s = self.asked([self.ASKING, {"pause": True}, self.READ, self.READ, {"pause": True}])
+        self.assertIn("S1 is working, so it was not prompted with Q1: it reads them with `zed-employee answers`", self.relay())
+        agent = self.w.agent(s["agent"])
+        self.assertEqual((agent["status"], len(agent["prompts"]), agent["queued"]), ("working", 1, []))  # left alone
+        self.assertEqual(self.delivered(), [{"status": "answered", "given": 0}])
+        self.assertNotIn("[E", self.w.watch_ticks(2))  # still working: the watcher sends nothing either
+        self.assertEqual(len(self.w.agent(s["agent"])["prompts"]), 1)
+
+        self.w.advance(s["agent"])  # its next step: it looks for answers, twice
+        first, second = self.w.agent(s["agent"])["results"]
+        self.assertEqual((first["rc"], first["out"].strip()), (0, self.GIVEN.splitlines()[0]))
+        self.assertEqual(second["out"].strip(), "no new answers")
+        self.assertEqual(self.delivered(), [{"status": "answered", "given": 1}])
+
+        self.w.advance(s["agent"])  # its turn ends: what it has read is not prompted to it as well
+        self.w.age_sessions()
+        self.assertNotIn("[E", self.w.watch_ticks(3))
+        self.assertEqual(len(self.w.agent(s["agent"])["prompts"]), 1)
+        self.assertEqual(self.w.events("prompt"), [])
+
+    def test_an_answer_a_busy_worker_did_not_read_is_prompted_once_when_it_is_idle(self):
+        s = self.asked([self.ASKING, {"pause": True}], [{"say": "Blue it is."}])
+        self.relay()
+        self.w.advance(s["agent"])  # it ends its turn without having looked
+        self.assertNotIn("[E", self.w.watch_ticks(3))
+        self.assertEqual(self.w.agent(s["agent"])["prompts"][1:], [self.GIVEN])
+        self.assertEqual(self.delivered(), [{"status": "answered", "given": 1}])
+        self.assertEqual(self.w.events("prompt"), ["S1 answers it had not read, sent by the watcher: Q1"])
+        self.assertNotIn("[E", self.w.watch_ticks(3))  # once: later looks send nothing more
+        self.assertEqual(len(self.w.agent(s["agent"])["prompts"]), 2)
+        self.assertEqual(self.w.wakes(), self.w.wakes()[:1])  # the coordinator heard of the question only
+
+    def test_an_answer_given_with_q_answer_reaches_an_idle_worker_through_the_watcher(self):
+        s = self.asked(ask("Red or blue?"))
+        self.assertIn("recorded Q1: S1 reads it with `zed-employee answers`, or the watcher prompts it once it is idle",
+                      self.w.zed("q", "answer", "Q1", "Blue, as on the home page.").stdout)
+        self.assertEqual(len(self.w.agent(s["agent"])["prompts"]), 1)
+        self.w.watch_ticks(2)
+        self.assertEqual(self.w.agent(s["agent"])["prompts"][1:], [self.GIVEN])
+
+    def test_an_answer_relayed_twice_is_sent_once(self):
+        s = self.asked(ask("Red or blue?"), [{"say": "Blue it is."}])
+        self.assertIn("recorded Q1", self.relay())
+        self.assertEqual(self.relay().strip(), "Q1: already answered in these words and given to the worker; not sent again")
+        self.assertEqual(self.w.agent(s["agent"])["prompts"][1:], [self.GIVEN])
+        self.assertEqual(self.w.events("answer"), ["Q1: Blue, as on the home page."])
+        self.assertIn("recorded Q1", self.w.zed("relay", "Q1", "Red after all.").stdout)  # other words are a new answer
+        self.assertEqual(len(self.w.agent(s["agent"])["prompts"]), 3)
+
+    def test_a_repeated_answer_to_a_question_no_session_asked_names_no_worker(self):
+        self.w.zed("q", "add", "-", "Tea or coffee?")
+        self.w.zed("relay", "Q1", "Tea.")
+        self.assertEqual(self.w.zed("relay", "Q1", "Tea.").stdout.strip(), "Q1: already answered in these words")
+
+    def test_an_answer_is_never_prompted_to_a_session_of_the_users_own(self):
+        """`relay` and `prompt` refuse an external session; the watcher leaves it alone as well."""
+        s = self.asked(ask("Red or blue?"))
+        self.w.adopted(s["session"])
+        self.w.zed("q", "answer", "Q1", "Blue, as on the home page.")
+        self.assertNotIn("[E", self.w.watch_ticks(3))
+        self.assertEqual(len(self.w.agent(s["agent"])["prompts"]), 1)
+        self.assertEqual(self.delivered(), [{"status": "answered", "given": 0}])  # recorded, and still there to be read
+
+    def test_an_answer_is_not_lost_when_herdr_refuses_the_prompt(self):
+        """The pane can close between the watcher's list of agents and its prompt: the answer it had claimed for the
+        prompt is given back, the coordinator is told, and the watcher goes on."""
+        s = self.asked(ask("Red or blue?"), [self.READ])
+        self.w.zed("q", "answer", "Q1", "Blue, as on the home page.")
+        (self.w.herdr / "herdr-refuses").write_text(f"agent get {s['agent']}\n")
+        out = self.w.watch_ticks(3)
+        self.assertIn("[E2] S1 T1 build-t1 · the answers to Q1 could not be prompted to it (herdr refused", out)
+        self.assertEqual(out.count("[E"), 1)  # the watcher lived on through its later looks, and said it once
+        self.assertEqual(len(self.w.agent(s["agent"])["prompts"]), 1)
+        self.assertEqual(self.delivered(), [{"status": "answered", "given": 0}])
+        (self.w.herdr / "herdr-refuses").unlink()
+        self.w.zed("prompt", s["session"], "Look for your answers.")  # it is still there for the worker to read
+        self.assertEqual(self.w.agent(s["agent"])["results"][-1]["out"].strip(), self.GIVEN.splitlines()[0])
+
+    def test_a_question_asked_again_is_answered_from_the_record_and_not_put_to_the_user_again(self):
+        s = self.asked(ask("Red or blue?"), [{"say": "Thanks."}, {"pause": True}, *ask("Red or blue?")])
+        self.assertIn("recorded Q1", self.relay())  # idle: prompted at once, and it works on
+        self.assertEqual(self.w.agent(s["agent"])["prompts"][1:], [self.GIVEN])
+        self.w.watch_ticks(1)
+        self.w.advance(s["agent"])  # later it asks the same again, in its status file and on its screen
+        self.assertNotIn("[E", self.w.watch_ticks(3))  # nothing for the coordinator, so nothing for the user
+        self.assertEqual(len(self.w.wakes()), 1)
+        self.assertEqual(self.w.rows("SELECT question, status FROM questions"), [{"question": "Red or blue?", "status": "answered"}])
+        self.assertEqual(self.w.zed("q", "list").stdout, "")
+        self.assertEqual(self.w.agent(s["agent"])["prompts"][2:], [self.GIVEN])  # the recorded answer, once more
+        self.assertEqual(self.w.events("auto"), ["S1 asked Q1 again; the user has answered: the answer goes to it again from the record"])
+        self.assertNotIn("[E", self.w.watch_ticks(3))
+        self.assertEqual(len(self.w.agent(s["agent"])["prompts"]), 3)
 
 
 class Close(LoopCase):
@@ -412,6 +540,8 @@ class Merge(LoopCase):
         self.assertEqual(self.w.rows("SELECT verdict FROM sessions WHERE hat='review'"), [{"verdict": None}])
         self.refused("no review verdict recorded for this code")
 
+
+per_runtime(globals(), Record, Brief, Spawn, Watch, Relay, Answers, Close, Lock, Merge)
 
 if __name__ == "__main__":
     unittest.main()

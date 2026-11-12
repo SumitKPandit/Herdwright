@@ -9,6 +9,9 @@ Usage
       is about (`blockers` needs the findings --draft) and records the draft for whoever fixes. Refuses an incomplete
       plan, a missing verdict, a review/qa that changed the code, a second finish. A hat session finishes only itself (known
       from its herdr pane); `--as-zed --session S<id>` is Zed's own shell finishing a stuck worker, refused in a hat session.
+  zed-employee answers
+      the user's answers to this session's questions that it has not read yet, marked read: for a session that asked
+      and carried on with other steps (an answer left unread is prompted to it once it is idle)
   zed-employee stop-guard
       the worker's Stop hook (spawn renders it into the session's settings): blocks the end of a turn that reported `done:` in
       its status file without having run `finish`; reads the hook JSON on stdin; prints {"decision":"block",...}
@@ -52,6 +55,12 @@ def cmd_finish(args):
     print("\n".join(emp.finish(session, verdict=args.verdict, draft=args.draft)))
 
 
+def cmd_answers(args):
+    with emp.database() as conn:
+        session = emp.target_session(conn)
+    print("\n".join(emp.answers(session)))
+
+
 def cmd_stop_guard(args):
     """Block the end of a turn that reported done without `finish`. A second Stop in a row (stop_hook_active) is let
     through, so a worker that cannot finish is never stuck: the done path still flags it to Zed."""
@@ -82,6 +91,7 @@ def build_parser():
     s.add_argument("--hat")
     add("hats", cmd_hats)
     add("stop-guard", cmd_stop_guard)
+    add("answers", cmd_answers)
     s = add("finish", cmd_finish)
     s.add_argument("--verdict", choices=emp.VERDICTS)
     s.add_argument("--draft")

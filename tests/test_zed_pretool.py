@@ -102,6 +102,37 @@ class PretoolTests(unittest.TestCase):
         self.assertIsNone(bash("cd $D && touch c.txt"))
         self.assertIsNone(bash("cd - && git commit -m x"))
 
+    def test_an_opener_or_a_wrapper_before_a_write_does_not_hide_it(self):
+        """S341 and S342: only the first word of a simple command was read as the program."""
+        for command in ("{ touch c.txt; }", "if true; then touch c.txt; fi", "for f in a b; do rm c.txt; done", "command touch c.txt",
+                        "env touch c.txt", "env FOO=1 rm c.txt", "! rm keep.txt", "sudo rm keep.txt", "time rm keep.txt", "xargs rm keep.txt",
+                        "nice -n 5 touch c.txt", "if true; then git commit -m x; fi",
+                        # S351: `timeout`, a run of operators, a `find` with options before its paths
+                        "timeout 5 rm c.txt", "timeout -k 1 5s rm c.txt", "stdbuf -oL touch c.txt", "true;>c.txt", "find -L . -name x -delete"):
+            self.assertIsNotNone(decide("shell", command=command, workdir="/code/proj"), command)
+            self.assertIsNone(bash(command), command)  # in Zed's own repo
+        for command in ("{ cd /code/proj && touch c.txt; }", "if true; then cd /code/proj; touch c.txt; fi", "builtin cd /code/proj && touch c.txt",
+                        "cd -P /code/proj", "pushd /code/proj", "cd"):
+            self.assertIn("it silently changes where later commands run", bash(command), command)
+        self.assertIsNone(decide("shell", command="if true; then ls; fi", workdir="/code/proj"))
+
+    def test_every_redirect_and_pipe_operator_is_read(self):
+        for command in ("echo x &> c.txt", "echo x &>> c.txt", "echo x >& c.txt", "ls |& tee c.txt"):
+            self.assertIn("outside Zed's repo/profile/tmp", decide("shell", command=command, workdir="/code/proj"), command)
+            self.assertIsNone(bash(command), command)
+        for command in ("echo x >&2", "ls 2>&1 | cat", "echo x &> /tmp/out", "echo x >&-"):
+            self.assertIsNone(decide("shell", command=command, workdir="/code/proj"), command)
+
+    def test_writes_that_are_not_a_file_writers_first_word(self):
+        """S342: a heredoc with the redirect after it, git clean and checkout, chmod, dd and a deleting find passed."""
+        for command in ("cat <<EOF > c.txt\nx\nEOF", "git clean -fd", "git checkout -- .", "git switch main", "chmod +x c.txt",
+                        "chown bob c.txt", "dd if=/dev/zero of=c.txt", "find . -delete", "find src -exec rm {} \\;"):
+            self.assertIsNotNone(decide("shell", command=command, workdir="/code/proj"), command)
+            self.assertIsNone(bash(command), command)
+        self.assertIsNotNone(bash("cat <<EOF > /code/proj/c.txt\nx\nEOF"))
+        for command in ("find . -name '*.py'", "find . -exec grep -l x {} \\;", "chmod +x /tmp/run.sh", "dd if=c.txt of=/tmp/c", "git log"):
+            self.assertIsNone(decide("shell", command=command, workdir="/code/proj"), command)
+
     def test_an_edit_that_names_no_file_is_denied_to_the_lock_holder(self):
         """S338: zed-deny denies it; here an unknown input shape (a patch without file markers) passed silently."""
         for tool, inp in (("patch", {"patchText": "*** Begin Patch\n+x\n*** End Patch"}), ("patch", {"diff": "--- a\n+++ b"}),

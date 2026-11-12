@@ -107,6 +107,14 @@ class SetupCase(unittest.TestCase):
         self.assertIn("(now: claude)", r.stdout)
         self.assertFalse(path.exists())
 
+    def test_asked_for_help_it_says_what_it_does_and_changes_nothing(self):
+        for flag in ("--help", "-h"):
+            r = subprocess.run([str(self.repo / "bin" / "zed-setup"), flag], cwd=self.repo, env=self.env, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0)
+            self.assertIn("zed-setup: check Zed's prerequisites", r.stdout)
+            self.assertNotIn("ok ", r.stdout)
+        self.assertEqual(self.hooks_path(), "")
+
     def test_running_it_again_changes_nothing(self):
         first, again = self.setup(), self.setup()
         self.assertEqual((again.returncode, again.stdout), (first.returncode, first.stdout))
@@ -141,8 +149,19 @@ class SetupCase(unittest.TestCase):
         (self.repo / "profile" / "profile.md").write_text("# A profile\n")
         self.git("checkout", "-q", "-b", "profile/me")
         r = self.setup()
-        self.assertRegex(r.stdout, r"(?m)^ok +profile/ present \(branch: profile/me\)$")
+        self.assertRegex(r.stdout, rf"(?m)^ok +profile present at {self.repo}/profile \(branch: profile/me\)$")
         self.assertNotIn("no profile yet", r.stdout)
+
+    def test_a_profile_kept_elsewhere_is_found_through_its_variable(self):
+        """S339: the script looked under the checkout only, said "no profile yet" and wrote no runtime."""
+        elsewhere = self.root / "my-profile"
+        (elsewhere / "config").mkdir(parents=True)
+        (elsewhere / "profile.md").write_text("# A profile\n")
+        self.env |= {"ZED_PROFILE_DIR": str(elsewhere)}
+        r = self.setup(runtimes=("opencode",))
+        self.assertRegex(r.stdout, rf"(?m)^ok +profile present at {elsewhere} ")
+        self.assertNotIn("no profile yet", r.stdout)
+        self.assertEqual(json.loads((elsewhere / "config" / "settings.json").read_text()), {"runtime": "opencode"})
 
 
 if __name__ == "__main__":

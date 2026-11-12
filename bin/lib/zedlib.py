@@ -127,11 +127,31 @@ SESSION_COLUMNS = [("hat", "TEXT"), ("verdict", "TEXT"), ("verdict_tree", "TEXT"
 
 
 def ensure_session_schema(conn):
-    """Add the columns hat sessions need to the sessions table. Idempotent."""
+    """Add the columns hat sessions need to the sessions table, and the one answers need to the questions table
+    (`delivered_at`: when the session that asked was given the answer; empty while it has not read it). Idempotent."""
     cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
     for col, decl in SESSION_COLUMNS if cols else []:  # no sessions table yet: bin/zed creates it, then calls us again
         if col not in cols:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
+    asked = {r[1] for r in conn.execute("PRAGMA table_info(questions)")}
+    if asked and "delivered_at" not in asked:
+        conn.execute("ALTER TABLE questions ADD COLUMN delivered_at TEXT")
+        conn.execute("UPDATE questions SET delivered_at=answered_at WHERE status='answered'")  # answered before answers were tracked: given then
+
+
+def take_answers(conn, sid, stamp):
+    """The user's answers to session `sid`'s questions that it has not been given yet, each claimed for the caller (the
+    worker reading them, or the watcher about to prompt it) in the same step, so no answer is given twice: rows of
+    (id, question, answer). The caller commits."""
+    rows = conn.execute("SELECT id, question, answer FROM questions WHERE session_id=? AND status='answered' AND delivered_at IS NULL "
+                        "ORDER BY id", (sid,)).fetchall()
+    return [r for r in rows
+            if conn.execute("UPDATE questions SET delivered_at=? WHERE id=? AND delivered_at IS NULL", (stamp, r["id"])).rowcount]
+
+
+def answer_line(q, answer=None):
+    """How an answer is handed to the worker that asked: its question's id and first line, then the answer verbatim."""
+    return f"Answer from the user to your question Q{q['id']} ({q['question'].splitlines()[0][:120]}): {q['answer'] if answer is None else answer}"
 
 
 PROFILE_ENTRY = "profile"  # the top-level directory holding a profile inside a Zed checkout

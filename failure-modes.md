@@ -7,11 +7,11 @@ depend on me. A new failure gets a row here and, where possible, a check in `bin
 |---|---|
 | Worker re-tools, re-reads or redoes finished work | Enforced: plan file required at spawn; watcher `STALL` after 30 min without plan progress |
 | Model or effort above what the work needs; too many parallel sessions | Enforced: `claude.json` effort ceiling and `effort_by_kind`; `max_running` counts every open Claude session and `spawn` queues the rest |
-| A worker asks while still `working` | Enforced: workers append to a status file the watcher reads in any state; the watcher scans working screens for `ZED:` blocks |
+| A worker asks while still `working` | Enforced: workers append to a status file the watcher reads in any state; the watcher scans working screens for `ZED:` blocks; the answer waits for it (`zed-employee answers`) and is prompted once it is idle |
 | A wake event is lost when my turn crashes | Enforced: events queue until `bin/zed ack`; `watch` re-shows them, `start` lists them |
 | A worker idles without a `ZED:` block, waits on a permission prompt, or its pane is gone | Enforced: nudge once, wake me on a repeat; `blocked` reported again after 5 min; `gone` reported |
 | A PR is merged, reviewed or failing and nobody notices | Enforced: the watcher polls open PRs |
-| Watcher died | Enforced: Stop hooks re-arm it and block a turn that ends with tracked work and no watcher |
+| Watcher died | Enforced: Stop hooks re-arm it and block a turn that ends with tracked work and no watcher (OpenCode: one long-lived watcher; `start` and `spawn` restart it) |
 | A DONE without a real QA line, an incomplete plan, or no `finish` | Enforced: the event flags it and `pr_open` isn't set; the worker Stop guard requires `zed-employee finish`. Practice: send it back |
 | Review or QA before the build's plan is ticked; a second writer on a worktree | Enforced: `spawn`/`assign` refuse |
 | A merge or PR without clean review and QA by non-authors | Enforced: `bin/zed merge`, `gate check`, git hooks |
