@@ -260,7 +260,8 @@ class StartTests(CoordinatorCase):
 
         self.output.seek(0)
         self.output.truncate(0)
-        clean = {k: v for k, v in os.environ.items() if not k.startswith(("OPENCODE_", "HW_", "HERDR_", "CLAUDE"))}
+        # ZED_: HW_ before the rename; `start` names those still set, also to a new user
+        clean = {k: v for k, v in os.environ.items() if not k.startswith(("OPENCODE_", "HW_", "ZED_", "HERDR_", "CLAUDE"))}
         with patch.dict(os.environ, clean | env, clear=True), patch.object(self.z, "cmd_lock") as lock, \
                 patch.object(self.z, "holds_lock", return_value=True), patch.object(self.z, "live_agents", return_value={}), \
                 patch.object(self.z, "watcher_alive", return_value=watcher), patch.object(self.z.hwlib, "git", side_effect=git), \

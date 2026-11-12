@@ -96,6 +96,7 @@ def skill_names(hat=None):
 
 def connect():
     DB = hwlib.DB_PATH
+    hwlib.refuse_old_database("hw-employee")
     DB.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB, timeout=10)
     conn.row_factory = sqlite3.Row

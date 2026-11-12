@@ -10,11 +10,13 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
 HW_HOME = Path(__file__).resolve().parent.parent.parent
 PROFILE_DIR = Path(os.environ.get("HW_PROFILE_DIR") or HW_HOME / "profile").expanduser().resolve()
 DB_PATH = PROFILE_DIR / "db" / "hw.db"
+OLD_DB_PATH = PROFILE_DIR / "db" / "zed.db"  # its name before the rename to Herdwright; `bin/hw start` renames it once
 PROJECTS_PATH = PROFILE_DIR / "config" / "projects.json"
 BRIEFS_DIR = PROFILE_DIR / "briefs"
 
@@ -107,6 +109,14 @@ def scratch_unique_work(scratch):
         elif git(root, "log", "--oneline", "--branches", "--not", "--remotes").stdout.strip():
             reasons.append(f"{rel}: commits not on any remote")
     return reasons
+
+
+def refuse_old_database(program):
+    """Stop a command that would create an empty database in front of the one a profile from before the rename
+    still has under its old name: the tasks, sessions and questions in it would look gone."""
+    if OLD_DB_PATH.exists() and not DB_PATH.exists():
+        sys.exit(f"{program}: this profile is from before the rename to Herdwright: its database is still {OLD_DB_PATH}. "
+                 "Run `bin/hw start` first: it renames the profile's old names once.")
 
 
 def db_readonly():

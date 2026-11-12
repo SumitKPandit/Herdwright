@@ -134,13 +134,19 @@ you like. Merging `main` never edits your profile files; if you edited core file
 any merge.
 - **The rename from Zed.** Herdwright was called Zed until November 2026: the command was `bin/zed` with helpers
   `bin/zed-*`, workers reported with `ZED:` markers, and settings were `ZED_*` environment variables. All of these are now
-  `bin/hw`, `bin/hw-*`, `HW:` and `HW_*`. Close your worker sessions before you upgrade (a session started by the old
-  code keeps the old names and cannot report to the new one). The first `bin/hw start` (on OpenCode, `bin/hw coordinator`)
-  then renames what your profile still calls by the old name, once, and lists each rename: `db/zed.db` to `db/hw.db`,
-  `.cache/zed.lock` to `.cache/hw.lock`, the `zed-deny` and `zed-pretool` plugin folders of OpenCode config folders
-  under `.cache`, and the `refs/zed/core-sync/` git refs to `refs/hw/core-sync/`. The old `ZED_*` variables are not
-  read: set `HW_PROFILE_DIR` where you set `ZED_PROFILE_DIR`; `start` names any that are still set. Git guard hooks
-  installed in worktrees by the old code (`zed-hooks`) are not migrated: `bin/hw-guard audit` lists those worktrees.
+  `bin/hw`, `bin/hw-*`, `HW:` and `HW_*`. Before you upgrade, let your worker sessions finish and close them, and close
+  the coordinator session: a session started by the old code keeps the old names (its settings call `bin/zed-*`, which
+  are gone) and cannot report to the new one. The first `bin/hw start` (on OpenCode, `bin/hw coordinator`) then renames
+  what your profile still calls by the old name, once, and lists each rename: `db/zed.db` to `db/hw.db`,
+  `.cache/zed.lock` to `.cache/hw.lock`, and the `zed-deny` and `zed-pretool` plugin folders of OpenCode config folders
+  under `.cache`. While a live session of the old code still holds `.cache/zed.lock`, `start` renames nothing, says so
+  and stops: close that session and run it again. Until `start` has run, a command that needs the database refuses
+  rather than open an empty `db/hw.db`. When your profile is the checkout's own `profile/` folder, `start` also renames
+  the sync point of the branch you are on, `refs/zed/core-sync/<branch>`, to `refs/hw/core-sync/<branch>`; with the
+  profile elsewhere (`HW_PROFILE_DIR`) no git ref is touched: record the sync point again with
+  `bin/hw-core-sync --mark <commit>`. The old `ZED_*` variables are not read: set `HW_PROFILE_DIR` where you set
+  `ZED_PROFILE_DIR`; `start` names any that are still set, also when it finds no profile. Git guard hooks installed in
+  worktrees by the old code (`zed-hooks`) are not migrated: `bin/hw-guard audit` lists those worktrees.
 - **Runtimes.** If you cloned `main` while it supported Pi or Copilot: both are gone, and so is runtime selection
   (order, fallback, handoff, `runtimes.json`). Workers run on the install's runtime: on Claude Code with model and
   effort from `config/claude.json`, on OpenCode with model and variant from `config/opencode.json` (no effort).

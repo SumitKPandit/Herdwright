@@ -174,18 +174,71 @@ def require_profile():
 
 
 # Before it was renamed, Herdwright was called Zed and named its files after that. A profile from then still carries
-# those names; `start` and `coordinator` rename each one once (old name, new name; relative to the profile).
-OLD_PROFILE_FILES = [("db/zed.db", "db/hw.db"), ("db/zed.db-wal", "db/hw.db-wal"), ("db/zed.db-shm", "db/hw.db-shm"),
-                     (".cache/zed.lock", ".cache/hw.lock")]
+# those names; `start` and `coordinator` rename each one once (old name, new name).
+OLD_LOCK_PATH = PROFILE_DIR / ".cache" / "zed.lock"
+OLD_PROFILE_FILES = [(hwlib.OLD_DB_PATH, DB_PATH), (OLD_LOCK_PATH, LOCK_PATH)]
+OLD_DB_SIDE_FILES = ("-journal",)  # what a crashed write leaves next to the database: it moves with the database only
+OLD_LOCK_GUARD_PATH = OLD_LOCK_PATH.with_suffix(".guard")  # the empty file the old lock was serialised on: the new lock has its own
 OLD_PLUGIN_FOLDERS = {"zed-deny": "hw-deny", "zed-pretool": "hw-pretool"}  # in an OpenCode config folder under .cache
-OLD_SYNC_REFS = ("refs/zed/core-sync/", "refs/hw/core-sync/")  # hw-core-sync's sync point, in this checkout
+OLD_SYNC_REF, SYNC_REF = "refs/zed/core-sync/", "refs/hw/core-sync/"  # hw-core-sync's sync point, a ref of the checkout
+OLD_VARIABLES = "ZED_"
+
+
+def old_variables_note():
+    """The old environment variables are not read; those still set are named, with what to set instead."""
+    stale = sorted(k for k in os.environ if k.startswith(OLD_VARIABLES))
+    return [f"NOT READ: {', '.join(stale)} (the old names). Set {', '.join('HW_' + k[len(OLD_VARIABLES):] for k in stale)} instead."] if stale else []
+
+
+def old_coordinator():
+    """The live session of the code from before the rename that holds this profile's old lock, or None. This session
+    holding it (the code was upgraded under it) is not another coordinator."""
+    h = read_json(OLD_LOCK_PATH, None)
+    if not isinstance(h, dict) or "pid" not in h or same_holder(h, me()):
+        return None
+    return h if holder_alive(h) else None
+
+
+def old_coordinator_note(holder):
+    return (f"OLD COORDINATOR STILL RUNNING: {OLD_LOCK_PATH} is held by a live session of the code from before the "
+            f"rename to Herdwright ({describe(holder)}). Nothing was renamed, so that session keeps working, and this one "
+            "does not act as Herdwright. Tell the user to close that session, then run this again.")
+
+
+def tasks_in(database):
+    """What a database file holds, for the user who has two: its number of tasks, or that it cannot be read."""
+    try:
+        with contextlib.closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as conn:
+            has_tasks = conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'tasks'").fetchone()
+            count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] if has_tasks else 0
+    except sqlite3.Error:
+        return f"{database.name} could not be read"
+    return f"{database.name} holds {count} task(s)"
+
+
+def migrate_old_sync_ref():
+    """Rename the sync point of the branch checked out here. A ref is the checkout's, not the profile's: only the
+    branch checked out here is this checkout's own (git's other worktrees share the refs), and only a checkout that
+    runs on its own `profile/` folder is the one being upgraded; with a profile elsewhere no ref is touched."""
+    branch = hwlib.git(HW_HOME, "branch", "--show-current").stdout.strip()
+    if not branch or PROFILE_DIR != (HW_HOME / "profile").resolve():
+        return []
+    old, new = OLD_SYNC_REF + branch, SYNC_REF + branch
+    sha = hwlib.git(HW_HOME, "rev-parse", "--verify", "--quiet", old).stdout.strip()
+    if not sha:
+        return []
+    if hwlib.git(HW_HOME, "rev-parse", "--verify", "--quiet", new).returncode == 0:
+        return [f"OLD NAME LEFT ALONE: git refs {old} and {new} both exist; {new} is the one in use."]
+    hwlib.git(HW_HOME, "update-ref", new, sha)
+    hwlib.git(HW_HOME, "update-ref", "-d", old)
+    return [f"renamed git ref {old} to {new}"]
 
 
 def migrate_old_names():
     """Rename what a profile created before the rename still calls by the old name; returns one line per thing
     renamed or left alone. An old name next to its new one is left alone and reported: which one is current is the
-    user's call. The old `ZED_*` environment variables are not read; one that is still set is reported."""
-    pairs = [(PROFILE_DIR / old, PROFILE_DIR / new) for old, new in OLD_PROFILE_FILES]
+    user's call. Not for a profile whose old lock a live session still holds (`old_coordinator`): ask that first."""
+    pairs = list(OLD_PROFILE_FILES)
     for old_name, new_name in OLD_PLUGIN_FOLDERS.items():
         pairs += [(folder, folder.with_name(new_name)) for folder in sorted((PROFILE_DIR / ".cache").glob(f"**/plugins/{old_name}"))]
     notes = []
@@ -193,26 +246,24 @@ def migrate_old_names():
         if not old.exists():
             continue
         if new.exists():
-            notes.append(f"OLD NAME LEFT ALONE: {old} and {new} both exist; keep the one that is current and delete the other.")
-        else:
-            old.rename(new)
-            notes.append(f"renamed {old} to {new.name} (a profile from before the rename to Herdwright)")
-    old_refs, new_refs = OLD_SYNC_REFS
-    for line in hwlib.git(HW_HOME, "for-each-ref", "--format=%(refname) %(objectname)", old_refs).stdout.splitlines():
-        ref, sha = line.split()
-        new = new_refs + ref[len(old_refs):]
-        if hwlib.git(HW_HOME, "rev-parse", "--verify", "--quiet", new).returncode != 0:
-            hwlib.git(HW_HOME, "update-ref", new, sha)
-        hwlib.git(HW_HOME, "update-ref", "-d", ref)
-        notes.append(f"renamed git ref {ref} to {new}")
-    stale = sorted(k for k in os.environ if k.startswith("ZED_"))
-    if stale:
-        notes.append(f"NOT READ: {', '.join(stale)} (the old names). Set {', '.join('HW_' + k[4:] for k in stale)} instead.")
-    return notes
+            holds = f" ({tasks_in(old)}; {tasks_in(new)} and is the one in use)" if old == hwlib.OLD_DB_PATH else ""
+            notes.append(f"OLD NAME LEFT ALONE: {old} and {new} both exist{holds}; keep the one that is current and delete the other.")
+            continue
+        old.rename(new)
+        notes.append(f"renamed {old} to {new.name} (a profile from before the rename to Herdwright)")
+        if old == hwlib.OLD_DB_PATH:
+            for suffix in OLD_DB_SIDE_FILES:
+                if old.with_name(old.name + suffix).exists():
+                    old.with_name(old.name + suffix).rename(new.with_name(new.name + suffix))
+    if OLD_LOCK_GUARD_PATH.exists():
+        OLD_LOCK_GUARD_PATH.unlink()
+        notes.append(f"removed {OLD_LOCK_GUARD_PATH} (the old lock's empty guard file)")
+    return notes + migrate_old_sync_ref() + old_variables_note()
 
 
 def db():
     require_profile()
+    hwlib.refuse_old_database("hw")
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=10)  # waits up to 10s if another process is writing
     conn.row_factory = sqlite3.Row
@@ -2691,6 +2742,8 @@ def cmd_coordinator(args):
             f"\"runtime\": \"opencode\" in {PROFILE_DIR / 'config' / 'settings.json'}.)")
     if not shutil.which("opencode"):
         die("`opencode` is not installed or not on PATH")
+    if holder := old_coordinator():
+        die(old_coordinator_note(holder))
     for note in migrate_old_names():  # before the config folder is written: a stale plugin there would refuse every call
         print(note)
     open_already = read_json(coordinator_record_path(), None)
@@ -2743,7 +2796,7 @@ def cmd_name(args):
     """name [--set <name> | --ask] — print what the assistant is called (`assistant_name` in the profile's
     config/settings.json; "Herdwright" when it is not set). --set stores a name. --ask (bin/hw-setup) asks the user for
     one and stores it, when there is a profile, none is stored and this runs in a terminal; no answer keeps the default."""
-    name = " ".join(args[1:]).strip() if args[:1] == ["--set"] else None
+    name = " ".join(" ".join(args[1:]).split()) if args[:1] == ["--set"] else None  # one line: `start` prints it in one
     if args[:1] == ["--set"] and not name:
         die("usage: hw name --set <name>")
     if args == ["--ask"] and (PROFILE_DIR / "profile.md").exists() and not hwlib.settings().get("assistant_name") and sys.stdin.isatty():
@@ -2772,8 +2825,12 @@ def cmd_start(args):
         die(f"this session is {record['session']} to OpenCode but {me()['agent_session']} to herdr: the guard would not "
             "recognise the lock holder, so Herdwright does not act from it.")
     if not (PROFILE_DIR / "profile.md").exists():
-        print(f"NEW USER: there is no profile at {PROFILE_DIR}. Run the `onboarding` skill and do nothing else until it is done."
-              + (" Then tell the user to quit and run `bin/hw coordinator` again." if record else ""))
+        print("\n".join(old_variables_note() + [  # a profile the old variable points at is not a new user's
+            f"NEW USER: there is no profile at {PROFILE_DIR}. Run the `onboarding` skill and do nothing else until it is done."
+            + (" Then tell the user to quit and run `bin/hw coordinator` again." if record else "")]))
+        return
+    if holder := old_coordinator():
+        print(old_coordinator_note(holder))
         return
     notes = migrate_old_names()
     if hwlib.git(HW_HOME, "branch", "--show-current").stdout.strip() == "main":
