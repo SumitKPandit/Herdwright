@@ -6,14 +6,14 @@ description: The 21 checkable rules for changed code. Use in a build's self-revi
 
 Check every changed line against each rule, on the change's diff: `git diff <base branch>...HEAD` plus, in a build,
 the uncommitted changes and each untracked file (`git status --porcelain`). The base branch is in the brief. "The plan"
-is your session's plan file; "the brief" includes the answers Zed relayed. A build fixes the line that fails a rule. A
+is your session's plan file; "the brief" includes the answers Herdwright relayed. A build fixes the line that fails a rule. A
 review only reports it, as a finding with the rule's number, and changes nothing. A fix that needs a choice neither
-the brief nor an existing convention settles: `ZED:QUESTION`.
+the brief nor an existing convention settles: `HW:QUESTION`.
 
 | # | Rule | Check |
 |---|---|---|
 | 1 | Every changed hunk maps to a step of the plan. | Name the step for each hunk. Revert any hunk without one. |
-| 2 | Follow the nearest existing convention for naming, error type, logging, imports and file layout: the same file first, then the same module, then the repo. | Name the existing code you followed. Two conventions that conflict: `ZED:QUESTION`. |
+| 2 | Follow the nearest existing convention for naming, error type, logging, imports and file layout: the same file first, then the same module, then the repo. | Name the existing code you followed. Two conventions that conflict: `HW:QUESTION`. |
 | 3 | Each function does one thing. | Describe it in one sentence without "and". |
 | 4 | Names use the domain words of the brief. Booleans read as questions, such as `isActive` or `hasAccess`. Use only abbreviations the repo already uses. | Compare each new name with the brief's wording. |
 | 5 | A literal with meaning gets a named constant, placed with similar constants. | No unexplained number or string in the diff. |
@@ -24,7 +24,7 @@ the brief nor an existing convention settles: `ZED:QUESTION`.
 | 10 | Nothing left behind: no commented-out code, debug output or TODO without a ticket. | Search the added lines for print and log calls, `debugger`, `TODO` and commented-out code. |
 | 11 | A comment only explains a why the code cannot show. | No new comment restates what its code does. Where a ticket, the brief or the user is the source of the why, the comment names it. |
 | 12 | Do not touch code the task does not change: no reformatting, renames or lint fixes, no hand edits to generated files, no lockfile change without a dependency change. | Every changed file serves a step of the plan. |
-| 13 | No new dependency unless the brief records it. | Compare manifest changes with the brief. A dependency it does not name: `ZED:QUESTION`. |
+| 13 | No new dependency unless the brief records it. | Compare manifest changes with the brief. A dependency it does not name: `HW:QUESTION`. |
 | 14 | Handle preconditions, errors and edge cases first, with an early return, `continue` or throw, so the main path is not nested. | No function the diff adds, or whose nesting the diff deepens, nests blocks more than 2 levels deep inside its body. |
 | 15 | A function that returns a value does not change its arguments or object state. A function that changes state, such as a database write, a state change or a call that changes another service, is not named like a query (`get`, `calculate`, `is`, `has`). | For each new or renamed function, list what it changes. |
 | 16 | A helper with one caller lives next to that caller, not in a shared `utils` or base module. | Each new function in a shared module has callers in more than one module. |

@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""hw-pr — read-only PR state, blocking CI wait and ready-for-review check (GitHub, through `gh`).
+
+Ported from firstmate's fm-pr-state / fm-pr-health / fm-pr-poll. It never posts, approves, marks ready or merges:
+outward actions stay with the worker or the user.
+firstmate: Copyright (c) 2026 Kun Chen, MIT licence, see THIRD_PARTY_LICENSES.md.
+
+Usage
+  hw-pr state <pr-url> [--json]
+      one verdict line plus its blockers. Verdicts: merged | closed | ci-failing | conflicts |
+      changes-requested | ci-pending | ci-none | green
+  hw-pr wait <pr-url> [--timeout 540] [--interval 20] [--json]
+      ONE blocking command that returns when CI has settled (no sleep-then-check turns).
+      exit 0 green · 1 failing/conflicts/changes-requested/closed · 3 still pending at the timeout · 2 usage or lookup error
+  hw-pr ready-check <pr-url> [--title-pattern RE] [--base BRANCH] [--reviewers a,b,...] [--json]
+      is this PR ready to take out of draft? Checks CI green, no conflicts, title format, base branch
+      and that the user's reviewers were requested (default list: GitHub handles in profile knowledge/people.md).
+      exit 0 ready · 1 problems listed · 2 lookup error
+
+Waiting never exceeds the Bash tool's 600 s limit with the default --timeout.
+"""
+import argparse
+import json
+import re
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import hwlib  # noqa: E402
+
+TITLE_PATTERN = r"^[A-Z][A-Z0-9]*-\d+ \| \S.*"   # default title rule: `TICKET-ID | Description`
+PASS_CONCLUSIONS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+GH_STATUS_PASS = {"SUCCESS"}
+GH_STATUS_PENDING = {"PENDING", "EXPECTED"}
+GH_URL = re.compile(r"^https://github\.com/([^/]+/[^/]+)/pull/(\d+)")
+
+
+class PrLookupError(Exception):
+    pass
+
+
+def require_github_pr_url(url):
+    if not GH_URL.match(url):
+        raise PrLookupError(f"not a GitHub PR URL: {url}")
+
+
+def summarize_github_checks(rollup):
+    failing, pending, passing = [], [], 0
+    for c in rollup or []:
+        if c.get("__typename") != "StatusContext":
+            name = c.get("name") or "?"
+            if c.get("status") != "COMPLETED":
+                pending.append(name)
+            elif c.get("conclusion") in PASS_CONCLUSIONS:
+                passing += 1
+            else:
+                failing.append(name)
+        else:
+            name = c.get("context") or "?"
+            st = c.get("state")
+            if st in GH_STATUS_PASS:
+                passing += 1
+            elif st in GH_STATUS_PENDING:
+                pending.append(name)
+            else:
+                failing.append(name)
+    return {"passing": passing, "failing": sorted(failing), "pending": sorted(pending)}
+
+
+def fetch(url):
+    require_github_pr_url(url)
+    fields = "state,isDraft,title,baseRefName,headRefOid,mergeable,reviewDecision,statusCheckRollup,reviewRequests,latestReviews,author"
+    r = hwlib.run_bounded(["gh", "pr", "view", url, "--json", fields], timeout=60)
+    if not r.ok:
+        raise PrLookupError(f"gh pr view failed: {(r.stderr or r.stdout).strip()[:300]}")
+    j = json.loads(r.stdout)
+    requested = [(x.get("login") or x.get("slug") or "").lower() for x in j.get("reviewRequests") or []]
+    reviewed = [(x.get("author") or {}).get("login", "").lower() for x in j.get("latestReviews") or []]
+    return {"url": url, "state": j["state"], "draft": j["isDraft"], "title": j["title"],
+            "base": j["baseRefName"], "head": j["headRefOid"], "author": ((j.get("author") or {}).get("login") or "").lower(),
+            "conflicts": {"CONFLICTING": True, "MERGEABLE": False}.get(j.get("mergeable")),
+            "changes_requested": j.get("reviewDecision") == "CHANGES_REQUESTED",
+            "checks": summarize_github_checks(j.get("statusCheckRollup")),
+            "reviewers": sorted(set(requested + reviewed) - {""})}
+
+
+def verdict(pr):
+    c = pr["checks"]
+    if pr["state"] == "MERGED":
+        return "merged"
+    if pr["state"] != "OPEN":
+        return "closed"
+    if c["failing"]:
+        return "ci-failing"
+    if pr["conflicts"]:
+        return "conflicts"
+    if pr["changes_requested"]:
+        return "changes-requested"
+    if c["pending"]:
+        return "ci-pending"
+    if not c["passing"]:
+        return "ci-none"
+    return "green"
+
+
+def render_state(pr):
+    v = verdict(pr)
+    c = pr["checks"]
+    lines = [f"{v}{' (draft)' if pr['draft'] and pr['state'] == 'OPEN' else ''}: {pr['url']} "
+             f"[checks {c['passing']} pass / {len(c['failing'])} fail / {len(c['pending'])} pending]"]
+    if c["failing"]:
+        lines.append("  failing: " + ", ".join(c["failing"]))
+    if c["pending"]:
+        lines.append("  pending: " + ", ".join(c["pending"]))
+    if pr["state"] == "OPEN" and pr["conflicts"]:
+        lines.append(f"  merge conflicts with {pr['base']}")
+    if pr["state"] == "OPEN" and pr["changes_requested"]:
+        lines.append("  changes requested by a reviewer")
+    return hwlib.cap_lines(lines, limit=12)
+
+
+def cmd_state(a, fetcher=fetch):
+    pr = fetcher(a.url)
+    pr["verdict"] = verdict(pr)
+    hwlib.emit(pr, a.json, render_state)
+    return 0
+
+
+def cmd_wait(a, fetcher=fetch, sleep=time.sleep, clock=time.monotonic):
+    deadline = clock() + a.timeout
+    errors = 0
+    while True:
+        try:
+            pr = fetcher(a.url)
+            errors = 0
+        except PrLookupError:
+            errors += 1  # a transient forge error (e.g. HTTP 504) must not end a long wait
+            if errors >= 3:
+                raise
+            sleep(a.interval)
+            continue
+        v = pr["verdict"] = verdict(pr)
+        if v not in ("ci-pending", "ci-none") or clock() + a.interval > deadline:  # ci-none: checks may not have reported yet
+            break
+        sleep(a.interval)
+    hwlib.emit(pr, a.json, render_state)
+    if v == "green":
+        return 0
+    return 3 if v in ("ci-pending", "ci-none") else 1
+
+
+def people_github_handles(path=None):
+    """GitHub reviewer handles from the profile's knowledge/people.md (the backticked list under 'GitHub handles')."""
+    path = path or hwlib.PROFILE_DIR / "knowledge" / "people.md"
+    try:
+        lines = Path(path).read_text().splitlines()
+    except FileNotFoundError:
+        return []
+    for i, ln in enumerate(lines):
+        if "GitHub handles" in ln:
+            return [h.lower() for h in re.findall(r"`([^`]+)`", " ".join(lines[i:i + 3]))]
+    return []
+
+
+def ready_problems(pr, title_pattern, base, reviewers):
+    problems, v = [], verdict(pr)
+    if pr["state"] != "OPEN":
+        problems.append(f"PR is {pr['state'].lower()}")
+    if not pr["draft"] and pr["state"] == "OPEN":
+        problems.append("already out of draft")
+    if v == "ci-failing":
+        problems.append("CI failing: " + ", ".join(pr["checks"]["failing"]))
+    elif v == "ci-pending":
+        problems.append("CI still running: " + ", ".join(pr["checks"]["pending"]))
+    elif v == "ci-none":
+        problems.append("no CI checks reported")
+    if pr["conflicts"]:
+        problems.append(f"merge conflicts with {pr['base']}")
+    if pr["changes_requested"]:
+        problems.append("changes requested")
+    if not re.match(title_pattern, pr["title"]):
+        problems.append(f"title does not match {title_pattern!r}: {pr['title']!r}")
+    if base and pr["base"] != base:
+        problems.append(f"base is {pr['base']}, expected {base}")
+    missing = sorted(set(reviewers) - set(pr["reviewers"]) - {pr["author"]})
+    if missing:
+        problems.append("reviewers not requested: " + ", ".join(missing))
+    return problems
+
+
+def cmd_ready(a, fetcher=fetch, handles=people_github_handles):
+    pr = fetcher(a.url)
+    reviewers = [r.strip().lower() for r in a.reviewers.split(",") if r.strip()] if a.reviewers is not None else handles()
+    problems = ready_problems(pr, a.title_pattern, a.base, reviewers)
+    out = {"url": a.url, "ready": not problems, "problems": problems}
+    hwlib.emit(out, a.json, lambda d: [("ready: " if d["ready"] else "NOT ready: ") + d["url"]] + ["  - " + p for p in d["problems"]])
+    return 0 if not problems else 1
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog="hw-pr", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("state", "wait", "ready-check"):
+        p = sub.add_parser(name)
+        p.add_argument("url")
+        p.add_argument("--json", action="store_true")
+        if name == "wait":
+            p.add_argument("--timeout", type=float, default=540)
+            p.add_argument("--interval", type=float, default=20)
+        if name == "ready-check":
+            p.add_argument("--title-pattern", default=TITLE_PATTERN)
+            p.add_argument("--base")
+            p.add_argument("--reviewers", help="comma-separated; default from knowledge/people.md (GitHub only)")
+    return ap
+
+
+def main(argv=None):
+    a = build_parser().parse_args(argv)
+    try:
+        return {"state": cmd_state, "wait": cmd_wait, "ready-check": cmd_ready}[a.cmd](a)
+    except PrLookupError as e:
+        print(f"hw-pr: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

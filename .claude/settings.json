@@ -1,9 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(bin/zed:*)",
-      "Bash(./bin/zed:*)",
-      "Bash(bin/zed-setup:*)",
+      "Bash(bin/hw:*)",
+      "Bash(./bin/hw:*)",
+      "Bash(bin/hw-setup:*)",
       "Bash(herdr agent:*)",
       "Bash(herdr pane read:*)",
       "Bash(herdr pane list:*)",
@@ -23,12 +23,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/bin/zed hook stop-guard",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/bin/hw hook stop-guard",
             "timeout": 15
           },
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/bin/zed hook arm",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/bin/hw hook arm",
             "asyncRewake": true,
             "timeout": 28800
           }
@@ -41,7 +41,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/bin/zed-pretool",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/bin/hw-pretool",
             "timeout": 10
           }
         ]

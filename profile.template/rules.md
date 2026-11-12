@@ -2,11 +2,11 @@
 
 <!-- Appended to every worker's system prompt after the core worker rules (templates/worker-rules.md).
      Only what is specific to this user: formats, tools, reviewers, base branches, team habits.
-     {{ZED_HOME}} and {{PROFILE}} are replaced with absolute paths at spawn time. -->
+     {{HW_HOME}} and {{PROFILE}} are replaced with absolute paths at spawn time. -->
 
 ## Branches
 - <format, e.g. `<worktype>/<ticket-id>-<short-description>`; where worktype comes from>
-- Zed creates your branch and worktree; stay on it.
+- Herdwright creates your branch and worktree; stay on it.
 
 ## Commits
 - <format, e.g. `TICKET-123 | Description in imperative mood`>
@@ -16,7 +16,7 @@
 
 ## QA tools
 - Browser QA: <tool, e.g. `playwright-cli`, fallback `agent-browser`>. How to run and log in per repo:
-  `{{PROFILE}}/knowledge/repos/<repo>.md`; if it isn't documented and you can't work it out, ask Zed.
+  `{{PROFILE}}/knowledge/repos/<repo>.md`; if it isn't documented and you can't work it out, ask Herdwright.
 
 ## Pull requests
 - Title: <format>. Target: the base branch from your brief.

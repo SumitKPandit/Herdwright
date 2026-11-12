@@ -21,7 +21,7 @@ from pathlib import Path
 
 VISIBLE_LINES = 40  # what `agent read --source visible` shows: the bottom of the screen
 # what a hat session must not inherit from the coordinator's shell: herdr starts a pane with its own identity
-COORDINATOR_ONLY = ("HERDR_PANE_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID", "OPENCODE_SESSION_ID", "OPENCODE_PID", "ZED_COORDINATOR")
+COORDINATOR_ONLY = ("HERDR_PANE_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID", "OPENCODE_SESSION_ID", "OPENCODE_PID", "HW_COORDINATOR")
 
 
 def home(root=None):

@@ -1,12 +1,12 @@
 #!/bin/sh
-# Zed guard (installed by bin/zed-setup): `main` holds core only, so no commit on main may touch
+# Herdwright guard (installed by bin/hw-setup): `main` holds core only, so no commit on main may touch
 # profile/. Also runs as pre-merge-commit, which catches merging a profile branch into main.
-# The always-loaded files (what every Zed session reads at start) have a word budget: a commit that touches
+# The always-loaded files (what every Herdwright session reads at start) have a word budget: a commit that touches
 # one of them fails when the total is over it. Prune, or move content into a skill (`learn` skill).
 if git diff --cached --name-only | grep -qE '^(AGENTS\.md|playbook\.md|failure-modes\.md|profile/profile\.md|profile/lessons\.md)$'; then
   top=$(git rev-parse --show-toplevel)
-  if [ -x "$top/bin/zed" ] && ! "$top/bin/zed" doctor --quiet; then
-    echo "zed guard: always-loaded context is over its word budget (see above); prune before committing." >&2
+  if [ -x "$top/bin/hw" ] && ! "$top/bin/hw" doctor --quiet; then
+    echo "hw guard: always-loaded context is over its word budget (see above); prune before committing." >&2
     exit 1
   fi
 fi
@@ -14,8 +14,8 @@ branch=$(git symbolic-ref --short -q HEAD)
 [ "$branch" = main ] || exit 0
 staged=$(git diff --cached --name-only -- profile/)
 if [ -n "$staged" ]; then
-  echo "zed guard: refusing to commit profile/ on main (main is core only):" >&2
+  echo "hw guard: refusing to commit profile/ on main (main is core only):" >&2
   echo "$staged" | sed 's/^/  /' >&2
-  echo "Commit it on your profile branch instead; core changes reach main via bin/zed-core-sync." >&2
+  echo "Commit it on your profile branch instead; core changes reach main via bin/hw-core-sync." >&2
   exit 1
 fi

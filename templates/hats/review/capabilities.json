@@ -1,5 +1,5 @@
 {
-  "scripts": ["zed-pr", "zed-review", "zed-checks", "zed-employee"],
+  "scripts": ["hw-pr", "hw-review", "hw-checks", "hw-employee"],
   "skills": ["review-maintainability", "code-rules", "completion-evidence", "finish"],
   "deny": {"edit": ["**", "profile/**"], "commands": ["gh pr review", "gh pr comment"],
            "except": ["profile/briefs/*-plan.md", "profile/briefs/*-findings.md", "profile/.cache/status/{session}.log"]},

@@ -1,6 +1,6 @@
-"""Real-runtime smoke for OpenCode: workers (`bin/zed spawn runtime=opencode`) and the coordinator
-(`bin/zed coordinator`, `bin/zed start`) against the installed `opencode` and a live herdr, in a throwaway profile and
-demo repo. For workers nothing is stubbed except Zed's own lock and capacity checks; the coordinator runs unstubbed.
+"""Real-runtime smoke for OpenCode: workers (`bin/hw spawn runtime=opencode`) and the coordinator
+(`bin/hw coordinator`, `bin/hw start`) against the installed `opencode` and a live herdr, in a throwaway profile and
+demo repo. For workers nothing is stubbed except Herdwright's own lock and capacity checks; the coordinator runs unstubbed.
 
 Not part of the default test run (its name does not match `test_*.py`), and skipped when `opencode` or herdr is
 missing. It starts model turns with neutral text only, on the shipped default model and variant (the profile template's
@@ -14,33 +14,33 @@ What is claimed about a guard is checked without asking a model for anything: th
 shell routes directly, which run the same check as a tool call. OpenCode v2.2.7 has no API that runs a tool without
 the model and the coordinator has no shell hook (its server's shell is the user's own), so the coordinator's guard is
 called the way its plugin calls it: the program the installed plugin names, with the plugin's environment and the
-call on stdin. That this is the route a real tool call takes is shown by the canary, the one call Zed itself needs a
+call on stdin. That this is the route a real tool call takes is shown by the canary, the one call Herdwright itself needs a
 model turn for: the session's real call and the direct one are refused in the same words. A model is in the loop
 only where the claim is about the model's session (its model and variant, the instructions and skills it loaded, its
 permission rules); the denied calls are also asked of the model once each, and shown when it makes them, not required.
 
 It proves, and prints the evidence for:
-1. a worker whose deny plugin does not load (the V1 plugin Zed used to write, which V2 ignores) fails the canary: its
+1. a worker whose deny plugin does not load (the V1 plugin Herdwright used to write, which V2 ignores) fails the canary: its
    session is marked failed, no TUI is started and no brief is handed over;
 2. a worker with the V2 plugin passes the canary, runs the configured model and variant, has read the repository's
-   `AGENTS.md` and Zed's rules but not `CLAUDE.md`, and has loaded one repository skill from `.claude/skills` and one
+   `AGENTS.md` and Herdwright's rules but not `CLAUDE.md`, and has loaded one repository skill from `.claude/skills` and one
    from `.opencode/skills`; its server's shells hold no server password, and its two shell routes refuse what its hat
    (review) denies even to a caller who has the password: a write in the worktree by an absolute path, by a relative
    one, after a `cd` in a subshell, and an outward command, while a write outside the worktree runs. Any write, edit,
    subagent or outward call the model itself makes when asked is denied too (shown when made, not required).
    (Not stopped, and not claimed: the terminal route `/api/pty` with a password read from the process list, a server
    the worker starts, a script.)
-3. a coordinator whose guard plugin does not load fails its canary: no record is written and `bin/zed start` refuses
+3. a coordinator whose guard plugin does not load fails its canary: no record is written and `bin/hw start` refuses
    the session;
-4. a coordinator opened with the guard holds the lock after `bin/zed start`, and its guard, called as its plugin calls
+4. a coordinator opened with the guard holds the lock after `bin/hw start`, and its guard, called as its plugin calls
    it, denies an edit, a commit and a shell write by a relative path (`touch`, `rm` with `workdir` set to the project)
    in a project repo, while a write in its profile passes: no model is asked for any of this. From its model's
    session (this part needs the model to do what is asked): it runs the configured model and variant, has the manual
    (`AGENTS.md`) and the profile's files in its instructions, has the coordinator's skills (the server activates
-   one), and runs `bin/zed start` without a permission prompt;
-5. `bin/zed coordinator` in a herdr pane opens the TUI on the configured model and variant, `bin/zed start` in that
+   one), and runs `bin/hw start` without a permission prompt;
+5. `bin/hw coordinator` in a herdr pane opens the TUI on the configured model and variant, `bin/hw start` in that
    session takes the lock, and closing the pane stops the server;
-6. `bin/zed start` in a coordinator's session starts the long-lived watcher, and one only; for an event the watcher
+6. `bin/hw start` in a coordinator's session starts the long-lived watcher, and one only; for an event the watcher
    queues (a tracked session whose pane is gone: no model is asked for anything) the idle session is prompted through
    its server, the id of the admitted message is kept on the event, and a turn starts;
 7. when the server refuses the watcher's call (here: a wrong password), the same prompt is typed into the coordinator's
@@ -63,10 +63,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import _load  # noqa: F401  (puts bin/lib on sys.path, drops a worker's ZED_* variables)
+import _load  # noqa: F401  (puts bin/lib on sys.path, drops a worker's HW_* variables)
 
-import zedemployee as emp
-import zedlib
+import hwemployee as emp
+import hwlib
 
 HOME = Path(__file__).resolve().parents[1]
 TURN_SECONDS = 420  # for the worker's first turn (its brief)
@@ -124,7 +124,7 @@ class OpenCodeWorkerSmoke(unittest.TestCase):
         (self.profile / "config" / "projects.json").write_text(json.dumps(
             {"worktree_root": str(self.root / "wt"), "repos": {"demo": {"path": str(self.repo), "dev_base": "main"}}}))
         for cmd in (["init", "-q", "-b", "main"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
-            zedlib.git(self.repo, *cmd)
+            hwlib.git(self.repo, *cmd)
         (self.repo / "AGENTS.md").write_text(f"# Demo\nThe repository code word is {self.words['REPO']}.\n")
         (self.repo / "CLAUDE.md").write_text(f"# Demo\nThe repository code word is {self.words['CLAUDE']}.\n")
         for folder, name, word in ((".claude", "smoke-claude-skill", "SKILLC"), (".opencode", "smoke-opencode-skill", "SKILLO")):
@@ -132,26 +132,26 @@ class OpenCodeWorkerSmoke(unittest.TestCase):
             skill.parent.mkdir(parents=True)
             skill.write_text(f"---\nname: {name}\ndescription: Gives the code word of {name}. Load it when asked for that code word.\n---\n"
                              f"The code word of this skill is {self.words[word]}.\n")
-        zedlib.git(self.repo, "add", ".")
-        zedlib.git(self.repo, "commit", "-qm", "init")
+        hwlib.git(self.repo, "add", ".")
+        hwlib.git(self.repo, "commit", "-qm", "init")
         self.worktree.parent.mkdir(parents=True)
-        zedlib.git(self.repo, "worktree", "add", "-q", "-b", "task/smoke", str(self.worktree))
+        hwlib.git(self.repo, "worktree", "add", "-q", "-b", "task/smoke", str(self.worktree))
         self.brief = self.root / "brief.md"
         self.brief.write_text(
             "# Brief: startup check of this worker\n\n## Goal\n"
-            "This is Zed's own check that a newly started worker runs, whatever hat it wears. There is nothing to review, "
+            "This is Herdwright's own check that a newly started worker runs, whatever hat it wears. There is nothing to review, "
             "nothing to read and nothing to write.\n\n"
-            "## Plan\n- Reply with the single line ZED:DONE and stop. Write no plan file and read no file.\n\n"
+            "## Plan\n- Reply with the single line HW:DONE and stop. Write no plan file and read no file.\n\n"
             "## Definition of done\n- The reply is sent.\n")
-        for name, value in (("PROFILE_DIR", self.profile), ("DB_PATH", self.profile / "db" / "zed.db"),
+        for name, value in (("PROFILE_DIR", self.profile), ("DB_PATH", self.profile / "db" / "hw.db"),
                             ("PROJECTS_PATH", self.profile / "config" / "projects.json")):
-            patcher = patch.object(zedlib, name, value)
+            patcher = patch.object(hwlib, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        self.z = types.ModuleType("zed")
-        self.z.__file__ = str(HOME / "bin/zed")
-        with patch.dict(os.environ, {"ZED_PROFILE_DIR": str(self.profile)}):
-            exec(compile((HOME / "bin/zed").read_text(), self.z.__file__, "exec"), self.z.__dict__)
+        self.z = types.ModuleType("hw")
+        self.z.__file__ = str(HOME / "bin/hw")
+        with patch.dict(os.environ, {"HW_PROFILE_DIR": str(self.profile)}):
+            exec(compile((HOME / "bin/hw").read_text(), self.z.__file__, "exec"), self.z.__dict__)
         self.kits = []
         real_kit = self.z.hat_kit
 
@@ -215,13 +215,13 @@ class OpenCodeWorkerSmoke(unittest.TestCase):
         print(f"  {label}: {value}")
 
     def test_1_a_worker_whose_plugin_does_not_load_is_refused(self):
-        def v1_plugin(directory, zed_home, env, deny_tools=()):  # what Zed wrote before the V2 port: V2 does not load it
-            plugin = Path(directory) / "plugins" / "zed-deny.js"
+        def v1_plugin(directory, hw_home, env, deny_tools=()):  # what Herdwright wrote before the V2 port: V2 does not load it
+            plugin = Path(directory) / "plugins" / "hw-deny.js"
             plugin.parent.mkdir(parents=True, exist_ok=True)
-            plugin.write_text('export const ZedDeny = async () => ({ "tool.execute.before": async () => { throw new Error("denied"); } });\n')
+            plugin.write_text('export const HwDeny = async () => ({ "tool.execute.before": async () => { throw new Error("denied"); } });\n')
             return Path(directory)
 
-        with patch.object(self.z.zeddeny, "opencode_plugin", side_effect=v1_plugin):
+        with patch.object(self.z.hwdeny, "opencode_plugin", side_effect=v1_plugin):
             out, s, refused = self.spawn()
         print("\nguard not live (V1 plugin on OpenCode V2):")
         self.say("spawn said", out.strip().splitlines()[-3:])
@@ -252,7 +252,7 @@ class OpenCodeWorkerSmoke(unittest.TestCase):
         self.api("POST", f"/experimental/session/{session}/wait", timeout=TURN_SECONDS)  # the brief's turn has ended
         server_pid = self.api("GET", "/info")["pid"]
 
-        # the guard, with no model in the loop: the server's two shell routes run zed-deny for any caller
+        # the guard, with no model in the loop: the server's two shell routes run hw-deny for any caller
         seen, wt = self.evidence / "password.txt", self.worktree
         self.assertEqual(self.shell_route(f"/session/{session}/shell", {"command": f"env | grep -c '^OPENCODE_PASSWORD=' > {seen}"}, seen), (False, True))
         self.assertEqual(seen.read_text().strip(), "0")  # a shell of this server does not hold its password
@@ -285,13 +285,13 @@ class OpenCodeWorkerSmoke(unittest.TestCase):
 
         for c in calls:
             self.say("call", f"{c.get('name')} {json.dumps(c['state']['input'])[:160]} -> {c['state']['status']} {reason(c)[:120]}")
-        canary = next(c for c in calls if str(c["state"]["input"].get("command", "")).startswith("zed-deny-canary"))
+        canary = next(c for c in calls if str(c["state"]["input"].get("command", "")).startswith("hw-deny-canary"))
         self.assertTrue(denied(canary) and "canary" in reason(canary), canary)
         self.say("canary", f"{canary['state']['input']['command']} -> {reason(canary)}")
         inside = lambda c: self.worktree in (self.worktree / str(c["state"]["input"].get("path", ""))).resolve().parents
         for what, made, why in (
-                ("write or edit in the worktree", [c for c in calls if c.get("name") in ("write", "edit") and inside(c)], "zed-deny: editing"),
-                ("subagent", [c for c in calls if c.get("name") in self.z.zeddeny.SUBAGENT_TOOLS], "this hat starts no subagents"),
+                ("write or edit in the worktree", [c for c in calls if c.get("name") in ("write", "edit") and inside(c)], "hw-deny: editing"),
+                ("subagent", [c for c in calls if c.get("name") in self.z.hwdeny.SUBAGENT_TOOLS], "this hat starts no subagents"),
                 ("outward command", [c for c in calls if "gh pr comment" in str(c["state"]["input"].get("command", ""))], "`gh pr comment` is denied")):
             self.assertTrue(all(denied(c) and why in reason(c) for c in made), made)
             self.say(f"{what}, as tool calls of the model", f"{len(made)} made, all denied" if made else "none made by the model (not required)")
@@ -310,7 +310,7 @@ class OpenCodeWorkerSmoke(unittest.TestCase):
                                   [self.words["REPO"], self.words["RULES"]])
         self.say("code words the worker gave", sorted(w for w in self.words.values() if w in words))
         self.assertIn(self.words["REPO"], words)  # the repository's AGENTS.md
-        self.assertIn(self.words["RULES"], words)  # Zed's rules, from the per-session config dir's AGENTS.md ...
+        self.assertIn(self.words["RULES"], words)  # Herdwright's rules, from the per-session config dir's AGENTS.md ...
         reads = [str(c["state"]["input"].get("path", "")) for c in self.tool_calls(session) if c.get("name") == "read" and not denied(c)]  # that worked
         self.assertFalse([p for p in reads if "rules" in p or p.endswith(("AGENTS.md", "CLAUDE.md", "SKILL.md"))], reads)  # ... not from reading a file
         self.assertNotIn(self.words["CLAUDE"], words)  # CLAUDE.md is not read by OpenCode V2
@@ -318,7 +318,7 @@ class OpenCodeWorkerSmoke(unittest.TestCase):
             text = activated_skill(self, session, name)
             self.say(f"skill {name}, activated by the server", text.strip())
             self.assertIn(self.words[word], text)
-        # the worker's shell commands run in its server: the session's pane must host it, or `zed-employee finish` refuses
+        # the worker's shell commands run in its server: the session's pane must host it, or `hw-employee finish` refuses
         info = json.loads(subprocess.run(["herdr", "pane", "process-info", "--pane", s["pane_id"]], capture_output=True, text=True).stdout)
         self.assertIn(info["result"]["process_info"]["shell_pid"], emp.ancestors(server_pid))
         self.say("server process", f"pid {server_pid}, a child of the shell of the session's pane {s['pane_id']}")
@@ -329,7 +329,7 @@ class OpenCodeWorkerSmoke(unittest.TestCase):
             time.sleep(0.5)
         self.assertTrue(subprocess.run(["/bin/ps", "-p", str(server_pid)], capture_output=True).returncode, "the server outlived its workspace")
         self.say("server after its workspace closed", "gone")
-        self.assertEqual(zedlib.git(self.worktree, "status", "--porcelain").stdout.strip(), "")  # the worktree is untouched
+        self.assertEqual(hwlib.git(self.worktree, "status", "--porcelain").stdout.strip(), "")  # the worktree is untouched
         self.assertEqual((self.worktree / "AGENTS.md").read_text(), (self.repo / "AGENTS.md").read_text())
 
 
@@ -340,8 +340,8 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name).resolve()
         self.profile = self.root / "profile"
-        # a project repo is anywhere outside Zed's home, the profile and the temp dirs (which the guard leaves writable)
-        self.project = Path(tempfile.mkdtemp(prefix=".zed-smoke-project-", dir=Path.home()))
+        # a project repo is anywhere outside Herdwright's home, the profile and the temp dirs (which the guard leaves writable)
+        self.project = Path(tempfile.mkdtemp(prefix=".hw-smoke-project-", dir=Path.home()))
         self.addCleanup(shutil.rmtree, self.project, True)
         self.word = f"PROFILE-{secrets.token_hex(3)}"
         (self.profile / "config").mkdir(parents=True)
@@ -350,19 +350,19 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
         (self.profile / "config" / "opencode.json").write_text(json.dumps(CONFIG))
         (self.profile / "config" / "projects.json").write_text(json.dumps({"worktree_root": str(self.root / "wt"), "repos": {}}))
         for cmd in (["init", "-q", "-b", "main"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
-            zedlib.git(self.project, *cmd)
-        patcher = patch.object(zedlib, "PROFILE_DIR", self.profile)
+            hwlib.git(self.project, *cmd)
+        patcher = patch.object(hwlib, "PROFILE_DIR", self.profile)
         patcher.start()
         self.addCleanup(patcher.stop)
         # a plain terminal: neither this test's own agent session nor its herdr pane is the coordinator's
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith(("ZED_", "OPENCODE_", "CLAUDE", "HERDR_"))}
-        self.env["ZED_PROFILE_DIR"] = str(self.profile)
-        self.z = types.ModuleType("zed")
-        self.z.__file__ = str(HOME / "bin/zed")
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith(("HW_", "OPENCODE_", "CLAUDE", "HERDR_"))}
+        self.env["HW_PROFILE_DIR"] = str(self.profile)
+        self.z = types.ModuleType("hw")
+        self.z.__file__ = str(HOME / "bin/hw")
         with patch.dict(os.environ, self.env, clear=True):
-            exec(compile((HOME / "bin/zed").read_text(), self.z.__file__, "exec"), self.z.__dict__)
+            exec(compile((HOME / "bin/hw").read_text(), self.z.__file__, "exec"), self.z.__dict__)
         self.record = self.profile / ".cache" / "coordinator.json"
-        self.before = zedlib.git(HOME, "status", "--porcelain").stdout
+        self.before = hwlib.git(HOME, "status", "--porcelain").stdout
         self.server = None
         self.addCleanup(self.stop_watcher)  # `start` leaves the long-lived watcher running
 
@@ -405,7 +405,7 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
         deadline = time.monotonic() + TURN_SECONDS
         while True:
             new = [m for m in self.api("GET", f"/session/{session}/message") if m["id"] not in seen]
-            told = [m for m in new if m.get("type") == "user" and "Watcher events for Zed" in json.dumps(m)]
+            told = [m for m in new if m.get("type") == "user" and "Watcher events for Herdwright" in json.dumps(m)]
             if told and [m for m in new if m.get("type") == "assistant"]:
                 self.api("POST", f"/experimental/session/{session}/wait", timeout=TURN_SECONDS)
                 return event, told[0]
@@ -449,7 +449,7 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
         """What the coordinator's guard decides about a tool call of `session`, with no model asked for it: the program
         the installed plugin names is run as the plugin runs it (the call on stdin, the plugin's environment). Returns
         the reason it denies, or "" when it lets the call through."""
-        path = kit["config_dir"] / "plugins" / "zed-pretool" / "index.js"
+        path = kit["config_dir"] / "plugins" / "hw-pretool" / "index.js"
         plugin = path.read_text()
         program, env = re.search(r'spawnSync\(("(?:[^"\\]|\\.)*")', plugin), re.search(r"^const ENV = (\{.*\});$", plugin, re.M)
         self.assertTrue(program and env, f"{path}: no `spawnSync(\"<program>\"` or no `const ENV = {{...}};` line to read the guard's call from")
@@ -457,7 +457,7 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
         call = {"tool_name": tool, "tool_input": tool_input, "cwd": str(HOME), "session_id": session}
         r = subprocess.run([program], input=json.dumps(call), capture_output=True, text=True, env=self.env | env, timeout=60)
         if r.returncode:
-            return (r.stderr or "zed-pretool could not run").strip()
+            return (r.stderr or "hw-pretool could not run").strip()
         decision = json.loads(r.stdout).get("hookSpecificOutput", {}) if r.stdout.strip() else {}
         return decision["permissionDecisionReason"] if decision.get("permissionDecision") == "deny" else ""
 
@@ -478,32 +478,32 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
                   + json.dumps([c["state"]["input"] for c in self.calls(session)][-4:])[:600])
 
     def start_as(self, session):
-        """`bin/zed start` as the shell tool of `session` would run it."""
-        env = self.env | {"OPENCODE_SESSION_ID": session, "ZED_COORDINATOR": str(self.record)}
-        return subprocess.run([sys.executable, str(HOME / "bin" / "zed"), "start"], env=env, capture_output=True, text=True, timeout=60)
+        """`bin/hw start` as the shell tool of `session` would run it."""
+        env = self.env | {"OPENCODE_SESSION_ID": session, "HW_COORDINATOR": str(self.record)}
+        return subprocess.run([sys.executable, str(HOME / "bin" / "hw"), "start"], env=env, capture_output=True, text=True, timeout=60)
 
     def say(self, label, value):
         print(f"  {label}: {value}")
 
     def test_3_a_coordinator_whose_plugin_does_not_load_is_not_opened_and_start_refuses_it(self):
-        def v1_plugin(directory, zed_home, env):  # the V1 shape: V2 does not load it
-            plugin = Path(directory) / "plugins" / "zed-pretool.js"
+        def v1_plugin(directory, hw_home, env):  # the V1 shape: V2 does not load it
+            plugin = Path(directory) / "plugins" / "hw-pretool.js"
             plugin.parent.mkdir(parents=True, exist_ok=True)
-            plugin.write_text('export const ZedPretool = async () => ({ "tool.execute.before": async () => { throw new Error("denied"); } });\n')
+            plugin.write_text('export const HwPretool = async () => ({ "tool.execute.before": async () => { throw new Error("denied"); } });\n')
             return Path(directory)
 
-        with patch.object(self.z.zeddeny, "coordinator_plugin", side_effect=v1_plugin):
+        with patch.object(self.z.hwdeny, "coordinator_plugin", side_effect=v1_plugin):
             kit, session, problem = self.open()
         print("\ncoordinator guard not live (V1 plugin on OpenCode V2):")
         self.say("open_coordinator said", problem)
-        self.assertIn("was not denied (status completed): the coordinator guard (bin/zed-pretool) is not live", problem)
+        self.assertIn("was not denied (status completed): the coordinator guard (bin/hw-pretool) is not live", problem)
         self.assertFalse(self.record.exists())
         self.assertIn('message="failed to load plugin"', Path(kit["server"]["log"]).read_text())
         r = self.start_as(session)
-        self.say("bin/zed start in that session", f"exit {r.returncode}: {r.stderr.strip()}")
+        self.say("bin/hw start in that session", f"exit {r.returncode}: {r.stderr.strip()}")
         self.assertEqual(r.returncode, 1)
-        self.assertIn("was not opened by `bin/zed coordinator`, so its guard (bin/zed-pretool) is not proven live", r.stderr)
-        self.assertFalse((self.profile / ".cache" / "zed.lock").exists())
+        self.assertIn("was not opened by `bin/hw coordinator`, so its guard (bin/hw-pretool) is not proven live", r.stderr)
+        self.assertFalse((self.profile / ".cache" / "hw.lock").exists())
 
     def test_4_a_guarded_coordinator_starts_holds_the_lock_and_cannot_change_a_project_repo(self):
         kit, session, problem = self.open()
@@ -515,18 +515,18 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
         reason = lambda c: str((c["state"].get("error") or {}).get("message", ""))
         made = lambda needle: [c for c in self.calls(session) if needle in json.dumps(c["state"]["input"])]
 
-        # 1. Without a model. The canary is the session's one real call (Zed's own startup check): the guard called
+        # 1. Without a model. The canary is the session's one real call (Herdwright's own startup check): the guard called
         # directly, as the plugin calls it, refuses the same input in the same words, so it is the route a real call takes.
-        canary, = made("zed-pretool-canary")
+        canary, = made("hw-pretool-canary")
         self.assertEqual(canary["state"]["status"], "error")
-        self.assertIn("zed-pretool: canary: `zed-pretool-canary", reason(canary))
+        self.assertIn("hw-pretool: canary: `hw-pretool-canary", reason(canary))
         self.say("canary", f"{canary['state']['input']['command']} -> {reason(canary)}")
         self.assertEqual(self.guard(kit, session, "shell", **canary["state"]["input"]), reason(canary))
         self.say("the same call, made directly to the guard", "refused in the same words")
 
         digest = self.start_as(session)
         self.assertEqual(digest.returncode, 0, digest.stderr)
-        lock = json.loads((self.profile / ".cache" / "zed.lock").read_text())
+        lock = json.loads((self.profile / ".cache" / "hw.lock").read_text())
         self.assertEqual(lock["agent_session"], session)
         self.say("lock", {k: lock.get(k) for k in ("agent_session", "pane")})
         self.assertIn(f"runtime: opencode · session {session} · guard proven live at", digest.stdout)
@@ -538,16 +538,16 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
         (self.project / "keep.txt").write_text("keep\n")
         cases = (  # what, the tool, its input (the shapes OpenCode v2.2.7 passes), the guard's reason, how the model is asked for it
             ("write in a project repo", "write", {"path": str(denied_file), "content": "x"},
-             f"zed-pretool: {denied_file} is outside Zed's repo, profile and temp dirs",
+             f"hw-pretool: {denied_file} is outside Herdwright's repo, profile and temp dirs",
              f"Call the write tool exactly once with the path {denied_file} and the content x."),
-            ("commit in a project repo", "shell", {"command": f"git -C {self.project} commit --allow-empty -m x"}, "zed-pretool: `git commit` in",
+            ("commit in a project repo", "shell", {"command": f"git -C {self.project} commit --allow-empty -m x"}, "hw-pretool: `git commit` in",
              f"Call the shell tool exactly once with exactly this command: git -C {self.project} commit --allow-empty -m x"),
             # S339 B1: a relative path, with the shell tool's workdir set to the project repo
             ("touch by a relative path, workdir in a project repo", "shell", {"command": "touch qa-relative.txt", "workdir": str(self.project)},
-             "zed-pretool: `touch` on qa-relative.txt in",
+             "hw-pretool: `touch` on qa-relative.txt in",
              f"Call the shell tool exactly once with the command `touch qa-relative.txt` and its workdir parameter set to {self.project} ."),
             ("rm by a relative path, workdir in a project repo", "shell", {"command": "rm keep.txt", "workdir": str(self.project)},
-             "zed-pretool: `rm` on keep.txt in",
+             "hw-pretool: `rm` on keep.txt in",
              f"Call the shell tool exactly once with the command `rm keep.txt` and its workdir parameter set to {self.project} ."))
         for what, tool, tool_input, why, _ in cases:
             said = self.guard(kit, session, tool, **tool_input)
@@ -556,11 +556,11 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
         self.assertEqual(self.guard(kit, session, "write", path=str(note), content="x"), "")  # its own profile stays writable
         self.say("guard, called directly: write in the profile", "allowed")
         self.assertEqual(self.guard(kit, "ses_another", "write", path=str(denied_file), content="x"), "")  # and it acts on the lock holder only
-        self.say("guard, called directly: the same write by a session that does not hold the lock", "allowed (not Zed)")
+        self.say("guard, called directly: the same write by a session that does not hold the lock", "allowed (not Herdwright)")
 
         # 2. From the model's session: only a call the model makes shows its permission rules.
-        (start, *_), asked = self.asked_call(session, "Call the shell tool exactly once with exactly this command: bin/zed start", "bin/zed start")
-        self.say("bin/zed start", f"{start['state']['status']}; permission asked: {asked}; state keys {sorted(start['state'])}")
+        (start, *_), asked = self.asked_call(session, "Call the shell tool exactly once with exactly this command: bin/hw start", "bin/hw start")
+        self.say("bin/hw start", f"{start['state']['status']}; permission asked: {asked}; state keys {sorted(start['state'])}")
         self.assertEqual((start["state"]["status"], asked), ("completed", []))  # the permission rules let it run unprompted
         # The same denied calls, asked of the model once each: evidence when it makes them, even after the user allows them
         for what, _, tool_input, why, ask in cases:
@@ -574,33 +574,33 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
             if not made_calls:
                 self.say(f"the model's own call: {what}", "not made by the model (not required)")
         self.assertEqual(sorted(p.name for p in self.project.iterdir()), [".git", "keep.txt"])  # nothing created, nothing deleted
-        self.assertNotEqual(zedlib.git(self.project, "rev-parse", "HEAD").returncode, 0)  # still no commit
+        self.assertNotEqual(hwlib.git(self.project, "rev-parse", "HEAD").returncode, 0)  # still no commit
 
-        expected = [self.word, "bin/zed start"]
+        expected = [self.word, "bin/hw start"]
         text = instruction_words(self, session, self.turn, "Which code word do your instructions give you, and which one command does your "
                                  "operating manual tell you to run at the start of every session? Reply with both.", expected)
         self.say("from its instructions", [w for w in expected if w in text])
         self.assertIn(self.word, text)  # the profile's profile.md, loaded through `instructions`
-        self.assertIn("bin/zed start", text)  # the manual: this repo's AGENTS.md
+        self.assertIn("bin/hw start", text)  # the manual: this repo's AGENTS.md
         reads = [str(c["state"]["input"].get("path", "")) for c in self.calls(session) if c.get("name") == "read"]
         self.assertFalse([p for p in reads if p.endswith(("AGENTS.md", "CLAUDE.md", "profile.md"))], reads)  # not from reading a file
         relay = activated_skill(self, session, "relay")  # a coordinator skill, from this repo's .claude/skills
         self.say("skill relay, activated by the server", relay.strip().splitlines()[:2])
-        self.assertIn("bin/zed relay", relay)
+        self.assertIn("bin/hw relay", relay)
 
         models = {json.dumps(m["model"], sort_keys=True) for m in self.api("GET", f"/session/{session}/message") if m.get("type") == "assistant"}
         self.assertEqual(models, {MODEL})
         self.say("model of every assistant message", models)
-        self.assertEqual(zedlib.git(HOME, "status", "--porcelain").stdout, self.before)  # Zed's own checkout is untouched
+        self.assertEqual(hwlib.git(HOME, "status", "--porcelain").stdout, self.before)  # Herdwright's own checkout is untouched
 
     @unittest.skipUnless(herdr_up(), "herdr is not running")
     def test_5_the_command_opens_the_tui_in_a_pane_and_closing_it_stops_the_server(self):
-        ws = json.loads(subprocess.run(["herdr", "workspace", "create", "--cwd", str(HOME), "--label", "zed coordinator smoke", "--no-focus",
-                                        "--env", f"ZED_PROFILE_DIR={self.profile}"], capture_output=True, text=True).stdout)["result"]
+        ws = json.loads(subprocess.run(["herdr", "workspace", "create", "--cwd", str(HOME), "--label", "hw coordinator smoke", "--no-focus",
+                                        "--env", f"HW_PROFILE_DIR={self.profile}"], capture_output=True, text=True).stdout)["result"]
         ws_id, pane = ws["workspace"]["workspace_id"], ws["root_pane"]["pane_id"]
         self.addCleanup(subprocess.run, ["herdr", "workspace", "close", ws_id], capture_output=True)
         time.sleep(1.5)
-        subprocess.run(["herdr", "pane", "run", pane, f"{HOME}/bin/zed coordinator"], capture_output=True)
+        subprocess.run(["herdr", "pane", "run", pane, f"{HOME}/bin/hw coordinator"], capture_output=True)
         deadline = time.monotonic() + 240
         while not self.record.exists():
             self.assertLess(time.monotonic(), deadline, subprocess.run(["herdr", "pane", "read", pane], capture_output=True, text=True).stdout)
@@ -608,11 +608,11 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
         record = json.loads(self.record.read_text())
         self.server, session = record["server"], record["session"]
         print("\ncoordinator in a herdr pane:")
-        (start, *_), asked = self.asked_call(session, "Call the shell tool exactly once with exactly this command: bin/zed start", "bin/zed start")
+        (start, *_), asked = self.asked_call(session, "Call the shell tool exactly once with exactly this command: bin/hw start", "bin/hw start")
         screen = subprocess.run(["herdr", "pane", "read", pane], capture_output=True, text=True).stdout
-        self.say("bin/zed start", f"{start['state']['status']} {str((start['state'].get('error') or {}).get('message', ''))[:300]}; permission asked: {asked}")
+        self.say("bin/hw start", f"{start['state']['status']} {str((start['state'].get('error') or {}).get('message', ''))[:300]}; permission asked: {asked}")
         self.assertEqual(start["state"]["status"], "completed", screen)
-        lock = json.loads((self.profile / ".cache" / "zed.lock").read_text())
+        lock = json.loads((self.profile / ".cache" / "hw.lock").read_text())
         self.say("lock", {k: lock.get(k) for k in ("agent_session", "pane")})
         self.assertEqual((lock["agent_session"], lock["pane"]), (session, pane))
         footer = next((line.strip(" ┃") for line in screen.splitlines() if FOOTER in line), "")
@@ -636,7 +636,7 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
         digest = self.start_as(session)
         self.assertEqual(digest.returncode, 0, digest.stderr)
         line = next(l for l in digest.stdout.splitlines() if l.startswith("watcher:"))
-        self.say("bin/zed start", line)
+        self.say("bin/hw start", line)
         self.assertRegex(line, r"^watcher: was NOT RUNNING; started now, pid \d+$")
         pid = self.watcher_pid()
         self.assertEqual(line.rsplit(" ", 1)[1], str(pid))
@@ -650,10 +650,10 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
         self.say("admitted message", f"{told['id']} type {told['type']}; an assistant message followed")
 
         again = self.start_as(session)
-        self.say("bin/zed start again", next(l for l in again.stdout.splitlines() if l.startswith("watcher:")))
+        self.say("bin/hw start again", next(l for l in again.stdout.splitlines() if l.startswith("watcher:")))
         self.assertIn(f"watcher: alive, pid {pid}", again.stdout)
-        env = self.env | {"OPENCODE_SESSION_ID": session, "ZED_COORDINATOR": str(self.record)}
-        second = subprocess.run([sys.executable, str(HOME / "bin" / "zed"), "watch", "--daemon"], env=env, capture_output=True, text=True, timeout=60)
+        env = self.env | {"OPENCODE_SESSION_ID": session, "HW_COORDINATOR": str(self.record)}
+        second = subprocess.run([sys.executable, str(HOME / "bin" / "hw"), "watch", "--daemon"], env=env, capture_output=True, text=True, timeout=60)
         self.say("a second watcher", f"exit {second.returncode}: {second.stdout.strip()}")
         self.assertEqual((second.returncode, self.watcher_pid()), (4, pid))
         self.assertIn(f"WATCH_ALREADY_RUNNING pid {pid}", second.stdout)
@@ -661,16 +661,16 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
         mine = [p for p in running if str(self.profile) in subprocess.run(["/bin/ps", "eww", "-p", p], capture_output=True, text=True).stdout]
         self.say("watchers of this profile", mine)
         self.assertEqual(mine, [str(pid)])
-        self.assertEqual(zedlib.git(HOME, "status", "--porcelain").stdout, self.before)
+        self.assertEqual(hwlib.git(HOME, "status", "--porcelain").stdout, self.before)
 
     @unittest.skipUnless(herdr_up(), "herdr is not running")
     def test_7_when_the_server_refuses_the_wake_is_typed_into_the_coordinators_pane(self):
-        ws = json.loads(subprocess.run(["herdr", "workspace", "create", "--cwd", str(HOME), "--label", "zed wake smoke", "--no-focus",
-                                        "--env", f"ZED_PROFILE_DIR={self.profile}"], capture_output=True, text=True).stdout)["result"]
+        ws = json.loads(subprocess.run(["herdr", "workspace", "create", "--cwd", str(HOME), "--label", "hw wake smoke", "--no-focus",
+                                        "--env", f"HW_PROFILE_DIR={self.profile}"], capture_output=True, text=True).stdout)["result"]
         ws_id, pane = ws["workspace"]["workspace_id"], ws["root_pane"]["pane_id"]
         self.addCleanup(subprocess.run, ["herdr", "workspace", "close", ws_id], capture_output=True)
         time.sleep(1.5)
-        subprocess.run(["herdr", "pane", "run", pane, f"{HOME}/bin/zed coordinator"], capture_output=True)
+        subprocess.run(["herdr", "pane", "run", pane, f"{HOME}/bin/hw coordinator"], capture_output=True)
         deadline = time.monotonic() + 240
         while not self.record.exists():
             self.assertLess(time.monotonic(), deadline, subprocess.run(["herdr", "pane", "read", pane], capture_output=True, text=True).stdout)
@@ -686,11 +686,11 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
         self.track_a_session_whose_pane_is_gone()
         seen = {m["id"] for m in self.api("GET", f"/session/{session}/message")}
         self.record.write_text(json.dumps(record | {"server": record["server"] | {"password": "wrong"}}))  # the watcher's call will be refused
-        env = self.env | {"OPENCODE_SESSION_ID": session, "ZED_COORDINATOR": str(self.record), "HERDR_PANE_ID": pane}
-        digest = subprocess.run([sys.executable, str(HOME / "bin" / "zed"), "start"], env=env, capture_output=True, text=True, timeout=60)
+        env = self.env | {"OPENCODE_SESSION_ID": session, "HW_COORDINATOR": str(self.record), "HERDR_PANE_ID": pane}
+        digest = subprocess.run([sys.executable, str(HOME / "bin" / "hw"), "start"], env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(digest.returncode, 0, digest.stderr)
-        self.say("bin/zed start", next(l for l in digest.stdout.splitlines() if l.startswith("watcher:")))
-        lock = json.loads((self.profile / ".cache" / "zed.lock").read_text())
+        self.say("bin/hw start", next(l for l in digest.stdout.splitlines() if l.startswith("watcher:")))
+        lock = json.loads((self.profile / ".cache" / "hw.lock").read_text())
         self.assertEqual((lock["agent_session"], lock["pane"]), (session, pane))
 
         event, told = self.woken(session, seen)

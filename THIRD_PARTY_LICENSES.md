@@ -6,12 +6,12 @@ Parts of the files below were ported from [firstmate](https://github.com/kunchen
 published under the MIT licence. Its copyright notice and licence text, as published at
 https://github.com/kunchenguid/firstmate/blob/main/LICENSE, follow the list.
 
-- `bin/lib/zedlib.py`
-- `bin/zed-crew`
-- `bin/zed-guard`
-- `bin/zed-plan`
-- `bin/zed-pr`
-- `bin/zed-pretool`
+- `bin/lib/hwlib.py`
+- `bin/hw-crew`
+- `bin/hw-guard`
+- `bin/hw-plan`
+- `bin/hw-pr`
+- `bin/hw-pretool`
 
 ```
 MIT License

@@ -1,4 +1,4 @@
-# <Product / team> — what Zed knows
+# <Product / team> — what Herdwright knows
 
 <!-- Products, apps and repos the user works on: what each is for, which branch is staging /
      production / base for new work, how repos depend on each other. Date volatile facts

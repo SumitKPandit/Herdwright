@@ -25,11 +25,11 @@
   Steps already finished by an earlier session start as `- [x]`. One line per step (no "1-5 done" ticks); only
   merge / push / raise-PR steps may stay open when you hand over to review and QA (start their title with the
   action, or put `[after-review]` in it). End the plan with the fixed line
-  `- [ ] Run zed-employee finish and report (ZED:DONE)`: `zed-employee finish` ticks exactly that line itself.
+  `- [ ] Run hw-employee finish and report (HW:DONE)`: `hw-employee finish` ticks exactly that line itself.
 - Follow it. Tick each step as soon as it's done. Change the plan only for a concrete reason, and
-  record the reason in the file. Zed tracks progress from this file.
+  record the reason in the file. Herdwright tracks progress from this file.
 
 ## Definition of done
 - <FILL: acceptance criteria>
 - QA done, self-review done, committed and PR raised per the user's rules against {{BASE}}.
-- Finish with a ZED:DONE block.
+- Finish with an HW:DONE block.

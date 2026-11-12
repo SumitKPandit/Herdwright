@@ -3,7 +3,7 @@
 like; what the agent then does is agent.py, shared by every runtime.
 
   opencode serve --port N [..]             the session's server, started in a pane (`herdr pane run`): the routes
-                                           `bin/zed` calls, answered from the world in store.py until its pane is gone
+                                           `bin/hw` calls, answered from the world in store.py until its pane is gone
   opencode --server URL [--auto] --session ID
                                            the TUI on a session of that server (`herdr agent start --kind opencode`)
 
