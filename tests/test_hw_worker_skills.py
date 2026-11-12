@@ -253,14 +253,18 @@ class UnfinishedWorkTests(unittest.TestCase):
 def own_change(repo, bases=BASE_BRANCHES):
     """The diff of the checkout's own change: its working tree against where it forked from the first base branch
     found (None when there is none). Once the change is merged HEAD is that fork point, so the diff would be empty and
-    prove nothing: the last change merged (from HEAD's first parent) is read instead."""
+    prove nothing: the last change merged (from HEAD's first parent) is read instead. A root commit has no first
+    parent and so no change to read: None, so the caller skips rather than passes on an empty diff."""
     git = lambda *args: subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
     base = next((b for b in bases if git("rev-parse", "--verify", "--quiet", b).returncode == 0), None)
     if base is None:
         return None
     fork = git("merge-base", "HEAD", base).stdout.strip()
     if fork == git("rev-parse", "HEAD").stdout.strip():
-        fork = git("rev-parse", "HEAD^1").stdout.strip()
+        parent = git("rev-parse", "--verify", "--quiet", "HEAD^1")
+        if parent.returncode:
+            return None
+        fork = parent.stdout.strip()
     return git("diff", fork).stdout
 
 
@@ -285,6 +289,9 @@ class OwnDiffTests(unittest.TestCase):
             git("checkout", "-q", "herdwright")
             git("merge", "-q", "--no-ff", "-m", "merge", "feature")
             self.assertEqual(kinds(), ["debugger"])  # merged: HEAD is the base branch
+            git("checkout", "-q", "--orphan", "fresh")
+            git("commit", "-qm", "root")
+            self.assertIsNone(own_change(tmp, ("fresh",)))  # a root commit on its base: nothing to read, not an empty pass
         self.assertIsNone(own_change(_load.HOME, ("no-such-branch",)))
 
     def test_rule_11_asks_what_this_repository_does(self):
