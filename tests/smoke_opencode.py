@@ -650,6 +650,25 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
         self.assertIn(f"[E{event['id']}]", json.dumps(told))
         self.say("admitted message", f"{told['id']} type {told['type']}; an assistant message followed")
 
+        # T121: the turn the wake started has ended (the session lists it as `idle`). Still un-acked, the event is
+        # shown again with a new receipt; acked in that turn (the model may run `bin/hw ack`), it is not.
+        ended = [m["type"] for m in self.api("GET", f"/session/{session}/message?limit=50")]
+        self.say("latest message types (newest first)", ended[:6])
+        self.assertIn("idle", ended[:ended.index("user") if "user" in ended else len(ended)])
+        queue, deadline = self.profile / ".cache" / "wake-queue.json", time.monotonic() + 60
+        while True:
+            now = json.loads(queue.read_text())["events"][0]
+            if now["acked"] or now["shown"] == 2 or time.monotonic() > deadline:
+                break
+            time.sleep(1)
+        self.say("after the turn", f"acked {now['acked']}, shown {now['shown']}, receipt {now.get('wake')}")
+        if now["acked"]:
+            self.assertEqual(now["shown"], 1)
+        else:
+            self.assertEqual(now["shown"], 2)
+            self.assertNotEqual(now["wake"]["message"], told["id"])  # a new wake, a new message to follow
+            self.api("POST", f"/experimental/session/{session}/wait", timeout=TURN_SECONDS)
+
         again = self.start_as(session)
         self.say("bin/hw start again", next(l for l in again.stdout.splitlines() if l.startswith("watcher:")))
         self.assertIn(f"watcher: alive, pid {pid}", again.stdout)

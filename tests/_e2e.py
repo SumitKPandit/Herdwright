@@ -305,6 +305,16 @@ class World:
                 event["shown_at"] -= seconds
             path.write_text(json.dumps(queue))
 
+    def turns_pass(self, turns=2):
+        """Stand in for the coordinator's turns (Claude Code: its prompt hook and Stop hook count them): `turns` whole
+        turns end, so an un-acked event is due to be shown again (bin/hw wake_queue)."""
+        path = self.profile / ".cache" / "wake-queue.json"
+        with open(path.with_suffix(".guard"), "w") as guard:  # the lock `bin/hw` takes around the queue
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            queue = json.loads(path.read_text())
+            queue["turn"], queue["running"] = queue.get("turn", 0) + turns, False
+            path.write_text(json.dumps(queue))
+
     def rest(self, name="hw"):
         """A coordinator's turn ends: it is idle, as herdr reports its runtime after a turn, and on OpenCode its
         session lists the turn's end."""
