@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""hw-pretool — pre-tool check that keeps the Herdwright coordinator from doing the work itself. It runs as a Claude Code
+PreToolUse hook and, under OpenCode, from the coordinator's plugin (hwdeny.coordinator_plugin), which sends the same
+payload with OpenCode's own tool names (shell, edit, write, patch, subagent).
+
+Ported from firstmate's fm-subagent-pretool-check / fm-cd-pretool-check / fm-primary-scope-lib. Prime directive 1:
+engineering work is delegated to worker sessions; the coordinator only does bookkeeping in Herdwright's own repo.
+firstmate: Copyright (c) 2026 Kun Chen, MIT licence, see THIRD_PARTY_LICENSES.md.
+
+It acts ONLY in the session that holds the profile's Herdwright lock (the hook payload's session_id must equal the
+lock's agent session). Workers, read-only sessions and every other tool call pass untouched. It is fail-open: a
+parse problem or an unexpected payload allows the call.
+
+For the coordinator it denies:
+  * Edit / Write / NotebookEdit / patch of a file outside Herdwright's home, the profile and the temp dirs
+  * Bash: git commit/push/rebase/merge/cherry-pick/reset/revert/add/apply/am/tag/stash/clean/checkout/switch in a repo
+    outside Herdwright's home, a `cd` or `pushd` in the command line's own shell that leads outside the allowed roots (it
+    silently changes where later commands run), and writes to paths outside them: a redirect (`>`, `>>`, `>|`, `&>`,
+    `&>>`, `>&`, also after a heredoc), rm, mv, cp, touch, mkdir, tee, ln, chmod, chown, sed -i, perl -i, `dd of=`, a
+    `find` that deletes or runs one of these. The path may be absolute, or relative to the call's working directory
+    (OpenCode's `workdir`) or to a `cd` before it; the command may stand after a compound command's opener (`{`,
+    `then`, `do`, `!`) or a wrapper (`command`, `env`, `sudo`, `xargs`, `time`, `nice`, `nohup`, `exec`, `timeout`).
+    Not followed: a path the shell expands (`$DIR/x`, `cd $X`), and a write made by another program (`bash -c`,
+    `python3 -c`, `npm install`, a script).
+  * an edit-tool call that names no file (it cannot be checked)
+  * Agent / Workflow tools (delegate with `bin/hw spawn`; pass --allow-subagents to permit them)
+Reads are never blocked. One call is denied in every session: a shell command starting with `hw-pretool-canary`,
+which `bin/hw coordinator` uses to prove the OpenCode plugin is live before the session may act as Herdwright.
+
+Register in .claude/settings.json (hooks.PreToolUse, matcher "*") with command `bin/hw-pretool`.
+Test a payload:  echo '<json>' | hw-pretool --explain
+"""
+import argparse
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import hwdeny  # noqa: E402
+import hwlib  # noqa: E402
+from hwshell import CD_COMMANDS, GIT_WRITE, cd_target, command_words, git_target, inside, redirect_targets, scope_dir, scoped_commands, tokens, write_targets  # noqa: E402
+
+
+def allowed_roots(hw_home=None, profile=None):
+    roots = [hw_home or hwlib.HW_HOME, profile or hwlib.PROFILE_DIR, Path(tempfile.gettempdir()), Path("/tmp"), Path("/private/tmp"),
+             Path("/dev/null"), Path("/dev/stdout"), Path("/dev/stderr")]  # discarding output is not a write
+    return [Path(os.path.realpath(r)) for r in roots]
+
+
+def lock_holder_session(lock_path=None):
+    lock = hwlib.read_json(lock_path or hwlib.PROFILE_DIR / ".cache" / "hw.lock", {}) or {}
+    return lock.get("agent_session") or lock.get("claude_session")
+
+
+def bash_problem(cmd, cwd, roots):
+    """Reason to deny the shell command `cmd`, run in `cwd`, or None. Every target is resolved where the shell will
+    stand when it runs: a relative path against `cwd`, or against the directory an earlier `cd` in the same shell led
+    to. Where that directory cannot be known (`cd $X`, `cd -`) a relative target is not checked."""
+    try:
+        cmds = scoped_commands(tokens(cmd))
+    except ValueError:
+        return None  # unbalanced quotes etc.: fail open
+    dirs = {(): cwd}  # where each shell of the command line stands
+
+    def outside(path, here):
+        known = here is not None or os.path.isabs(os.path.expanduser(path))
+        return known and not inside(path, roots, here or "/")
+
+    for words, scope in cmds:
+        here = scope_dir(dirs, scope)
+        words = command_words(words)
+        if not words:
+            continue
+        name = Path(words[0]).name
+        if name in CD_COMMANDS:
+            dirs[scope] = cd_target(words, here)
+            if scope == () and dirs[scope] is not None and not inside(dirs[scope], roots, "/"):
+                return f"don't `{name}` into {dirs[scope]}: it silently changes where later commands run. Use absolute paths or `git -C` for reads, and delegate changes to a worker (bin/hw spawn)."
+            continue
+        if name == "git":
+            sub, target = git_target(words, here)
+            if sub in GIT_WRITE and target is not None and outside(target, here):
+                return f"`git {sub}` in {target}: project repos are changed only by workers (bin/hw spawn). Herdwright commits only in its own repo."
+        for target in redirect_targets(words):
+            if outside(target, here):
+                return f"writing to {target} is outside Herdwright's repo/profile/tmp: that is a worker's job."
+        for w in write_targets(words):
+            if outside(w, here):
+                where = w if os.path.isabs(os.path.expanduser(w)) else f"{w} in {here}"
+                return f"`{name}` on {where}: outside Herdwright's repo/profile/tmp. Project files are changed by workers (bin/hw spawn)."
+    return None
+
+
+CANARY_COMMAND = hwdeny.PRETOOL_CANARY
+SUBAGENT_TOOLS = hwdeny.SUBAGENT_TOOLS | {"workflow"}
+
+
+def decide(payload, holder=None, roots=None, allow_subagents=False):
+    """Reason to deny this tool call, or None to allow it. Tool names are compared in lower case, so Claude Code's
+    (`Bash`, `Edit`) and OpenCode's (`shell`, `edit`, `patch`) are checked alike."""
+    tool, inp, cwd = str(payload.get("tool_name", "")).lower(), payload.get("tool_input") or {}, payload.get("cwd") or os.getcwd()
+    shell = tool in hwdeny.SHELL_TOOLS and isinstance(inp, dict)
+    if shell and str(inp.get("command", "")).split()[:1] == [CANARY_COMMAND]:
+        return f"canary: `{inp['command'].strip()}` is denied in every session, so the coordinator guard is live"
+    holder = holder if holder is not None else lock_holder_session()
+    if not holder or payload.get("session_id") != holder:
+        return None  # not the coordinator
+    roots = roots or allowed_roots()
+    if tool in hwdeny.EDIT_TOOLS:
+        paths = hwdeny.edit_paths(inp)
+        if not paths:
+            return "an edit that names no file cannot be checked, so it is denied: name the file by its path."
+        for path in paths:
+            if not inside(path, roots, cwd):
+                return f"{path} is outside Herdwright's repo, profile and temp dirs. Herdwright does not edit project files: put it in a brief and spawn a worker (bin/hw spawn)."
+    elif shell:
+        if inp.get("workdir"):  # OpenCode's shell runs in `workdir`, relative to the session's directory
+            cwd = os.path.join(cwd, os.path.expanduser(inp["workdir"]))
+        return bash_problem(inp.get("command", ""), cwd, roots)
+    elif tool in SUBAGENT_TOOLS and not allow_subagents:
+        return "Herdwright delegates engineering work to worker sessions in herdr (bin/hw spawn), not to in-process subagents."
+    return None
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="hw-pretool", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--allow-subagents", action="store_true")
+    ap.add_argument("--explain", action="store_true", help="print the decision in words instead of hook JSON")
+    a = ap.parse_args(argv)
+    try:
+        reason = decide(json.load(sys.stdin), allow_subagents=a.allow_subagents)
+    except Exception:  # fail open: a guard bug must never brick the coordinator
+        return 0
+    if a.explain:
+        print(f"deny: {reason}" if reason else "allow")
+    elif reason:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                 "permissionDecisionReason": f"hw-pretool: {reason}"}}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

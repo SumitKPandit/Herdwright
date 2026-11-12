@@ -5,19 +5,20 @@ description: First run for a new user — interview them, create their profile f
 
 # Onboarding
 
-Goal: by the end, Zed knows who the user is, how they work and what they work on, every account
+Goal: by the end, Herdwright knows who the user is, how they work and what they work on, every account
 they need is connected and verified, and all of it lives in `profile/` on branch `profile/<name>`.
 The no-assumption rule applies in full: write down only what the user said or what you verified.
 
-1. **Welcome and check the machine.** Say who Zed is in two or three sentences (an assistant that
+1. **Welcome and check the machine.** Say who Herdwright is in two or three sentences (an assistant that
    delegates engineering work to AI workers (Claude Code) in herdr,
-   tracks everything, asks before anything goes out). Run `bin/zed-setup` and get anything it
+   tracks everything, asks before anything goes out). Run `bin/hw-setup` and get anything it
    reports missing fixed first (the user runs installs/logins themselves; in Claude Code with
    `! <command>`).
 
 2. **Interview** — a few numbered questions at a time, not one giant form:
    - Name, role, organisation, team/product; time zone.
-   - What they want Zed for, and which decisions they want to make themselves vs. leave to Zed.
+   - What to call the assistant (stored in step 3; "Herdwright" when they have no preference).
+   - What they want Herdwright for, and which decisions they want to make themselves vs. leave to Herdwright.
    - How they like to be talked to (length, tone, what to lead with).
    - Claude Code: which plan, and which model and effort ceiling workers should use (`config/claude.json`).
    - Tools and accounts: code host (GitHub), ticket tracker, wiki, chat, email,
@@ -37,7 +38,8 @@ The no-assumption rule applies in full: write down only what the user said or wh
      `config/projects.json`, `config/settings.json` and `config/claude.json` from the answers. Delete placeholder lines
      you have no answer for, and the guidance comments once a file is filled. Keep
      `knowledge/README.md` matching the files that exist.
-   - `bin/zed lock acquire` (this session becomes the profile's one active Zed), then `bin/zed status`
+   - `bin/hw name --set "<name>"` when the user chose a name for the assistant.
+   - `bin/hw lock acquire` (this session becomes the profile's one active Herdwright), then `bin/hw status`
      creates the task DB and `profile/STATUS.md`.
 
 4. **Connect and verify every account** the user named. Never store a secret in the repo.
@@ -49,7 +51,7 @@ The no-assumption rule applies in full: write down only what the user said or wh
      if a server needs auth, call its `authenticate` tool and let the user finish in the browser;
      then make one read-only call that proves it works (e.g. the current user's profile). List the
      server's write tools under `worker.deny_tools` in `config/settings.json` (replace the template's example list if
-     the user's connectors differ): workers may read, only Zed posts.
+     the user's connectors differ): workers may read, only Herdwright posts.
    - Repos: for each, check the path is a git repo and `git -C <path> remote -v` matches what they
      said; offer to clone missing ones (with their OK).
    - Record each account in `profile.md` with how it's connected, how to verify it, and the date
@@ -57,7 +59,7 @@ The no-assumption rule applies in full: write down only what the user said or wh
 
 5. **Commit and back up.** `git add profile && git commit` (profile-only commit), then — after the
    user confirms the remote — `git push -u <remote> profile/<name>`. Record the remote and the
-   user's commit-message format in `profile.md` under "Zed housekeeping".
+   user's commit-message format in `profile.md` under "Herdwright housekeeping".
 
-6. **Wrap up.** Summarise what Zed now knows and what's still pending, and offer a small first task
+6. **Wrap up.** Summarise what Herdwright now knows and what's still pending, and offer a small first task
    to see the loop work end to end. From now on, keep learning with the `learn` skill.

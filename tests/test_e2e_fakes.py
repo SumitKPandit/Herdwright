@@ -1,5 +1,5 @@
 """The fakes themselves (tests/fakes/): what the fake herdr answers, what a scripted agent does and what the fake OpenCode
-server answers, without `bin/zed`.
+server answers, without `bin/hw`.
 These pin the behaviour the end-to-end tests in test_e2e_loop.py stand on, and the parts of the fakes they do not use
 yet (a prompt left unsent in the input box, an agent CLI that quits)."""
 import base64
@@ -27,7 +27,7 @@ class FakeCase(unittest.TestCase):
     def agent(self, name="worker", **script):
         """Start an agent in a new workspace (its pane: `self.pane`; the start command: `self.started`). Returns the workspace."""
         self.w.script(default=script)
-        ws = self.result("workspace", "create", "--cwd", str(self.w.root), "--label", "a task", "--no-focus", "--env", "ZED_HAT=build")
+        ws = self.result("workspace", "create", "--cwd", str(self.w.root), "--label", "a task", "--no-focus", "--env", "HW_HAT=build")
         self.pane = ws["root_pane"]["pane_id"]
         self.started = self.herdr("agent", "start", name, "--kind", "claude", "--pane", self.pane, "--timeout", "60000",
                                   "--", "-n", name, "--model", "some-model")
@@ -188,7 +188,7 @@ class OpenCode(FakeCase):
         self.assertEqual(self.w.agent("worker")["prompts"], ["Do the thing\nnow"])
         self.assertEqual(self.status(), "done")  # how herdr reports OpenCode after a turn
         screen = self.herdr("agent", "read", "worker", "--source", "recent-unwrapped", "--lines", "150").stdout
-        self.assertIn("  ┃  Do the thing\n  ┃  now\n     On it.\n     Two lines.\n     ZED:QUESTION\n     1. Red or blue?\n\n"
+        self.assertIn("  ┃  Do the thing\n  ┃  now\n     On it.\n     Two lines.\n     HW:QUESTION\n     1. Red or blue?\n\n"
                       "     Build · Fake Model · 0.1s · 20.0 tok/s\n\n  ┃\n", screen)
         self.assertTrue(screen.rstrip().endswith("ctrl+p commands"))
         self.assertEqual(self.herdr("agent", "prompt", "worker", "Again").returncode, 0)  # typed in: a turn from `done`

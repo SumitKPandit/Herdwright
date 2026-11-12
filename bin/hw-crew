@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""hw-crew — what each worker session is really doing, from authoritative sources and no model.
+
+Ported from firstmate's fm-crew-state / fm-peek / fm-inactive-reconcile / fm-fleet-snapshot. Read-only: it never
+writes the DB, never prompts a worker and never touches a worktree.
+firstmate: Copyright (c) 2026 Kun Chen, MIT licence, see THIRD_PARTY_LICENSES.md.
+
+Usage
+  hw-crew state [S<id>|agent] [--json]
+      facts per live session (default: every running / waiting_user / finished session): DB status, herdr state,
+      branch, dirty and unpushed counts, last commit, diffstat against base, plan progress, PR
+  hw-crew reconcile [--prs] [--json]
+      only the mismatches between the DB and reality, one line each; exit 0 none, 1 some.
+      --prs also asks hw-pr whether a session's PR is already merged/closed (network).
+  hw-crew peek <S<id>|agent> [lines=40]
+      bounded tail of a worker's terminal, for diagnosis when the facts above are not enough
+
+Flags: pane-gone, worktree-missing, wrong-branch, on-protected-branch, finished-unpushed (work that would be
+lost), closed-with-unlanded-work (a closed session whose worktree still holds uncommitted work, or commits that are on no
+remote and no other local branch; a clean or merged leftover worktree is not reported), no-plan (running >10 min), pr-merged, pr-closed.
+"""
+import argparse
+import re
+import sys
+import time
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import hwlib  # noqa: E402
+
+LIVE_STATUSES = ("running", "waiting_user", "finished")
+NO_PLAN_MINUTES = 10
+
+
+def plan_progress(s, now=None):
+    """Progress of the session's own plan (hat included), or None when it has not written it yet."""
+    now = now or time.time()
+    path = hwlib.session_plan(s)
+    if not path or not path.is_file():
+        return None
+    steps = hwlib.parse_plan_steps(path.read_text())
+    return {"hat": (s["hat"] if "hat" in s.keys() else None) or "build", "done": sum(x["done"] for x in steps), "total": len(steps),
+            "age_min": int((now - path.stat().st_mtime) // 60)}
+
+
+def protected_branches(repo, base):
+    names = set((hwlib.projects().get(repo) or {}).get("branches") or {})
+    return names | {base, "main", "master", "deploy"}
+
+
+def git_facts(wt, base):
+    """Branch, dirty, unpushed, last commit and diffstat of a worktree; None when it does not exist."""
+    wt = Path(wt)
+    if not wt.exists():
+        return None
+    g = lambda *a: hwlib.git(wt, *a)
+    branch = g("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    dirty = len([ln for ln in g("status", "--porcelain").stdout.splitlines() if ln.strip()])
+    base_ref = next((r for r in (f"origin/{base}", base) if g("rev-parse", "--verify", "--quiet", r).ok), None)
+    # commits on no remote branch and not in the base: a branch cut from an unpushed base does not count the base's history
+    up = g("rev-list", "--count", "HEAD", "--not", "--remotes", *([base_ref] if base_ref else []))
+    ahead = g("rev-list", "--count", f"{base_ref}..HEAD").stdout.strip() if base_ref else ""
+    last = g("log", "-1", "--format=%h%x09%ct%x09%s").stdout.strip().split("\t")
+    stat = g("diff", "--shortstat", f"{base_ref}...HEAD").stdout.strip() if base_ref else ""
+    nums = [int(x) for x in re.findall(r"(\d+) (?:files? changed|insertion|deletion)", stat)]
+    held_by = g("branch", "--contains", "HEAD", "--format=%(refname:short)").stdout.split()  # local branches holding the head
+    return {"branch": branch, "dirty": dirty,
+            "unpushed": int(up.stdout) if up.ok and up.stdout.strip().isdigit() else None,
+            "merged_locally": any(b != branch for b in held_by),
+            "ahead_of_base": int(ahead) if ahead.isdigit() else None,
+            "last_commit": {"sha": last[0], "age_min": int((time.time() - int(last[1])) // 60), "subject": last[2]} if len(last) == 3 and last[1].isdigit() else None,
+            "diffstat": stat or None, "_nums": nums}
+
+
+def facts(s, live, now=None):
+    """Everything about one session row (a dict), plus its mismatch flags."""
+    now = now or time.time()
+    agent = live.get(s["pane_id"]) if s["pane_id"] else None
+    out = {"session": s["id"], "task": s["task_id"], "agent": s["agent"], "repo": s["repo"],
+           "db_status": s["status"], "herdr": agent["agent_status"] if agent else "gone", "branch_expected": s["branch"],
+           "base": s["base"], "pr": s["pr_url"], "external": bool(s["external"]), "plan": plan_progress(s, now),
+           "git": None, "flags": []}
+    flags = out["flags"]
+    live_status = s["status"] in ("running", "waiting_user")
+    if live_status and not agent and s["pane_id"]:
+        flags.append("pane-gone")
+    in_place = (hwlib.projects().get(s["repo"]) or {}).get("worktrees") is False
+    if not s["external"]:
+        g = out["git"] = git_facts(s["worktree"], s["base"]) if s["base"] != "-" else None  # base "-": not a git project
+        if g is None and s["status"] != "closed" and s["base"] != "-":
+            flags.append("worktree-missing")
+        if g and not in_place and s["status"] != "closed":
+            if g["branch"] != s["branch"]:
+                flags.append(f"wrong-branch (on {g['branch']}, expected {s['branch']})")
+            if g["branch"] in protected_branches(s["repo"], s["base"]):
+                flags.append(f"on-protected-branch ({g['branch']})")
+        if g and s["status"] == "finished" and (g["dirty"] or g["unpushed"]):
+            flags.append(f"finished-unpushed ({g['dirty']} uncommitted, {g['unpushed']} unpushed)")
+        if g and s["status"] == "closed" and not in_place and (g["dirty"] or (g["unpushed"] and not g["merged_locally"])):
+            flags.append(f"closed-with-unlanded-work ({g['dirty']} uncommitted, {g['unpushed']} unpushed, on no other branch)")
+        if live_status and not out["plan"]:
+            started = time.mktime(time.strptime(s["created_at"], "%Y-%m-%d %H:%M"))
+            if (now - started) // 60 >= NO_PLAN_MINUTES:
+                flags.append(f"no-plan (running {int((now - started) // 60)} min)")
+    return out
+
+
+def pr_flags(f, verdict_of):
+    try:
+        v = verdict_of(f["pr"])
+    except Exception as e:  # a PR lookup failure is information, not a crash
+        return [f"pr-lookup-failed ({str(e)[:80]})"]
+    return {"merged": ["pr-merged (close the session and task?)"], "closed": ["pr-closed"]}.get(v, [])
+
+
+def render_session(f):
+    g = f["git"] or {}
+    bits = [f"S{f['session']} T{f['task']} {f['agent']} {f['repo']}", f"{f['db_status']}/{f['herdr']}"]
+    if g:
+        bits.append(f"{g['branch']}←{f['base']}")
+        bits.append(f"dirty {g['dirty']}")
+        bits.append("unpushed " + ("?" if g["unpushed"] is None else str(g["unpushed"])))
+        if g["last_commit"]:
+            bits.append(f"last {g['last_commit']['age_min']}m \"{g['last_commit']['subject'][:50]}\"")
+        if g["diffstat"]:
+            bits.append(g["diffstat"])
+    if f["plan"]:
+        bits.append(f"{f['plan']['hat']} plan {f['plan']['done']}/{f['plan']['total']} ({f['plan']['age_min']}m ago)")
+    if f["pr"]:
+        bits.append(f"PR {f['pr']}")
+    return [" · ".join(bits)] + [f"  ! {fl}" for fl in f["flags"]]
+
+
+def load_sessions(ref=None, statuses=LIVE_STATUSES):
+    conn = hwlib.db_readonly()
+    if conn is None:
+        return []
+    if ref:
+        key = ref[1:] if re.fullmatch(r"S\d+", ref) else ref
+        q = "SELECT * FROM sessions WHERE id=?" if key.isdigit() else "SELECT * FROM sessions WHERE agent=?"
+        rows = conn.execute(q, (int(key) if key.isdigit() else key,)).fetchall()
+    else:
+        rows = conn.execute(f"SELECT * FROM sessions WHERE status IN ({','.join('?' * len(statuses))}) ORDER BY id", statuses).fetchall()
+    return [dict(r) for r in rows]
+
+
+def strip_private(f):
+    if f["git"]:
+        f["git"] = {k: v for k, v in f["git"].items() if not k.startswith("_")}
+    return f
+
+
+def cmd_state(a):
+    sessions = load_sessions(a.session)
+    if a.session and not sessions:
+        print(f"hw-crew: no session {a.session}", file=sys.stderr)
+        return 2
+    live = hwlib.live_agents()
+    data = [strip_private(facts(s, live)) for s in sessions]
+    hwlib.emit(data, a.json, lambda d: hwlib.cap_lines([ln for f in d for ln in render_session(f)], limit=60, width=260) or ["no live sessions"])
+    return 0
+
+
+def cmd_reconcile(a, verdict_of=None):
+    live = hwlib.live_agents()
+    found = []
+    for s in load_sessions(statuses=LIVE_STATUSES + ("closed",)):
+        if s["status"] == "closed" and s["external"]:
+            continue
+        f = facts(s, live)
+        if a.prs and f["pr"] and s["status"] != "closed":
+            if verdict_of is None:
+                hw_pr = SourceFileLoader("hw_pr", str(Path(__file__).resolve().parent / "hw-pr")).load_module()
+                verdict_of = lambda url: hw_pr.verdict(hw_pr.fetch(url))
+            f["flags"] += pr_flags(f, verdict_of)
+        if f["flags"]:
+            found.append({"session": f["session"], "task": f["task"], "agent": f["agent"], "flags": f["flags"]})
+    hwlib.emit(found, a.json, lambda d: hwlib.cap_lines(
+        [f"S{x['session']} T{x['task']} {x['agent']}: " + "; ".join(x["flags"]) for x in d], limit=40, width=260) or ["consistent: DB matches reality"])
+    return 1 if found else 0
+
+
+def cmd_peek(a):
+    sessions = load_sessions(a.session)
+    if not sessions:
+        print(f"hw-crew: no session {a.session}", file=sys.stderr)
+        return 2
+    r = hwlib.run_bounded(["herdr", "agent", "read", sessions[0]["agent"], "--source", "recent-unwrapped", "--lines", str(a.lines)], timeout=15)
+    if not r.ok:
+        print(f"hw-crew: herdr read failed: {(r.stderr or r.stdout).strip()[:200]}", file=sys.stderr)
+        return 2
+    lines = [ln.rstrip() for ln in r.stdout.splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    print("\n".join(lines[-a.lines:]))
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="hw-crew", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    st = sub.add_parser("state")
+    st.add_argument("session", nargs="?")
+    st.add_argument("--json", action="store_true")
+    rc = sub.add_parser("reconcile")
+    rc.add_argument("--prs", action="store_true")
+    rc.add_argument("--json", action="store_true")
+    pk = sub.add_parser("peek")
+    pk.add_argument("session")
+    pk.add_argument("lines", nargs="?", type=int, default=40)
+    a = ap.parse_args(argv)
+    return {"state": cmd_state, "reconcile": cmd_reconcile, "peek": cmd_peek}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

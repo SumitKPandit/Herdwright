@@ -1,6 +1,6 @@
 """The end-to-end harness: a throwaway profile, a throwaway git repo, and the fakes in tests/fakes/ first on PATH.
 
-A `World` is everything one test needs. The real `bin/zed` runs as a subprocess against it, as a coordinator session
+A `World` is everything one test needs. The real `bin/hw` runs as a subprocess against it, as a coordinator session
 would run it: in a (fake) herdr pane, with its own agent session. Nothing here reads or writes the real profile, the
 real herdr or the network: the environment of every command is built from scratch (see `World.env`).
 """
@@ -25,24 +25,24 @@ FAKES = HOME / "tests" / "fakes"
 sys.path.insert(0, str(FAKES))
 import store  # noqa: E402
 
-ZED = str(HOME / "bin" / "zed")
-RUN_ZED = [sys.executable, str(FAKES / "run_zed.py")]  # the real `bin/zed`, without spawn's wait for a pane's shell
+HW = str(HOME / "bin" / "hw")
+RUN_HW = [sys.executable, str(FAKES / "run_hw.py")]  # the real `bin/hw`, without spawn's wait for a pane's shell
 REPO = "demo"
 BASE = "main"
 RUNTIMES = {"claude": "OnClaude", "opencode": "OnOpenCode"}  # what a test class is called for each (per_runtime)
 # never inherited from the shell that runs the tests: a worker session carries all of these
-FOREIGN = ("ZED_", "CLAUDE", "OPENCODE", "HERDR", "GIT_", "FAKE_")
-FILL = re.compile(r"<FILL\b[^>\n]*>")  # what `bin/zed brief` leaves for the coordinator to write
+FOREIGN = ("HW_", "ZED_", "CLAUDE", "OPENCODE", "HERDR", "GIT_", "FAKE_")  # ZED_: HW_ before the rename; `start` names them
+FILL = re.compile(r"<FILL\b[^>\n]*>")  # what `bin/hw brief` leaves for the coordinator to write
 
 
 def ask(*questions):
-    """Acts of a worker asking: one status line per question, then the ZED:QUESTION block in the same words."""
+    """Acts of a worker asking: one status line per question, then the HW:QUESTION block in the same words."""
     return [*({"status": f"needs-decision: {q}"} for q in questions),
             {"block": "QUESTION", "text": "\n".join(f"{n}. {q}" for n, q in enumerate(questions, 1))}]
 
 
 def done(summary, qa, pr="not raised", branch="task/demo"):
-    """Acts of a worker reporting: the status line, then the ZED:DONE block."""
+    """Acts of a worker reporting: the status line, then the HW:DONE block."""
     url = pr if pr.startswith("http") else "none"
     return [{"status": f"done: {summary}; pr={url}; qa={qa}"},
             {"block": "DONE", "text": f"Summary: {summary}\nBranch: {branch}  Commits: abc1234\nPR: {pr}\n"
@@ -51,7 +51,7 @@ def done(summary, qa, pr="not raised", branch="task/demo"):
 
 def clean_env(home, **extra):
     """An environment built from scratch for a command under test: the fakes first on PATH, a throwaway HOME, git
-    without the user's own config, and none of the caller's Zed, Claude, herdr or git variables."""
+    without the user's own config, and none of the caller's Herdwright, Claude, herdr or git variables."""
     env = {k: v for k, v in os.environ.items() if not k.startswith(FOREIGN)}
     return env | {"PATH": f"{FAKES / 'bin'}{os.pathsep}{env['PATH']}", "HOME": str(home), "PYTHONDONTWRITEBYTECODE": "1",
                   "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
@@ -123,7 +123,7 @@ class World:
         shutil.copytree(template() / REPO, self.repo)
         shutil.copytree(template() / "origin.git", self.root / "origin.git")
         self.git("remote", "set-url", "origin", str(self.root / "origin.git"))
-        self.me = self.coordinator("zed")
+        self.me = self.coordinator("hw")
         case.assertEqual(shutil.which("herdr", path=self.env()["PATH"]), str(FAKES / "bin" / "herdr"))
 
     # ------------------------------------------------------------ running things
@@ -132,7 +132,7 @@ class World:
         """The environment of a command run by `coordinator` (default: the first one). On OpenCode `start` and `spawn`
         start the long-lived watcher only in a world that is about it (`self.daemon`): the other tests look through a
         watcher of their own (`watch_once`, `watch_ticks`), and a profile has one watcher at a time."""
-        return clean_env(self.root / "home", ZED_PROFILE_DIR=str(self.profile), FAKE_HERDR_DIR=str(self.herdr),
+        return clean_env(self.root / "home", HW_PROFILE_DIR=str(self.profile), FAKE_HERDR_DIR=str(self.herdr),
                          FAKE_AGENT_SCRIPT=str(self.script_path), **({} if self.daemon else {"FAKE_NO_WATCHER": "1"})
                          ) | (coordinator or getattr(self, "me", {}))
 
@@ -142,12 +142,12 @@ class World:
             self.case.assertEqual(r.returncode, 0, f"git {' '.join(args)}\n{r.stdout}{r.stderr}")
         return r
 
-    def zed(self, *args, coordinator=None, check=True, timeout=90):
-        """Run `bin/zed <args>` as a coordinator session. With check, a failure fails the test with the output."""
-        r = subprocess.run([*RUN_ZED, *args], env=self.env(coordinator), capture_output=True, text=True,
+    def hw(self, *args, coordinator=None, check=True, timeout=90):
+        """Run `bin/hw <args>` as a coordinator session. With check, a failure fails the test with the output."""
+        r = subprocess.run([*RUN_HW, *args], env=self.env(coordinator), capture_output=True, text=True,
                            timeout=timeout, cwd=self.root)
         if check:
-            self.case.assertEqual(r.returncode, 0, f"bin/zed {' '.join(args)}\n{r.stdout}{r.stderr}")
+            self.case.assertEqual(r.returncode, 0, f"bin/hw {' '.join(args)}\n{r.stdout}{r.stderr}")
         return r
 
     def watcher_pid(self):
@@ -174,7 +174,7 @@ class World:
     def coordinator(self, name):
         """A coordinator session in its own pane of the fake herdr, mid-turn (it is the one running the commands).
         Returns the environment that identifies it, as its runtime and herdr set it in a real pane. On OpenCode it is a
-        session of its own server, opened as `bin/zed coordinator` leaves it: the TUI on the session and the record of
+        session of its own server, opened as `bin/hw coordinator` leaves it: the TUI on the session and the record of
         a proven guard."""
         with store.locked(self.herdr) as state:
             _, pane = store.new_pane(state, HOME, label=name, shell_pid=os.getpid())
@@ -201,23 +201,23 @@ class World:
             store.agent_event(pane, "start", env=self.env({}), root=self.herdr)  # the TUI opens: herdr learns its session
             record.write_text(json.dumps({"runtime": "opencode", "session": session, "server": server, "server_pid": job.pid,
                                           "guard": "live", "started_at": "2026-01-01 00:00"}))
-            identity = {"OPENCODE_SESSION_ID": session, "OPENCODE_PID": str(os.getpid()), "ZED_COORDINATOR": str(record)}
+            identity = {"OPENCODE_SESSION_ID": session, "OPENCODE_PID": str(os.getpid()), "HW_COORDINATOR": str(record)}
         self.coordinators[name] = {"HERDR_PANE_ID": pane} | identity
         return self.coordinators[name]
 
     # ------------------------------------------------------------ the loop's steps
 
     def start(self, coordinator=None):
-        return self.zed("start", coordinator=coordinator)
+        return self.hw("start", coordinator=coordinator)
 
     def task(self, title="Add a greeting", **fields):
-        out = self.zed("task", "add", f"title={title}", *(f"{k}={v}" for k, v in fields.items())).stdout
+        out = self.hw("task", "add", f"title={title}", *(f"{k}={v}" for k, v in fields.items())).stdout
         return int(out.strip().lstrip("T"))
 
     def brief(self, tid, branch, fill="none", name=None):
-        """Scaffold the brief with the real `bin/zed brief`; `fill` replaces every <FILL: …> (None leaves them). With
+        """Scaffold the brief with the real `bin/hw brief`; `fill` replaces every <FILL: …> (None leaves them). With
         `name` (a review or QA session's brief) it is a brief of its own, with its own plan file."""
-        self.zed("brief", f"T{tid}", f"repo={REPO}", f"base={BASE}", f"branch={branch}", "force")
+        self.hw("brief", f"T{tid}", f"repo={REPO}", f"base={BASE}", f"branch={branch}", "force")
         path = self.profile / "briefs" / f"T{tid}-{REPO}.md"
         text = path.read_text() if fill is None else FILL.sub(fill, path.read_text())
         if name:
@@ -233,9 +233,9 @@ class World:
         self.script_path.write_text(json.dumps(scripts))
 
     def spawn(self, tid, branch, hat="build", check=True, brief=None):
-        """`bin/zed spawn`; returns the JSON line it prints (session, agent, pane, worktree) when it succeeds."""
+        """`bin/hw spawn`; returns the JSON line it prints (session, agent, pane, worktree) when it succeeds."""
         brief = brief or self.profile / "briefs" / f"T{tid}-{REPO}.md"
-        r = self.zed("spawn", f"T{tid}", f"repo={REPO}", f"base={BASE}", f"branch={branch}", f"brief={brief}",
+        r = self.hw("spawn", f"T{tid}", f"repo={REPO}", f"base={BASE}", f"branch={branch}", f"brief={brief}",
                      f"hat={hat}", check=check)
         if r.returncode:
             return r
@@ -251,10 +251,10 @@ class World:
     # ------------------------------------------------------------ the watcher
 
     def watch_once(self):
-        """`bin/zed watch --once`: returns when the watcher has something for the coordinator (the process result).
+        """`bin/hw watch --once`: returns when the watcher has something for the coordinator (the process result).
         A watcher with nothing to say never returns: that fails the test at the time limit."""
         try:
-            return self.zed("watch", "--once", "0.05", timeout=30)
+            return self.hw("watch", "--once", "0.05", timeout=30)
         except subprocess.TimeoutExpired as e:
             self.case.fail(f"the watcher reported nothing in {e.timeout} s; it printed:\n{e.stdout or ''}{e.stderr or ''}")
 
@@ -271,7 +271,7 @@ class World:
 
     def watch_ticks(self, ticks=3, coordinator=None):
         """Let a watcher look at every session `ticks` times, then stop it. Returns what it printed."""
-        p = subprocess.Popen([*RUN_ZED, "watch", "0.05"], env=self.env(coordinator), cwd=self.root,
+        p = subprocess.Popen([*RUN_HW, "watch", "0.05"], env=self.env(coordinator), cwd=self.root,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         try:
             self.watch_state_changes(ticks, running=p)
@@ -282,7 +282,7 @@ class World:
         return out
 
     def ack_all(self):
-        self.zed("ack", "--all")
+        self.hw("ack", "--all")
 
     def wait_for(self, what, test, timeout=30):
         """Wait until `test()` is true (for what a background watcher does); fails with `what` at the time limit."""
@@ -294,14 +294,14 @@ class World:
     def age_wakes(self, seconds=600):
         """Stand in for waiting: the long-lived watcher shows an un-acked event again five minutes after it last did."""
         path = self.profile / ".cache" / "wake-queue.json"
-        with open(path.with_suffix(".guard"), "w") as guard:  # the lock `bin/zed` takes around the queue
+        with open(path.with_suffix(".guard"), "w") as guard:  # the lock `bin/hw` takes around the queue
             fcntl.flock(guard, fcntl.LOCK_EX)
             queue = json.loads(path.read_text())
             for event in queue["events"]:
                 event["shown_at"] -= seconds
             path.write_text(json.dumps(queue))
 
-    def rest(self, name="zed"):
+    def rest(self, name="hw"):
         """A coordinator's turn ends: it is idle, as herdr reports its runtime after a turn."""
         with store.locked(self.herdr) as state:
             _, pane = store.find_agent(state, name)
@@ -310,7 +310,7 @@ class World:
     # ------------------------------------------------------------ reading the record and the world
 
     def rows(self, sql, *args):
-        conn = sqlite3.connect(f"file:{self.profile / 'db' / 'zed.db'}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"file:{self.profile / 'db' / 'hw.db'}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         try:
             return [dict(r) for r in conn.execute(sql, args)]
@@ -374,15 +374,15 @@ class World:
             del state["workspaces"][pane["workspace_id"]]
 
     def adopted(self, sid):
-        """The session is one of the user's own that Zed only tracks (`bin/zed adopt`): never prompted."""
-        conn = sqlite3.connect(self.profile / "db" / "zed.db")
+        """The session is one of the user's own that Herdwright only tracks (`bin/hw adopt`): never prompted."""
+        conn = sqlite3.connect(self.profile / "db" / "hw.db")
         with conn:
             conn.execute("UPDATE sessions SET external=1 WHERE id=?", (int(str(sid).lstrip("S")),))
         conn.close()
 
     def age_sessions(self, minutes=10):
         """Stand in for waiting: the watcher treats a session younger than three minutes as still reading its brief."""
-        conn = sqlite3.connect(self.profile / "db" / "zed.db")
+        conn = sqlite3.connect(self.profile / "db" / "hw.db")
         with conn:
             conn.execute("UPDATE sessions SET created_at = strftime('%Y-%m-%d %H:%M', created_at, ?)", (f"-{minutes} minutes",))
         conn.close()
@@ -405,4 +405,4 @@ class LoopCase(unittest.TestCase):
 
     def setUp(self):
         self.w = World(self, self.RUNTIME)
-        self.w.zed("lock", "acquire")
+        self.w.hw("lock", "acquire")

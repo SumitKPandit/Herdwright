@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A fake `herdr`: the commands `bin/zed` and `bin/lib` use, answered from the world in `store.py`, in herdr's own JSON
+"""A fake `herdr`: the commands `bin/hw` and `bin/lib` use, answered from the world in `store.py`, in herdr's own JSON
 shapes and error words (`pane_not_found`, `workspace_not_found`, `agent_not_ready`, `agent_prompt_stalled`).
 
   workspace create --cwd D --label L [--no-focus] [--env K=V ..]   |  workspace close <id>

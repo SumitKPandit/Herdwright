@@ -4,7 +4,7 @@ description: Review a diff for correctness, the code rules and long-term maintai
 ---
 # review-maintainability
 
-Start from the facts `zed-review prep` printed (changed files without tests, debug leftovers, new dependencies,
+Start from the facts `hw-review prep` printed (changed files without tests, debug leftovers, new dependencies,
 migrations, large functions); do not redo them by hand. You review a change someone else wrote: change no file.
 
 ## Review
@@ -28,7 +28,7 @@ migrations, large functions); do not redo them by hand. You review a change some
 4. Skip anything a linter or formatter catches, such as whitespace, formatting and import order.
 5. **Verify each finding** before you write it. Re-read the code and its callers and confirm the problem happens. A
    correctness finding names the input, the code path and the wrong result. Drop a finding you cannot support with
-   evidence. A doubt about intent that neither the code nor the brief settles is a `ZED:QUESTION`, not a blocker.
+   evidence. A doubt about intent that neither the code nor the brief settles is a `HW:QUESTION`, not a blocker.
 6. Follow the `completion-evidence` skill: list what you did not check, as `required` or `not-applicable`, with the
    reason. Required work left unchecked cannot give a clean verdict.
 
@@ -67,5 +67,5 @@ Write the findings draft, most severe first, one line per finding, then exactly 
 Verdict: clean | blockers
 ```
 
-`blockers` when any finding is a `[blocker]`, otherwise `clean`. Check the draft with `zed-review check-draft`, then
-`zed-employee finish --verdict ...`. Never post it anywhere.
+`blockers` when any finding is a `[blocker]`, otherwise `clean`. Check the draft with `hw-review check-draft`, then
+`hw-employee finish --verdict ...`. Never post it anywhere.

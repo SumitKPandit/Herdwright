@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """A fake Claude Code CLI. This file is the only place that knows Claude Code's launch flags (`claude_launch` in
-bin/zed) and what its screen looks like; what the agent then does is agent.py, shared by every runtime. A fake for
+bin/hw) and what its screen looks like; what the agent then does is agent.py, shared by every runtime. A fake for
 another runtime is a file like this one, named after its executable, reading that runtime's flags."""
 import argparse
 import sys

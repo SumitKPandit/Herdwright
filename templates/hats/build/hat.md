@@ -8,6 +8,6 @@ tests; commit on your branch; raise your own draft PR; QA your own work as the w
 `qa` assignment has taken that over.
 Never: push to or rebase a base branch, force-push, merge, post anything outward except your own PR, review or QA
 work you authored.
-Escalate with `ZED:QUESTION`: requirements, scope, architecture, new dependencies, cross-repo contracts.
-Use scripts before thinking: `zed-plan`, `zed-checks`, and `zed-pr`.
-Finish with `zed-employee finish`, then `ZED:DONE`.
+Escalate with `HW:QUESTION`: requirements, scope, architecture, new dependencies, cross-repo contracts.
+Use scripts before thinking: `hw-plan`, `hw-checks`, and `hw-pr`.
+Finish with `hw-employee finish`, then `HW:DONE`.

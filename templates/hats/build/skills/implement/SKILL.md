@@ -6,18 +6,18 @@ description: Turn the plan into code, test first where the repository has tests,
 
 ## Before the first change
 
-1. Write the plan file the brief names (steps, each with "done when" and an estimate); `zed-plan lint` must pass. It
-   is the only plan: Zed reads progress from it.
+1. Write the plan file the brief names (steps, each with "done when" and an estimate); `hw-plan lint` must pass. It
+   is the only plan: Herdwright reads progress from it.
 2. Read the code next to what you change; match its patterns, naming and comment density.
-3. Run `zed-checks run <repo>` (lint, types, tests) before you change a line. A check that already fails:
-   `ZED:QUESTION`, never a silent workaround.
+3. Run `hw-checks run <repo>` (lint, types, tests) before you change a line. A check that already fails:
+   `HW:QUESTION`, never a silent workaround.
 
 ## Per plan step
 
 Where the repository has tests, work test first:
 
 1. **Protect existing behaviour.** Add a test for each behaviour the brief says must stay as it is, and run it. It
-   must pass on today's code. If it fails, today's behaviour is not what the brief says: `ZED:QUESTION`.
+   must pass on today's code. If it fails, today's behaviour is not what the brief says: `HW:QUESTION`.
 2. **Add the new tests.** One test per requirement or scenario of the brief, named after it. Run them. Each must fail
    for the reason the change will remove. A failure for another reason, such as an import error or a broken fixture:
    fix the test. A test that already passes: the requirement is met or the test is wrong; find out which.
@@ -32,13 +32,13 @@ the repository has no tests for the code you change, say so in your report inste
 
 1. **Self-review, in one pass.** Check the full diff against every rule of the `code-rules` skill, using its Check
    column, and fix each rule that fails. Do not repeat the pass: a rule that still fails is listed in your report.
-2. **Check everything.** Run `zed-checks run <repo>` again, including the tests from the steps above. All must pass.
-   Fix what your change broke. If you cannot after 3 attempts with no new information, stop: `ZED:BLOCKED`.
+2. **Check everything.** Run `hw-checks run <repo>` again, including the tests from the steps above. All must pass.
+   Fix what your change broke. If you cannot after 3 attempts with no new information, stop: `HW:BLOCKED`.
 3. Commit on your branch in the user's format.
-4. **Report** in `ZED:DONE` as the `completion-evidence` skill says: each requirement with its test, each check with
+4. **Report** in `HW:DONE` as the `completion-evidence` skill says: each requirement with its test, each check with
    its command and result, open rule failures, and anything you noticed but did not change.
 
-Anything that is a product, architecture or scope decision, or work the brief does not cover: `ZED:QUESTION`, never a
+Anything that is a product, architecture or scope decision, or work the brief does not cover: `HW:QUESTION`, never a
 guess. What an existing convention of the codebase settles, you decide.
 
 ## Known failure modes

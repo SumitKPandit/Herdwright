@@ -1,5 +1,5 @@
 {
-  "scripts": ["zed-plan", "zed-checks", "zed-guard", "zed-pr", "zed-employee"],
+  "scripts": ["hw-plan", "hw-checks", "hw-guard", "hw-pr", "hw-employee"],
   "skills": ["implement", "code-rules", "completion-evidence", "raise-pr", "address-findings", "finish"],
   "deny": {"edit": [], "commands": ["gh pr review", "gh pr comment"],
            "gated": ["gh pr create"]},

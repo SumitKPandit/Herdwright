@@ -1,4 +1,4 @@
-"""Wake and hold on OpenCode, end to end: the real `bin/zed` with its long-lived watcher (`watch --daemon`, started by
+"""Wake and hold on OpenCode, end to end: the real `bin/hw` with its long-lived watcher (`watch --daemon`, started by
 `start` and `spawn`) against the fake herdr and the fake OpenCode server and TUI (tests/fakes/). Claude Code wakes its
 coordinator through Stop hooks instead (tests/test_hooks.py).
 
@@ -22,7 +22,7 @@ import unittest
 from _e2e import LoopCase, ask
 
 BRANCH = "task/demo"
-HEADING = "Watcher events for Zed. Handle each one, then retire it with `bin/zed ack E<id>`:"
+HEADING = "Watcher events for Herdwright. Handle each one, then retire it with `bin/hw ack E<id>`:"
 
 
 class DaemonCase(LoopCase):
@@ -35,7 +35,7 @@ class DaemonCase(LoopCase):
         self.started = self.w.start().stdout
         self.w.rest()
 
-    def prompts(self, name="zed"):
+    def prompts(self, name="hw"):
         """What the coordinator was prompted with, by its server or through herdr."""
         return self.w.agent(name)["prompts"]
 
@@ -56,16 +56,16 @@ class Wake(DaemonCase):
         self.w.started(BRANCH, turns=[ask("Red or blue?")])
         event, = self.woken()
         prompt, = self.prompts()  # one new turn of the coordinator, started from outside it
-        self.assertEqual(prompt.splitlines()[:2], [HEADING, "[E1] S1 T1 build-t1 · status file: ZED:QUESTION"])
+        self.assertEqual(prompt.splitlines()[:2], [HEADING, "[E1] S1 T1 build-t1 · status file: HW:QUESTION"])
         self.assertIn("Q1: Red or blue?", prompt)
         self.assertEqual(event["wake"]["via"], "api")
-        admitted = [m["id"] for m in self.w.server_messages("zed") if m["type"] == "user"]
+        admitted = [m["id"] for m in self.w.server_messages("hw") if m["type"] == "user"]
         self.assertEqual([event["wake"]["message"]], admitted)  # the receipt is the id the server gave the admitted prompt
         self.assertEqual(self.w.herdr_calls("agent", "prompt"), [])  # nothing was typed into its screen
         self.assertIn(f'woke the coordinator: {{"via": "api", "message": "{admitted[0]}"', self.log())
-        self.assertIn("[E1] ", self.w.zed("start").stdout)  # still listed at a session start until it is acknowledged
+        self.assertIn("[E1] ", self.w.hw("start").stdout)  # still listed at a session start until it is acknowledged
         self.w.ack_all()
-        self.w.zed("prompt", "S1", "Blue.")  # the worker ends another turn with nothing new: no second wake
+        self.w.hw("prompt", "S1", "Blue.")  # the worker ends another turn with nothing new: no second wake
         self.w.watch_state_changes(3)
         self.assertEqual((len(self.prompts()), len(self.w.wakes())), (1, 1))
 
@@ -79,7 +79,7 @@ class Wake(DaemonCase):
         self.assertEqual(typed[2], self.w.me["HERDR_PANE_ID"])
         self.assertEqual(self.prompts(), [typed[3]])
         self.assertIn("Q1: Red or blue?", typed[3])
-        self.assertEqual(self.w.server_messages("zed"), [])
+        self.assertEqual(self.w.server_messages("hw"), [])
 
     def test_a_server_that_breaks_off_its_answer_does_not_end_the_watcher(self):
         pid = self.w.watcher_pid()
@@ -100,7 +100,7 @@ class Wake(DaemonCase):
         self.w.wait_for("the wake to reach the server", held.with_name("opencode-held.reached").exists)
         self.w.stop_watcher(signal.SIGKILL)
         held.unlink()
-        self.assertIn("[E1] ", self.w.zed("start").stdout)  # the next watcher starts, and the event is still listed
+        self.assertIn("[E1] ", self.w.hw("start").stdout)  # the next watcher starts, and the event is still listed
         self.w.watch_state_changes(3)
         self.assertEqual([e["id"] for e in self.w.wakes()], [1])
         self.assertEqual(self.w.rows("SELECT COUNT(*) AS n FROM questions"), [{"n": 1}])
@@ -117,38 +117,38 @@ class Wake(DaemonCase):
         self.w.age_wakes()
         self.w.watch_state_changes(2)
         self.assertEqual(len(self.prompts()), 3)  # a forgotten ack cannot wake the coordinator for ever
-        self.assertIn("[E1] ", self.w.zed("start").stdout)  # `start` still lists it
+        self.assertIn("[E1] ", self.w.hw("start").stdout)  # `start` still lists it
 
     def test_one_watcher_per_profile(self):
         pid = self.w.watcher_pid()
-        self.assertIn(f"watcher: alive, pid {pid}", self.w.zed("start").stdout)
+        self.assertIn(f"watcher: alive, pid {pid}", self.w.hw("start").stdout)
         for form in ("--daemon", "--once"):
-            r = self.w.zed("watch", form, check=False)
+            r = self.w.hw("watch", form, check=False)
             self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
             self.assertIn(f"WATCH_ALREADY_RUNNING pid {pid}", r.stdout)
         self.w.started(BRANCH)  # `spawn` starts none either
         self.assertEqual(self.w.watcher_pid(), pid)
 
     def test_the_watcher_stops_when_its_coordinator_loses_the_lock(self):
-        other = self.w.coordinator("zed-b")
+        other = self.w.coordinator("hw-b")
         self.w.script()
-        self.w.zed("lock", "acquire", "--take-over", coordinator=other)
+        self.w.hw("lock", "acquire", "--take-over", coordinator=other)
         self.w.wait_for("the watcher to stop", lambda: self.w.watcher_pid() is None)
-        told, = self.prompts()  # the session that was Zed is told, in its own session
-        self.assertIn("LOCK LOST: another session took over as Zed", told)
-        self.assertEqual(self.prompts("zed-b"), [])
+        told, = self.prompts()  # the session that was Herdwright is told, in its own session
+        self.assertIn("LOCK LOST: another session took over as Herdwright", told)
+        self.assertEqual(self.prompts("hw-b"), [])
         self.assertEqual(self.w.herdr_calls("agent", "prompt"), [])
 
     def test_the_watcher_ends_with_the_coordinators_server(self):
-        self.w.stop_server("zed")
+        self.w.stop_server("hw")
         self.w.wait_for("the watcher to end", lambda: self.w.watcher_pid() is None)
         self.assertIn("COORDINATOR GONE", self.log())
         self.assertEqual(self.w.herdr_calls("agent", "prompt"), [])  # nothing is typed into a pane whose session is gone
 
     def test_it_runs_only_for_an_opencode_coordinator(self):
         self.w.stop_watcher()
-        env = {k: v for k, v in self.w.me.items() if k != "ZED_COORDINATOR"}  # a session `bin/zed coordinator` did not open
-        r = self.w.zed("watch", "--daemon", coordinator=env, check=False)
+        env = {k: v for k, v in self.w.me.items() if k != "HW_COORDINATOR"}  # a session `bin/hw coordinator` did not open
+        r = self.w.hw("watch", "--daemon", coordinator=env, check=False)
         self.assertEqual(r.returncode, 1)
         self.assertIn("`watch --daemon` wakes an OpenCode coordinator through its server", r.stderr)
         self.assertIsNone(self.w.watcher_pid())
@@ -171,7 +171,7 @@ class Hold(DaemonCase):
 
     def test_a_watcher_that_died_is_started_again_by_start_and_spawn(self):
         self.w.stop_watcher(signal.SIGKILL)
-        out = self.w.zed("start").stdout
+        out = self.w.hw("start").stdout
         self.assertRegex(out, r"(?m)^watcher: was NOT RUNNING; started now, pid \d+$")
         first = self.w.watcher_pid()
         self.assertIsNotNone(first)

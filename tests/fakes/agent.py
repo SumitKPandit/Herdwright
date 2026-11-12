@@ -16,13 +16,13 @@ The script is the JSON file $FAKE_AGENT_SCRIPT: {"<agent name>" or "*": {"start"
 
 Acts, one key each:
   {"say": text}                       print text
-  {"block": KIND, "text": text}       print a `ZED:<KIND>` block (QUESTION, DONE, BLOCKED)
+  {"block": KIND, "text": text}       print a `HW:<KIND>` block (QUESTION, DONE, BLOCKED)
   {"status": line}                    append a line to the status file named in the first prompt
   {"plan": [step, ..]}                write the plan file the brief names: those steps, then the fixed finish line
   {"tick": n | "all"}                 tick step n, or every step but the finish line
   {"write": path, "text": text}       write a file in the working folder
   {"git": [args]}                     run git there
-  {"run": [argv]}                     run a command there; {bin} is Zed's bin folder, {profile} the profile
+  {"run": [argv]}                     run a command there; {bin} is Herdwright's bin folder, {profile} the profile
   {"pause": true}                     keep working until `advance`
   {"dialog": text}                    show a permission prompt and stay `blocked` until keys ending in `enter`
   {"exit": true}                      the CLI quits: the pane stays, the agent is gone
@@ -36,7 +36,7 @@ from pathlib import Path
 
 import store
 
-FINISH_STEP = "- [ ] Run zed-employee finish and report (ZED:DONE)"
+FINISH_STEP = "- [ ] Run hw-employee finish and report (HW:DONE)"
 
 
 def main(launch):
@@ -186,7 +186,7 @@ def work(pane_id):
 
 
 def plan_file(facts):
-    """The plan file the brief tells its worker to write (the same reading `bin/zed` records at spawn)."""
+    """The plan file the brief tells its worker to write (the same reading `bin/hw` records at spawn)."""
     m = re.search(r"`([^`\s]+-plan\.md)`", Path(facts["brief"]).read_text())
     return Path(m.group(1))
 
@@ -196,7 +196,7 @@ def perform(act, pane_id, cwd, facts):
     if "say" in act:
         return {"print": act["say"].splitlines()}
     if "block" in act:
-        return {"print": [f"ZED:{act['block']}", *act.get("text", "").splitlines()]}
+        return {"print": [f"HW:{act['block']}", *act.get("text", "").splitlines()]}
     if "status" in act:
         with open(facts["status_file"], "a") as f:
             f.write(act["status"] + "\n")
@@ -219,7 +219,7 @@ def perform(act, pane_id, cwd, facts):
         target.write_text(act.get("text", ""))
     elif "git" in act or "run" in act:
         home = Path(facts["home"]) if facts.get("home") else None
-        fill = {"bin": str(home / "bin") if home else "", "profile": os.environ.get("ZED_PROFILE_DIR", "")}
+        fill = {"bin": str(home / "bin") if home else "", "profile": os.environ.get("HW_PROFILE_DIR", "")}
         cmd = ["git", *act["git"]] if "git" in act else [a.format(**fill) for a in act["run"]]
         with store.locked() as state:  # herdr knows what runs in the pane: the CLI, whose child the command is
             state["panes"][pane_id]["foreground"] = [os.getpid()]

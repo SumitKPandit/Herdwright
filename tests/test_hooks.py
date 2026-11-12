@@ -1,10 +1,10 @@
-"""The git hooks in hooks/ (installed by bin/zed-setup as core.hooksPath), run by git itself in a throwaway copy of a
-Zed checkout: `main` holds core only, the always-loaded files have a word budget, and a merge into `main` or a profile
+"""The git hooks in hooks/ (installed by bin/hw-setup as core.hooksPath), run by git itself in a throwaway copy of a
+Herdwright checkout: `main` holds core only, the always-loaded files have a word budget, and a merge into `main` or a profile
 branch needs a clean review and QA.
 
 The copy links to this checkout's hooks/ and bin/ and has a `main` with core files, a worker's branch `task/work` cut
 from it, and a profile branch `profile/me` (checked out) with a profile in profile/. So git runs the real hooks, and
-they call the real `bin/zed` on the copy's profile."""
+they call the real `bin/hw` on the copy's profile."""
 import json
 import shutil
 import sqlite3
@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 
 import _load  # noqa: F401 (puts bin/lib on the path)
-import zedlib
+import hwlib
 from _e2e import clean_env
 
 HOME = Path(__file__).resolve().parents[1]
@@ -28,13 +28,13 @@ def setUpModule():
     global TEMPLATE
     tmp = tempfile.TemporaryDirectory()
     unittest.addModuleCleanup(tmp.cleanup)
-    TEMPLATE = repo = Path(tmp.name).resolve() / "zed"
-    env = clean_env(repo.parent / "home", ZED_PROFILE_DIR=str(repo / "profile"))
+    TEMPLATE = repo = Path(tmp.name).resolve() / "hw"
+    env = clean_env(repo.parent / "home", HW_PROFILE_DIR=str(repo / "profile"))
 
     def git(*args):
         subprocess.run(["git", *args], cwd=repo, env=env, check=True, capture_output=True)
     repo.mkdir()
-    for shared in ("hooks", "bin"):  # links, not copies: the hooks and the `bin/zed` they call are this checkout's own files
+    for shared in ("hooks", "bin"):  # links, not copies: the hooks and the `bin/hw` they call are this checkout's own files
         (repo / shared).symlink_to(HOME / shared)
     shutil.copy(HOME / ".gitignore", repo / ".gitignore")
     (repo / "profile.template").mkdir()
@@ -42,7 +42,7 @@ def setUpModule():
     (repo / "AGENTS.md").write_text("# Operating manual\n")
     (repo / "CLAUDE.md").write_text("@AGENTS.md\n")
     git("init", "-q", "-b", "main")
-    git("config", "core.hooksPath", "hooks")  # what bin/zed-setup does
+    git("config", "core.hooksPath", "hooks")  # what bin/hw-setup does
     git("add", "-A")
     git("commit", "-q", "-m", "Core")
     git("checkout", "-q", "-b", "task/work")  # a worker's branch, cut from main
@@ -63,8 +63,8 @@ class HookCase(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name).resolve()
-        self.repo = self.root / "zed"
-        self.env = clean_env(self.root / "home", ZED_PROFILE_DIR=str(self.repo / "profile"))  # where a checkout keeps it
+        self.repo = self.root / "hw"
+        self.env = clean_env(self.root / "home", HW_PROFILE_DIR=str(self.repo / "profile"))  # where a checkout keeps it
         shutil.copytree(TEMPLATE, self.repo, symlinks=True)
 
     def git(self, *args, check=True, **env):
@@ -170,15 +170,15 @@ class ReferenceTransaction(HookCase):
         return self.git("merge", "--no-ff", "-m", f"Merge {branch}", branch, check=False, **env)
 
     def verdicts(self, **by_hat):
-        """Record a finished session per hat with its verdict about the work's code, as `zed-employee finish` does."""
-        subprocess.run([str(self.repo / "bin" / "zed"), "task", "list"], env=self.env, check=True, capture_output=True)  # creates the DB
-        tree = zedlib.core_tree(self.repo, self.work)
-        conn = sqlite3.connect(self.repo / "profile" / "db" / "zed.db")
+        """Record a finished session per hat with its verdict about the work's code, as `hw-employee finish` does."""
+        subprocess.run([str(self.repo / "bin" / "hw"), "task", "list"], env=self.env, check=True, capture_output=True)  # creates the DB
+        tree = hwlib.core_tree(self.repo, self.work)
+        conn = sqlite3.connect(self.repo / "profile" / "db" / "hw.db")
         with conn:
             for hat, verdict in by_hat.items():
                 conn.execute(
                     "INSERT INTO sessions(task_id,repo,base,branch,worktree,agent,status,hat,verdict,verdict_tree,core_start,"
-                    "created_at,updated_at) VALUES (1,'zed','main','task/work',?,?,'closed',?,?,?,?,'2026-11-11 10:00','2026-11-11 10:00')",
+                    "created_at,updated_at) VALUES (1,'hw','main','task/work',?,?,'closed',?,?,?,?,'2026-11-11 10:00','2026-11-11 10:00')",
                     (str(self.repo), f"{hat}-t1", hat, verdict, tree, tree))
         conn.close()
 
@@ -217,18 +217,18 @@ class ReferenceTransaction(HookCase):
         self.assert_refused(self.merge())
 
     def test_the_users_override_is_logged(self):
-        r = self.merge(ZED_GATE_OVERRIDE="the user said so")
+        r = self.merge(HW_GATE_OVERRIDE="the user said so")
         self.assert_merged(r)
         self.assertIn("overridden (the user said so); logged", r.stderr)
-        conn = sqlite3.connect(self.repo / "profile" / "db" / "zed.db")
+        conn = sqlite3.connect(self.repo / "profile" / "db" / "hw.db")
         self.addCleanup(conn.close)
         logged = [row[0] for row in conn.execute("SELECT text FROM events WHERE kind='merge'")]
         self.assertEqual(len(logged), 1)
         self.assertIn("the user said so", logged[0])
 
     def test_what_is_not_unreviewed_work_arriving_is_not_gated(self):
-        self.assert_refused(self.merge(ZED_MERGE_GATE_DONE="0" * 40))  # `bin/zed merge` vetted another head: still checked
-        self.assert_merged(self.merge(ZED_MERGE_GATE_DONE=self.work))  # the head it vetted: not checked again
+        self.assert_refused(self.merge(HW_MERGE_GATE_DONE="0" * 40))  # `bin/hw merge` vetted another head: still checked
+        self.assert_merged(self.merge(HW_MERGE_GATE_DONE=self.work))  # the head it vetted: not checked again
 
         self.git("reset", "-q", "--hard", self.before)
         self.git("update-ref", f"refs/remotes/origin/{PROFILE_BRANCH}", self.work)  # a pull: the remote's copy of this branch holds it
