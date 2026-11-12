@@ -329,6 +329,18 @@ class ZedTests(unittest.TestCase):
 ❯ 
   ⏵⏵ accept edits on"""
 
+    def test_a_block_ends_at_opencodes_chrome(self):
+        """What `herdr agent read` showed of OpenCode v2.2.7 (2026-11-12) after a turn that ended in a question: without
+        an end at its chrome the last item took the footer with it and was recorded as a second question."""
+        screen = ("  ┃  Formatting test. Reply with exactly these four lines:\n  ┃  ZED:QUESTION" + " " * 60 + "10,605 tokens\n"
+                  "  ┃  1. Not this one: it is the echo of a prompt\n  ┃\n\n     Noted.\n     ZED:QUESTION\n\n"
+                  "     1. Red or blue? I recommend red.\n     2. Round or square corners?\n\n"
+                  "     Build · Claude Haiku 5.5 · 1.6s · 26.7 tok/s\n\n\n  ┃\n  ┃\n  ┃\n"
+                  "  ┃  Build auto · Claude Haiku 5.5 GitHub Copilot · low\n  ╹▀▀▀▀▀▀▀▀\n  /…/work  10.6K (1%) · $0.00  ctrl+p commands\n")
+        self.assertEqual(self.z.parse_block(screen)["items"], ["Red or blue? I recommend red.", "Round or square corners?"])
+        done = self.z.parse_block("     ZED:DONE\n     Summary: Added it\n     QA: ran it\n\n     Build · Some Model · 2m 13s\n  ┃\n")
+        self.assertEqual(done["fields"], {"Summary": "Added it", "QA": "ran it"})
+
     def test_parse_block_kinds_and_chrome(self):
         b = self.z.parse_block(self.DONE_SCREEN)
         self.assertEqual(b["kind"], "DONE")

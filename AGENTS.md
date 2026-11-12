@@ -66,7 +66,8 @@ the user who took over.
 3. **Watch**: one watcher runs while any session is running (how it is armed: "Runtime differences"). It does routine
    work in code and wakes me only for what needs judgment; I `bin/zed ack` each `[E<id>]` once handled.
 4. **Check** (`check-workers`): compare progress with the plan file; redirect a worker that is off-plan, redoing work or over estimate.
-5. **Relay** (`relay`): `bin/zed relay Q<id> "<the user's answer, verbatim>"` records it and prompts the worker.
+5. **Relay** (`relay`): `bin/zed relay Q<id> "<the user's answer, verbatim>"` records it and prompts the worker; a
+   working worker is left alone and reads it (`zed-employee answers`), or the watcher prompts it once idle.
 6. **Wrap up** (`wrap-up`): close published, idle sessions; harvest `Learnings:` into `profile/knowledge/repos/<repo>.md`.
 
 External sessions (adopted with `bin/zed adopt`) are tracked and reported but never prompted or closed unless asked.
@@ -81,7 +82,8 @@ Only these parts depend on the runtime; `bin/zed start` says which one this inst
 - **OpenCode.** Reads this manual as `AGENTS.md`. Started with `bin/zed coordinator`, never plain `opencode`: it sets the
   model and variant from `config/opencode.json`, the permission rules and the guard plugin (`bin/zed-pretool`), proves
   the guard with a canary and opens the session; `start` refuses any other session. There are no Stop hooks: `start`
-  arms the watcher and shows its un-acked events. Workers: model and variant from `config/opencode.json`.
+  starts one long-lived watcher (`watch --daemon`; restarted by `start` if it died) that wakes this session through
+  its server for every event, and shows the un-acked ones. Workers: model and variant from `config/opencode.json`.
 
 ## Talking to the user
 

@@ -4,11 +4,14 @@ A `World` is everything one test needs. The real `bin/zed` runs as a subprocess 
 would run it: in a (fake) herdr pane, with its own agent session. Nothing here reads or writes the real profile, the
 real herdr or the network: the environment of every command is built from scratch (see `World.env`).
 """
+import atexit
+import fcntl
 import json
 import os
 import re
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -23,9 +26,10 @@ sys.path.insert(0, str(FAKES))
 import store  # noqa: E402
 
 ZED = str(HOME / "bin" / "zed")
-RUN_ZED = [sys.executable, str(FAKES / "no_wait.py"), ZED]  # the real `bin/zed`, its waits cut short
+RUN_ZED = [sys.executable, str(FAKES / "run_zed.py")]  # the real `bin/zed`, without spawn's wait for a pane's shell
 REPO = "demo"
 BASE = "main"
+RUNTIMES = {"claude": "OnClaude", "opencode": "OnOpenCode"}  # what a test class is called for each (per_runtime)
 # never inherited from the shell that runs the tests: a worker session carries all of these
 FOREIGN = ("ZED_", "CLAUDE", "OPENCODE", "HERDR", "GIT_", "FAKE_")
 FILL = re.compile(r"<FILL\b[^>\n]*>")  # what `bin/zed brief` leaves for the coordinator to write
@@ -55,6 +59,22 @@ def clean_env(home, **extra):
                   "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.invalid"} | extra
 
 
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def per_runtime(namespace, *cases):
+    """Replace each test class in a module's `namespace` by one per runtime (`WatchOnClaude`, `WatchOnOpenCode`): the
+    same tests, in a world whose coordinator and workers run on that runtime."""
+    for case in cases:
+        del namespace[case.__name__]
+        for runtime, suffix in RUNTIMES.items():
+            name = case.__name__ + suffix
+            namespace[name] = type(name, (case,), {"RUNTIME": runtime, "__module__": case.__module__, "__qualname__": name})
+
+
 _template = None  # the folder every World copies its git repo and origin from, built once per test run
 
 
@@ -62,7 +82,8 @@ def template():
     """A folder with the demo repo (one commit on BASE, pushed) and its bare origin."""
     global _template
     if _template is None:
-        _template = tempfile.TemporaryDirectory()  # removed when the test run ends
+        _template = tempfile.TemporaryDirectory()
+        atexit.register(_template.cleanup)  # removed when the test run ends
         root = Path(_template.name).resolve()
 
         def git(*args, cwd):
@@ -79,8 +100,10 @@ def template():
 
 
 class World:
-    def __init__(self, case):
-        self.case = case
+    """`runtime`: the one this install runs on, coordinator and workers alike (`runtime` in the profile's settings)."""
+
+    def __init__(self, case, runtime="claude"):
+        self.case, self.runtime = case, runtime
         tmp = tempfile.TemporaryDirectory()
         case.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name).resolve()
@@ -89,10 +112,12 @@ class World:
         self.repo = self.root / "repos" / REPO
         self.worktrees = self.root / "worktrees"
         self.script_path = self.root / "agent-script.json"
-        self.coordinators = {}
+        self.coordinators, self.servers, self.daemon = {}, {}, False
+        case.addCleanup(self.stop_watcher)
         for d in (self.profile / "config", self.herdr, self.root / "home"):
             d.mkdir(parents=True)
         (self.profile / "profile.md").write_text("# Throwaway test profile\n")
+        (self.profile / "config" / "settings.json").write_text(json.dumps({"runtime": runtime}))
         (self.profile / "config" / "projects.json").write_text(json.dumps(
             {"worktree_root": str(self.worktrees), "repos": {REPO: {"path": str(self.repo), "role": "demo repo"}}}))
         shutil.copytree(template() / REPO, self.repo)
@@ -115,23 +140,71 @@ class World:
         return r
 
     def zed(self, *args, coordinator=None, check=True, timeout=90):
-        """Run `bin/zed <args>` as a coordinator session. With check, a failure fails the test with the output."""
+        """Run `bin/zed <args>` as a coordinator session. With check, a failure fails the test with the output.
+        On OpenCode `start` and `spawn` leave the long-lived watcher running. Unless the test is about it
+        (`self.daemon`), it is stopped again: these tests look through a watcher of their own (`watch_once`,
+        `watch_ticks`), and a profile has one watcher at a time."""
         r = subprocess.run([*RUN_ZED, *args], env=self.env(coordinator), capture_output=True, text=True,
                            timeout=timeout, cwd=self.root)
+        if args[0] in ("start", "spawn") and not self.daemon:
+            self.stop_watcher()
         if check:
             self.case.assertEqual(r.returncode, 0, f"bin/zed {' '.join(args)}\n{r.stdout}{r.stderr}")
         return r
 
+    def watcher_pid(self):
+        """The pid of the profile's running watcher, or None."""
+        path = self.profile / ".cache" / "watch.pid"
+        try:
+            pid = json.loads(path.read_text())["pid"]
+            os.kill(pid, 0)
+        except (OSError, ValueError, KeyError):
+            return None
+        return pid
+
+    def stop_watcher(self, sig=signal.SIGTERM):
+        """End the profile's watcher, if one runs, and wait until it is gone."""
+        pid, deadline = self.watcher_pid(), time.time() + 10
+        while pid and self.watcher_pid() == pid:
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                break
+            self.case.assertLess(time.time(), deadline, "the watcher did not stop")
+            time.sleep(0.02)
+
     def coordinator(self, name):
-        """A coordinator session in its own pane of the fake herdr. Returns the environment that identifies it, as
-        Claude Code and herdr set it in a real pane."""
+        """A coordinator session in its own pane of the fake herdr, mid-turn (it is the one running the commands).
+        Returns the environment that identifies it, as its runtime and herdr set it in a real pane. On OpenCode it is a
+        session of its own server, opened as `bin/zed coordinator` leaves it: the TUI on the session and the record of
+        a proven guard."""
         with store.locked(self.herdr) as state:
             _, pane = store.new_pane(state, HOME, label=name, shell_pid=os.getpid())
-            agent = store.new_agent(name, "claude", [])
+            agent = store.new_agent(name, self.runtime, [])
             agent["status"] = "working"
             state["panes"][pane]["agent"] = agent
-        self.coordinators[name] = {"HERDR_PANE_ID": pane, "CLAUDE_CODE_SESSION_ID": agent["session"],
-                                   "CLAUDE_PID": str(os.getpid())}
+        if self.runtime == "claude":
+            identity = {"CLAUDE_CODE_SESSION_ID": agent["session"], "CLAUDE_PID": str(os.getpid())}
+        else:
+            server = {"url": f"http://127.0.0.1:{free_port()}", "password": f"pw-{name}"}
+            session, record = f"ses_{name}", self.root / f"coordinator-{name}.json"
+            job = subprocess.Popen(["opencode", "serve", "--port", server["url"].rsplit(":", 1)[1]], stdin=subprocess.DEVNULL,
+                                   env=self.env({}) | {"FAKE_AGENT_PANE": pane, "OPENCODE_PASSWORD": server["password"]})
+            self.servers[name] = job
+            self.case.addCleanup(job.wait, 10)
+            self.case.addCleanup(job.terminate)
+            deadline = time.time() + 10
+            while "server" not in store.read(self.herdr)["panes"][pane]:
+                self.case.assertLess(time.time(), deadline, "the fake OpenCode server did not come up")
+                time.sleep(0.02)
+            with store.locked(self.herdr) as state:
+                state["panes"][pane]["agent"]["argv"] = ["--server", server["url"], "--session", session]
+                state["panes"][pane]["opencode"] = {session: {"directory": str(HOME), "model": None, "messages": []}}
+            store.agent_event(pane, "start", env=self.env({}), root=self.herdr)  # the TUI opens: herdr learns its session
+            record.write_text(json.dumps({"runtime": "opencode", "session": session, "server": server, "server_pid": job.pid,
+                                          "guard": "live", "started_at": "2026-01-01 00:00"}))
+            identity = {"OPENCODE_SESSION_ID": session, "OPENCODE_PID": str(os.getpid()), "ZED_COORDINATOR": str(record)}
+        self.coordinators[name] = {"HERDR_PANE_ID": pane} | identity
         return self.coordinators[name]
 
     # ------------------------------------------------------------ the loop's steps
@@ -157,7 +230,8 @@ class World:
 
     def script(self, **agents):
         """What each agent does, by agent name (see fakes/agent.py); `default=` is for any other agent."""
-        scripts = {("*" if name == "default" else name.replace("_", "-")): s for name, s in agents.items()}
+        scripts = {name: {"turns": []} for name in self.coordinators}  # a coordinator that is prompted just ends its turn
+        scripts |= {("*" if name == "default" else name.replace("_", "-")): s for name, s in agents.items()}
         self.script_path.write_text(json.dumps(scripts))
 
     def spawn(self, tid, branch, hat="build", check=True, brief=None):
@@ -212,6 +286,29 @@ class World:
     def ack_all(self):
         self.zed("ack", "--all")
 
+    def wait_for(self, what, test, timeout=30):
+        """Wait until `test()` is true (for what a background watcher does); fails with `what` at the time limit."""
+        deadline = time.time() + timeout
+        while not test():
+            self.case.assertLess(time.time(), deadline, f"waited {timeout} s for {what}")
+            time.sleep(0.05)
+
+    def age_wakes(self, seconds=600):
+        """Stand in for waiting: the long-lived watcher shows an un-acked event again five minutes after it last did."""
+        path = self.profile / ".cache" / "wake-queue.json"
+        with open(path.with_suffix(".guard"), "w") as guard:  # the lock `bin/zed` takes around the queue
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            queue = json.loads(path.read_text())
+            for event in queue["events"]:
+                event["shown_at"] -= seconds
+            path.write_text(json.dumps(queue))
+
+    def rest(self, name="zed"):
+        """A coordinator's turn ends: it is idle, as herdr reports its runtime after a turn."""
+        with store.locked(self.herdr) as state:
+            _, pane = store.find_agent(state, name)
+            store.set_status(pane["agent"], pane["agent"]["launch"].get("rest", "idle"))
+
     # ------------------------------------------------------------ reading the record and the world
 
     def rows(self, sql, *args):
@@ -237,6 +334,25 @@ class World:
         """The fake agent's state (None once its pane is gone or the CLI quit)."""
         _, pane = store.find_agent(store.read(self.herdr), name)
         return pane["agent"] if pane else None
+
+    def worker_rules(self, name):
+        """The file a worker's CLI loads as its rules: the one named at its launch (Claude Code), or the instruction
+        file of its own config directory (OpenCode)."""
+        _, pane = store.find_agent(store.read(self.herdr), name)
+        if self.runtime == "claude":
+            return Path(pane["agent"]["launch"]["rules"])
+        return Path(pane["env"]["OPENCODE_CONFIG_DIR"]) / "AGENTS.md"
+
+    def server_messages(self, name):
+        """The messages every session of the OpenCode server in an agent's pane holds, oldest first."""
+        _, pane = store.find_agent(store.read(self.herdr), name)
+        return [m for session in pane.get("opencode", {}).values() for m in session["messages"]]
+
+    def stop_server(self, name):
+        """The OpenCode server in an agent's pane stops (its TUI was closed)."""
+        _, pane = store.find_agent(store.read(self.herdr), name)
+        os.kill(pane["server"]["pid"], signal.SIGKILL)
+        self.wait_for("the server to stop", lambda: not self.servers[name].poll() is None)
 
     def herdr_calls(self, *prefix):
         """The herdr commands received so far that start with `prefix`."""
@@ -268,15 +384,17 @@ class World:
         while no watcher runs (the watcher keeps this file between its runs)."""
         path = self.profile / ".cache" / "watch-alerts.json"
         alerts = json.loads(path.read_text())
-        for seen in alerts.values():
-            if isinstance(seen, dict) and "lapse" in seen:
-                seen["lapse"]["since"] -= seconds
+        lapses = [seen["lapse"] for seen in alerts.values() if isinstance(seen, dict) and "lapse" in seen]
+        self.case.assertTrue(lapses, "the watcher holds no lapse to age")
+        for lapse in lapses:
+            lapse["since"] -= seconds
         path.write_text(json.dumps(alerts))
 
 
 class LoopCase(unittest.TestCase):
     """A test case with a fresh world whose coordinator already holds the profile lock."""
+    RUNTIME = "claude"
 
     def setUp(self):
-        self.w = World(self)
+        self.w = World(self, self.RUNTIME)
         self.w.zed("lock", "acquire")

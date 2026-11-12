@@ -1,7 +1,6 @@
 """A scripted agent CLI, the same for every runtime.
 
-A runtime's wrapper (`bin/claude`; an OpenCode one would sit next to it) only reads its own launch flags and calls
-`main(launch)`. Everything an agent does here is driven by a script, so a test decides what the "model" does.
+A runtime's wrapper (`bin/claude`, `bin/opencode`) only reads its own launch flags and calls `main(launch)`. Everything an agent does here is driven by a script, so a test decides what the "model" does.
 
 The fake herdr runs the wrapper once per thing that happens to the agent, named in $FAKE_AGENT_EVENT:
   start     the CLI was launched in pane $FAKE_AGENT_PANE
@@ -42,8 +41,10 @@ FINISH_STEP = "- [ ] Run zed-employee finish and report (ZED:DONE)"
 
 def main(launch):
     """Handle one event for the agent in $FAKE_AGENT_PANE. `launch` is what the wrapper read from its flags:
-    {"name", the runtime's screen ("bullet": what it prints before a message, "prompt_echo": before the echo of a
-    prompt, "footer": the lines under an idle CLI), plus whatever the runtime's flags carry}."""
+    {"name", the runtime's screen ("bullet": what it prints before a message, "indent": before the message's other
+    lines, "prompt_echo": before the echo of a prompt ("echo_indent": before its other lines, when they differ), "turn_end": the lines it prints when a turn ends, "footer": the
+    lines under an idle CLI, "rest": herdr's status for it after a turn, `idle` or `done`), plus whatever the runtime's
+    flags carry}."""
     pane_id, event = os.environ["FAKE_AGENT_PANE"], os.environ.get("FAKE_AGENT_EVENT", "start")
     payload = os.environ.get("FAKE_AGENT_PAYLOAD", "")
     if event == "start":
@@ -89,7 +90,7 @@ def take(pane_id, text):
     """The prompt is submitted: it starts a turn, or waits its turn behind the one in progress."""
     with store.locked() as state:
         agent = state["panes"][pane_id]["agent"]
-        if agent["status"] != "idle":
+        if agent["status"] not in ("idle", "done"):
             agent["queued"].append(text)
             return
         begin_turn(agent, text)
@@ -99,7 +100,8 @@ def take(pane_id, text):
 def begin_turn(agent, text):
     agent["prompts"].append(text)
     agent["turn"], agent["step"] = len(agent["prompts"]), 0
-    agent["screen"] += [agent["launch"].get("prompt_echo", "") + line for line in text.splitlines()]
+    echo, rest = agent["launch"].get("prompt_echo", ""), agent["launch"].get("echo_indent")
+    agent["screen"] += [(echo if i == 0 or rest is None else rest) + line for i, line in enumerate(text.splitlines())]
     if len(agent["prompts"]) == 1:
         agent["facts"] |= facts_from(text)
     store.set_status(agent, "working")
@@ -150,7 +152,8 @@ def work(pane_id):
             turns = script_for(agent).get("turns", [])
             acts = turns[agent["turn"] - 1] if 0 < agent["turn"] <= len(turns) else []
             if agent["step"] >= len(acts):
-                store.set_status(agent, "idle")
+                agent["screen"] += agent["launch"].get("turn_end", [])
+                store.set_status(agent, agent["launch"].get("rest", "idle"))
                 if not agent["queued"]:
                     return
                 begin_turn(agent, agent["queued"].pop(0))
@@ -158,6 +161,7 @@ def work(pane_id):
             act = acts[agent["step"]]
             agent["step"] += 1
             cwd, facts, bullet = pane["cwd"], dict(agent["facts"]), agent["launch"].get("bullet", "")
+            indent = agent["launch"].get("indent", "  " if bullet else "")
         out = perform(act, pane_id, cwd, facts)
         with store.locked() as state:
             pane = state["panes"].get(pane_id)
@@ -168,7 +172,7 @@ def work(pane_id):
                 pane["agent"] = None
                 return
             for i, line in enumerate(out.get("print", [])):
-                agent["screen"].append((bullet if i == 0 else "  " if bullet else "") + line)
+                agent["screen"].append((bullet if i == 0 else indent) + line)
             if "result" in out:
                 agent.setdefault("results", []).append(out["result"])
             if "pause" in act:

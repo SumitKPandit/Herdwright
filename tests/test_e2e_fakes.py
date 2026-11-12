@@ -76,7 +76,8 @@ class Agent(FakeCase):
         self.assertEqual((self.w.root / "out" / "note.txt").read_text(), "done\n")
         self.assertEqual(self.w.agent("worker")["results"][0]["rc"], 0)
         screen = self.herdr("agent", "read", "worker", "--source", "recent-unwrapped", "--lines", "150").stdout
-        self.assertIn("> Do the thing\n⏺ On it.\n", screen)
+        self.assertIn("❯ Do the thing\n⏺ On it.\n", screen)
+        self.assertIn("✻ Worked for 1s\n", screen)
 
     def test_a_prompt_left_in_the_input_box_is_sent_by_enter_once(self):
         self.agent(swallow=[1])

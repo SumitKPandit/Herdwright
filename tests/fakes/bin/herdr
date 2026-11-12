@@ -3,16 +3,20 @@
 shapes and error words (`pane_not_found`, `workspace_not_found`, `agent_not_ready`, `agent_prompt_stalled`).
 
   workspace create --cwd D --label L [--no-focus] [--env K=V ..]   |  workspace close <id>
-  pane get <pane>  |  pane list  |  pane process-info --pane <pane>
+  pane get <pane>  |  pane list  |  pane process-info --pane <pane>  |  pane run <pane> <command line>
   agent list | get <a> | read <a> [--source S] [--lines N] | start <a> --kind K --pane P [--timeout MS] -- <cli args>
         | prompt <a> <text> [--wait ..] | send-keys <a> <key..> | wait <a> --until <state> [--timeout MS]
 
 `agent start` launches the executable named by --kind (found on PATH, as herdr types it into the pane's shell); later
 events reach the same executable (see agent.py). Nothing here waits: an agent is whatever its script made it.
+`pane run` types a command line into the pane's shell: it runs in the pane's folder and environment, and a server it
+leaves in the background (`opencode serve .. &`) is up when the command returns.
 """
 import json
 import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -60,6 +64,13 @@ def pane(args):
     found = state["panes"].get(pane_id)
     if not found:
         return fail("pane_not_found")
+    if args[0] == "run":
+        subprocess.run(["sh", "-c", args[2]], cwd=found["cwd"], env=store.pane_env(pane_id, found), stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        deadline = time.monotonic() + 10
+        while " serve " in args[2] and "server" not in store.read()["panes"][pane_id] and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return ok({"type": "pane_run"})
     if args[0] == "get":
         return ok({"type": "pane", "pane": store.pane_record(pane_id, found)})
     if args[0] == "process-info":

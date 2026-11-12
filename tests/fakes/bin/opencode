@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""A fake OpenCode CLI (v2). This file is the only place that knows OpenCode's launch forms and what its screen looks
+like; what the agent then does is agent.py, shared by every runtime.
+
+  opencode serve --port N [..]             the session's server, started in a pane (`herdr pane run`): the routes
+                                           `bin/zed` calls, answered from the world in store.py until its pane is gone
+  opencode --server URL [--auto] --session ID
+                                           the TUI on a session of that server (`herdr agent start --kind opencode`)
+
+The server (HTTP basic auth, user `opencode`, password $OPENCODE_PASSWORD), under /api:
+  GET  /info                               {"version"}
+  POST /session                            create a session; echoes the model it was asked for
+  POST /session/<id>/prompt                admit a prompt: {"id": "msg_..", "sessionID"}. With a TUI on the session it is
+                                           the agent's next prompt (agent.py). Without one, a prompt that asks for one shell
+                                           call gets it: the call passes the plugins in $OPENCODE_CONFIG_DIR/plugins the
+                                           way OpenCode runs them, so a guard that is installed stops it and one that is
+                                           not lets it run. A file `opencode-down` in the world's folder that names
+                                           the server's pane makes the route fail (HTTP 500), for a caller's fallback.
+  POST /experimental/session/<id>/wait     returns at once: nothing here takes time
+  GET  /session/<id>/message               the session's messages, tool calls as OpenCode v2.2.7 reports them
+
+The screen is what `herdr agent read` showed of OpenCode v2.2.7 on 2026-11-12: a prompt is echoed behind a bar, a
+message is indented without a bullet and followed by a line naming the agent, model and time, and the idle input box
+is four barred lines, the last naming the mode and model, over a ruler and the folder.
+"""
+import argparse
+import base64
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import agent  # noqa: E402
+import store  # noqa: E402
+
+VERSION = "9.9.9 (fake OpenCode)"
+SCREEN = {"bullet": "     ", "indent": "     ", "prompt_echo": "  ┃  ", "rest": "done",
+          "turn_end": ["", "     Build · Fake Model · 0.1s · 20.0 tok/s", ""],
+          "footer": ["  ┃", "  ┃", "  ┃", "  ┃  Build auto · Fake Model Fake Provider · low", "  ╹" + "▀" * 40,
+                     "  /…/work  shift+tab agents  ctrl+p commands"]}
+ONE_SHELL_CALL = re.compile(r"Call the shell tool exactly once with exactly this command: (.+)")
+PLUGIN_PROGRAM = re.compile(r"spawnSync\((\"(?:[^\"\\]|\\.)*\")")
+PLUGIN_ENV = re.compile(r"^const ENV = (\{.*\});$", re.M)
+
+
+def launch(argv):
+    p = argparse.ArgumentParser(prog="opencode")
+    p.add_argument("--version", action="store_true")
+    p.add_argument("--server")
+    p.add_argument("--auto", action="store_true")
+    p.add_argument("--session")
+    return vars(p.parse_args(argv)) | {"runtime": "opencode"} | SCREEN
+
+
+def tui(flags):
+    """One event for the TUI's agent. At its start herdr learns the OpenCode session it is on."""
+    if os.environ.get("FAKE_AGENT_EVENT", "start") == "start":
+        with store.locked() as state:
+            state["panes"][os.environ["FAKE_AGENT_PANE"]]["agent"]["session"] = flags["session"]
+    agent.main(flags)
+
+
+# ---------------------------------------------------------------- the server
+
+
+def guard_refusal(command, directory, session):
+    """Why the plugins in the server's config directory stop the shell call `command`, or None when none does. A V2
+    plugin (`Plugin.define`) is run as OpenCode runs it: the program it names gets the call on stdin, and a non-zero
+    exit or a `deny` decision on stdout throws. Any other file there is not a plugin to V2 and stops nothing."""
+    plugins = Path(os.environ.get("OPENCODE_CONFIG_DIR", os.devnull)) / "plugins"
+    for index in sorted(plugins.glob("*/index.js")):
+        text = index.read_text()
+        program, env = PLUGIN_PROGRAM.search(text), PLUGIN_ENV.search(text)
+        if "Plugin.define(" not in text or not program:
+            continue
+        call = {"tool_name": "shell", "tool_input": {"command": command}, "cwd": directory, "session_id": session}
+        r = subprocess.run([json.loads(program.group(1))], input=json.dumps(call), capture_output=True, text=True,
+                           env=os.environ | (json.loads(env.group(1)) if env else {}))
+        if r.returncode:
+            return (r.stderr or r.stdout).strip()
+        decision = json.loads(r.stdout).get("hookSpecificOutput", {}) if r.stdout.strip() else {}
+        if decision.get("permissionDecision") == "deny":
+            return decision["permissionDecisionReason"]
+    return None
+
+
+class Api(BaseHTTPRequestHandler):
+    pane = os.environ.get("FAKE_AGENT_PANE")
+
+    def log_message(self, *args):
+        pass
+
+    def answer(self, code, data=None):
+        body = json.dumps({"data": data} if code == 200 else {"error": data}).encode()
+        self.send_response(code)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def route(self, method):
+        wanted = "Basic " + base64.b64encode(f"opencode:{os.environ.get('OPENCODE_PASSWORD', '')}".encode()).decode()
+        if self.headers.get("authorization") != wanted:
+            return self.answer(401, "unauthorized")
+        length = int(self.headers.get("content-length") or 0)
+        body = json.loads(self.rfile.read(length) or "{}") if length else {}
+        path = self.path.removeprefix("/api")
+        if (method, path) == ("GET", "/info"):
+            return self.answer(200, {"version": VERSION})
+        if (method, path) == ("POST", "/session"):
+            session = f"ses_{uuid.uuid4().hex[:12]}"
+            with store.locked() as state:
+                state["panes"][self.pane].setdefault("opencode", {})[session] = {
+                    "directory": body["location"]["directory"], "model": body.get("model"), "messages": []}
+            return self.answer(200, {"id": session, "model": body.get("model")})
+        m = re.fullmatch(r"(?:/experimental)?/session/([^/]+)/(prompt|wait|message)", path)
+        session = m and store.read()["panes"][self.pane].get("opencode", {}).get(m.group(1))
+        if not session:
+            return self.answer(404, "not found")
+        if m.group(2) == "wait":
+            return self.answer(200, None)
+        if m.group(2) == "message":
+            return self.answer(200, session["messages"])
+        down = store.home() / "opencode-down"
+        if down.exists() and self.pane in down.read_text().split():
+            return self.answer(500, "the server cannot take a prompt now")
+        self.answer(200, self.prompt(m.group(1), session, body["text"]))
+
+    def prompt(self, session_id, session, text):
+        """Admit `text` to the session's inbox and let its turn run. Returns the admitted message."""
+        message = {"id": f"msg_{uuid.uuid4().hex[:12]}", "sessionID": session_id, "type": "user", "payload": {"text": text}}
+        reply = {"id": f"msg_{uuid.uuid4().hex[:12]}", "sessionID": session_id, "type": "assistant", "model": session["model"], "content": []}
+        on_screen = (store.read()["panes"][self.pane].get("agent") or {}).get("launch", {}).get("session") == session_id
+        call = None if on_screen else ONE_SHELL_CALL.search(text)
+        if call:
+            command = call.group(1).strip()
+            refusal = guard_refusal(command, session["directory"], session_id)
+            state = {"status": "error", "input": {"command": command}, "error": {"type": "unknown", "message": refusal}} if refusal else \
+                {"status": "completed", "input": {"command": command}}
+            reply["content"].append({"type": "tool", "name": "shell", "executed": False, "state": state})
+        with store.locked() as state:
+            state["panes"][self.pane]["opencode"][session_id]["messages"] += [message, reply]
+        if on_screen:
+            store.agent_event(self.pane, "prompt", text)
+        return {k: message[k] for k in ("id", "sessionID")}
+
+    def do_GET(self):
+        self.route("GET")
+
+    def do_POST(self):
+        self.route("POST")
+
+
+def serve(port):
+    """Serve until the pane this server is a job of is gone (its workspace was closed, or the test's world removed)."""
+    server = ThreadingHTTPServer(("127.0.0.1", port), Api)
+    with store.locked() as state:
+        state["panes"][Api.pane]["server"] = {"port": port, "pid": os.getpid()}
+
+    def pane_alive():
+        try:
+            return Api.pane in store.read()["panes"] and (store.home() / "state.json").exists()
+        except (OSError, ValueError):
+            return False
+
+    def watch_pane():
+        while pane_alive():
+            time.sleep(0.2)
+        os._exit(0)
+    threading.Thread(target=watch_pane, daemon=True).start()
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["serve"]:
+        serve(int(sys.argv[sys.argv.index("--port") + 1]))
+    flags = launch(sys.argv[1:])
+    if flags["version"]:
+        print(VERSION)
+        sys.exit(0)
+    tui(flags)

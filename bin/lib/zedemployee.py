@@ -11,7 +11,7 @@ import re
 import shutil
 import sqlite3
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -157,6 +157,14 @@ def stop_problem(session=None):
             return None
     return (f"S{sid} reported done but `zed-employee finish` has not run: run it (it ticks the plan's last step "
             "and records a verdict), then print your ZED:DONE block")
+
+
+def answers(session, today=None):
+    """The lines `zed-employee answers` prints for session `session`: each answer the user gave to one of its questions
+    that it has not been given yet. They count as given from here on: the watcher does not prompt them as well."""
+    with database() as conn:
+        taken = zedlib.take_answers(conn, session, today or datetime.now().strftime("%Y-%m-%d %H:%M"))
+    return [zedlib.answer_line(q) for q in taken] or ["no new answers"]
 
 
 def place_draft(draft, tid, hat, sid):
