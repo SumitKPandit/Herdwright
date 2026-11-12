@@ -1,11 +1,15 @@
-"""The fakes themselves (tests/fakes/): what the fake herdr answers and what a scripted agent does, without `bin/zed`.
+"""The fakes themselves (tests/fakes/): what the fake herdr answers, what a scripted agent does and what the fake OpenCode
+server answers, without `bin/zed`.
 These pin the behaviour the end-to-end tests in test_e2e_loop.py stand on, and the parts of the fakes they do not use
 yet (a prompt left unsent in the input box, an agent CLI that quits)."""
+import base64
 import json
 import subprocess
 import unittest
+import urllib.error
+import urllib.request
 
-from _e2e import World
+from _e2e import World, free_port
 
 
 class FakeCase(unittest.TestCase):
@@ -106,6 +110,89 @@ class Agent(FakeCase):
         self.assertIsNone(self.w.agent("worker"))
         self.assertEqual([a for a in self.result("agent", "list")["agents"] if a["pane_id"] == self.pane], [])
         self.assertNotIn("agent_session", self.result("pane", "get", self.pane)["pane"])  # the pane itself is still there
+
+
+class OpenCode(FakeCase):
+    """The fake OpenCode: its server in a pane (`herdr pane run`), then its TUI on a session of that server."""
+    PASSWORD = "secret"
+
+    def serve(self, plugin=None):
+        """A pane with a server in it, its config directory holding `plugin` (the text of plugins/guard/index.js)."""
+        config = self.w.root / "opencode-config"
+        if plugin:
+            (config / "plugins" / "guard").mkdir(parents=True)
+            (config / "plugins" / "guard" / "index.js").write_text(plugin)
+        ws = self.result("workspace", "create", "--cwd", str(self.w.root), "--label", "a task", "--no-focus",
+                         "--env", f"OPENCODE_CONFIG_DIR={config}", "--env", f"OPENCODE_PASSWORD={self.PASSWORD}")
+        self.pane, self.port = ws["root_pane"]["pane_id"], free_port()
+        self.result("pane", "run", self.pane, f"opencode serve --hostname 127.0.0.1 --port {self.port} > /dev/null 2>&1 &")
+        return ws
+
+    def api(self, method, path, body=None, password=PASSWORD):
+        token = base64.b64encode(f"opencode:{password}".encode()).decode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}/api{path}", method=method, data=json.dumps(body or {}).encode(),
+                                         headers={"authorization": f"Basic {token}", "content-type": "application/json"})
+        with urllib.request.urlopen(request, timeout=20) as r:
+            return json.loads(r.read())["data"]
+
+    def session(self):
+        model = {"providerID": "acme", "id": "m-1", "variant": "low"}
+        created = self.api("POST", "/session", {"location": {"directory": str(self.w.root)}, "title": "t", "model": model})
+        self.assertEqual(created["model"], model)  # echoed, as OpenCode does
+        return created["id"]
+
+    def shell_call(self, session, command="some-command 1f"):
+        """Ask the session for one shell call, as the canary does; returns the call's state."""
+        admitted = self.api("POST", f"/session/{session}/prompt", {"text": f"Call the shell tool exactly once with exactly this command: {command}\nThen stop."})
+        self.assertTrue(admitted["id"].startswith("msg_"))
+        self.api("POST", f"/experimental/session/{session}/wait")
+        user, reply = self.api("GET", f"/session/{session}/message")
+        self.assertEqual((user["id"], user["type"], reply["type"]), (admitted["id"], "user", "assistant"))
+        return reply["content"][0]["state"]
+
+    def test_the_server_is_up_when_pane_run_returns_asks_for_its_password_and_ends_with_its_pane(self):
+        ws = self.serve()
+        self.assertIn("fake OpenCode", self.api("GET", "/info")["version"])
+        with self.assertRaises(urllib.error.HTTPError) as refused:
+            self.api("GET", "/info", password="wrong")
+        self.assertEqual(refused.exception.code, 401)
+        pid = self.w.pane(self.pane)["server"]["pid"]
+        self.result("workspace", "close", ws["workspace"]["workspace_id"])
+        self.w.wait_for("the server to end", lambda: subprocess.run(["/bin/ps", "-p", str(pid)], capture_output=True).returncode)
+
+    def test_a_shell_call_passes_a_v2_plugin_and_no_other_file(self):
+        guard = self.w.root / "guard.sh"
+        guard.write_text("#!/bin/sh\necho \"denied by $WHO: $(cat)\" >&2\nexit 2\n")
+        guard.chmod(0o755)
+        v2 = (f'import {{ Plugin }} from "@opencode/plugin";\nconst ENV = {{"WHO": "the guard"}};\n'
+              f'export default Plugin.define({{ id: "g", async setup(ctx) {{ spawnSync({json.dumps(str(guard))}, []) }} }});\n')
+        self.serve(plugin=v2)
+        state = self.shell_call(self.session())
+        self.assertEqual((state["status"], state["input"]), ("error", {"command": "some-command 1f"}))
+        self.assertIn("denied by the guard: ", state["error"]["message"])  # the plugin's program ran, with the plugin's ENV
+        self.assertIn('"command": "some-command 1f"', state["error"]["message"])  # and was given the call
+
+    def test_a_v1_plugin_stops_nothing(self):
+        self.serve(plugin='export const Guard = async () => ({ "tool.execute.before": async () => { throw new Error("denied"); } });\n')
+        self.assertEqual(self.shell_call(self.session())["status"], "completed")
+
+    def test_the_tui_takes_the_sessions_prompts_and_looks_like_opencode(self):
+        self.serve()
+        session = self.session()
+        self.w.script(default={"turns": [[{"say": "On it.\nTwo lines."}, {"block": "QUESTION", "text": "1. Red or blue?"}]]})
+        started = self.herdr("agent", "start", "worker", "--kind", "opencode", "--pane", self.pane, "--timeout", "60000",
+                             "--", "--server", f"http://127.0.0.1:{self.port}", "--auto", "--session", session)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        self.assertEqual(self.result("pane", "get", self.pane)["pane"]["agent_session"]["value"], session)  # herdr knows the session
+        self.api("POST", f"/session/{session}/prompt", {"text": "Do the thing\nnow"})
+        self.assertEqual(self.w.agent("worker")["prompts"], ["Do the thing\nnow"])
+        self.assertEqual(self.status(), "done")  # how herdr reports OpenCode after a turn
+        screen = self.herdr("agent", "read", "worker", "--source", "recent-unwrapped", "--lines", "150").stdout
+        self.assertIn("  ┃  Do the thing\n  ┃  now\n     On it.\n     Two lines.\n     ZED:QUESTION\n     1. Red or blue?\n\n"
+                      "     Build · Fake Model · 0.1s · 20.0 tok/s\n\n  ┃\n", screen)
+        self.assertTrue(screen.rstrip().endswith("ctrl+p commands"))
+        self.assertEqual(self.herdr("agent", "prompt", "worker", "Again").returncode, 0)  # typed in: a turn from `done`
+        self.assertEqual(len(self.w.agent("worker")["prompts"]), 2)
 
 
 class Gh(FakeCase):

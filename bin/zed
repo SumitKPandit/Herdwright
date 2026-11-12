@@ -2761,7 +2761,8 @@ def cmd_help(args):
                                      the way to prompt a worker: refused while it is `working` unless --redirect
   relay <Q> "<answer>" [<Q> "<answer>" …] [--redirect]
                                      the user's answers in one step: prompt each worker verbatim, record the answers,
-                                     note them in the session's brief
+                                     note them in the session's brief. A working worker is not prompted: it reads
+                                     its answers (`zed-employee answers`), or the watcher prompts it once it is idle
   relay-post <S|agent> <words-file> --action "<exact action>" [--redirect] [--print]
                                      relay the user's OK to post: their words verbatim + the exact action
   gate check <sha|branch> [dir]      exit 1 unless the commit's code (profile/ ignored) has a clean review and qa by non-authors (read-only)

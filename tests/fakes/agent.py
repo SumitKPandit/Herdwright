@@ -42,9 +42,9 @@ FINISH_STEP = "- [ ] Run zed-employee finish and report (ZED:DONE)"
 def main(launch):
     """Handle one event for the agent in $FAKE_AGENT_PANE. `launch` is what the wrapper read from its flags:
     {"name", the runtime's screen ("bullet": what it prints before a message, "indent": before the message's other
-    lines, "prompt_echo": before the echo of a prompt ("echo_indent": before its other lines, when they differ), "turn_end": the lines it prints when a turn ends, "footer": the
-    lines under an idle CLI, "rest": herdr's status for it after a turn, `idle` or `done`), plus whatever the runtime's
-    flags carry}."""
+    lines, "prompt_echo": before the echo of a prompt, "echo_indent": before the echo's other lines when they differ,
+    "turn_end": the lines it prints when a turn ends, "footer": the lines under an idle CLI, "rest": herdr's status
+    for it after a turn, `idle` or `done`), plus whatever the runtime's flags carry}."""
     pane_id, event = os.environ["FAKE_AGENT_PANE"], os.environ.get("FAKE_AGENT_EVENT", "start")
     payload = os.environ.get("FAKE_AGENT_PAYLOAD", "")
     if event == "start":

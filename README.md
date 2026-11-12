@@ -101,7 +101,9 @@ deleting `find`. A path the shell expands (`$DIR/x`) is not followed. Review and
 guard, do not depend on these checks. `tests/smoke_opencode.py` runs all of this against
 the installed `opencode` (not part of the default test run): a worker's start, canary, `AGENTS.md` and skills, and its
 server's shell routes refusing what the hat denies, with no model asked for anything; Zed's own canary, model and
-variant, `start`, the lock, and a denied edit, commit and relative-path shell write in a project repo.
+variant, `start`, the lock, and a denied edit, commit and relative-path shell write in a project repo; and the wake:
+an idle session prompted through its server with the receipt kept, the prompt typed into its pane when the server
+refuses, and one watcher only.
 
 Tests: `python3 -B -m unittest discover -s tests -v`.
 

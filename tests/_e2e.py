@@ -335,6 +335,9 @@ class World:
         _, pane = store.find_agent(store.read(self.herdr), name)
         return pane["agent"] if pane else None
 
+    def pane(self, pane_id):
+        return store.read(self.herdr)["panes"][pane_id]
+
     def worker_rules(self, name):
         """The file a worker's CLI loads as its rules: the one named at its launch (Claude Code), or the instruction
         file of its own config directory (OpenCode)."""

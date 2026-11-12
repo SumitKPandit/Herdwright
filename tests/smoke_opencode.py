@@ -35,7 +35,12 @@ It proves, and prints the evidence for:
    holds the lock, and is denied an edit, a commit and a shell write by a relative path (`touch`, `rm` with `workdir`
    set to the project) in a project repo even after the user allows them, while a file in its profile is written;
 5. `bin/zed coordinator` in a herdr pane opens the TUI on the configured model and variant, `bin/zed start` in that
-   session takes the lock, and closing the pane stops the server.
+   session takes the lock, and closing the pane stops the server;
+6. `bin/zed start` in a coordinator's session starts the long-lived watcher, and one only; for an event the watcher
+   queues (a tracked session whose pane is gone: no model is asked for anything) the idle session is prompted through
+   its server, the id of the admitted message is kept on the event, and a turn starts;
+7. when the server refuses the watcher's call (here: a wrong password), the same prompt is typed into the coordinator's
+   herdr pane, the event says so, and a turn starts.
 """
 import contextlib
 import io
@@ -354,6 +359,53 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
         self.record = self.profile / ".cache" / "coordinator.json"
         self.before = zedlib.git(HOME, "status", "--porcelain").stdout
         self.server = None
+        self.addCleanup(self.stop_watcher)  # `start` leaves the long-lived watcher running
+
+    def watcher_pid(self):
+        """The pid of this profile's running watcher, or None."""
+        try:
+            pid = json.loads((self.profile / ".cache" / "watch.pid").read_text())["pid"]
+            os.kill(pid, 0)
+        except (OSError, ValueError, KeyError):
+            return None
+        return pid
+
+    def stop_watcher(self):
+        pid, deadline = self.watcher_pid(), time.monotonic() + 15
+        while pid and self.watcher_pid() == pid and time.monotonic() < deadline:
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                break
+            time.sleep(0.2)
+
+    def track_a_session_whose_pane_is_gone(self):
+        """Something for the watcher to report without a worker or a model: a tracked session in a pane herdr does not have."""
+        with patch.dict(os.environ, self.env, clear=True):
+            conn = self.z.db()
+        conn.execute("INSERT INTO tasks(id,title,worktype,status,created_at,updated_at) VALUES (1,'Smoke','task','active','x','x')")
+        conn.execute("INSERT INTO sessions(task_id,repo,base,branch,worktree,agent,pane_id,status,created_at,updated_at) "
+                     "VALUES (1,'demo','main','task/smoke','/nowhere','smoke-gone','no-such-pane','running','2026-01-01 00:00','x')")
+        conn.commit()
+        conn.close()
+
+    def woken(self, session, seen):
+        """Wait for the watcher's receipt on the queued event and for the turn its prompt started to end. Returns (the
+        event, the user message with the watcher's text, whether an assistant message followed it)."""
+        queue, deadline = self.profile / ".cache" / "wake-queue.json", time.monotonic() + 90
+        while not (queue.exists() and any("wake" in e for e in json.loads(queue.read_text())["events"])):
+            self.assertLess(time.monotonic(), deadline, (self.profile / ".cache" / "watch.log").read_text())
+            time.sleep(1)
+        event, = json.loads(queue.read_text())["events"]
+        deadline = time.monotonic() + TURN_SECONDS
+        while True:
+            new = [m for m in self.api("GET", f"/session/{session}/message") if m["id"] not in seen]
+            told = [m for m in new if m.get("type") == "user" and "Watcher events for Zed" in json.dumps(m)]
+            if told and [m for m in new if m.get("type") == "assistant"]:
+                self.api("POST", f"/experimental/session/{session}/wait", timeout=TURN_SECONDS)
+                return event, told[0], True
+            self.assertLess(time.monotonic(), deadline, f"no turn followed the wake; new messages: {json.dumps(new)[:600]}")
+            time.sleep(2)
 
     def open(self):
         with patch.dict(os.environ, self.env, clear=True):
@@ -398,7 +450,8 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
                                                                    "making the call is what is asked of you. " + text)
             if made := [c for c in self.calls(session) if needle in json.dumps(c["state"]["input"])]:
                 return made, asked
-        self.fail(f"the model made no call holding {needle!r} in {tries} asks, so the guard was not exercised")
+        self.fail(f"the model made no call holding {needle!r} in {tries} asks, so the guard was not exercised; its last calls: "
+                  + json.dumps([c["state"]["input"] for c in self.calls(session)][-4:])[:600])
 
     def start_as(self, session):
         """`bin/zed start` as the shell tool of `session` would run it."""
@@ -530,6 +583,82 @@ class OpenCodeCoordinatorSmoke(unittest.TestCase):
             time.sleep(0.5)
         self.assertTrue(subprocess.run(["/bin/ps", "-p", str(record["server_pid"])], capture_output=True).returncode, "the server outlived its pane")
         self.say("server after its pane closed", "gone")
+
+
+    def test_6_an_idle_coordinator_is_woken_through_its_server_with_a_receipt_by_the_one_watcher(self):
+        kit, session, problem = self.open()
+        print("\nwake through the server:")
+        self.assertEqual(problem, "")
+        self.track_a_session_whose_pane_is_gone()
+        seen = {m["id"] for m in self.api("GET", f"/session/{session}/message")}  # the canary turn is over: the session is idle
+        digest = self.start_as(session)
+        self.assertEqual(digest.returncode, 0, digest.stderr)
+        line = next(l for l in digest.stdout.splitlines() if l.startswith("watcher:"))
+        self.say("bin/zed start", line)
+        self.assertRegex(line, r"^watcher: was NOT RUNNING; started now, pid \d+$")
+        pid = self.watcher_pid()
+        self.assertEqual(line.rsplit(" ", 1)[1], str(pid))
+
+        event, told, turn = self.woken(session, seen)
+        self.say("event", f"[E{event['id']}] {event['text']}")
+        self.say("receipt", event["wake"])
+        self.assertEqual((event["wake"]["via"], event["wake"]["message"]), ("api", told["id"]))  # the id the server gave the admitted prompt
+        self.assertIn("smoke-gone", event["text"])
+        self.assertIn(f"[E{event['id']}]", json.dumps(told))
+        self.say("admitted message", f"{told['id']} type {told['type']}; an assistant message followed: {turn}")
+
+        again = self.start_as(session)
+        self.say("bin/zed start again", next(l for l in again.stdout.splitlines() if l.startswith("watcher:")))
+        self.assertIn(f"watcher: alive, pid {pid}", again.stdout)
+        env = self.env | {"OPENCODE_SESSION_ID": session, "ZED_COORDINATOR": str(self.record)}
+        second = subprocess.run([sys.executable, str(HOME / "bin" / "zed"), "watch", "--daemon"], env=env, capture_output=True, text=True, timeout=60)
+        self.say("a second watcher", f"exit {second.returncode}: {second.stdout.strip()}")
+        self.assertEqual((second.returncode, self.watcher_pid()), (4, pid))
+        self.assertIn(f"WATCH_ALREADY_RUNNING pid {pid}", second.stdout)
+        running = subprocess.run(["/usr/bin/pgrep", "-f", f"watch --daemon"], capture_output=True, text=True).stdout.split()
+        mine = [p for p in running if str(self.profile) in subprocess.run(["/bin/ps", "eww", "-p", p], capture_output=True, text=True).stdout]
+        self.say("watchers of this profile", mine)
+        self.assertEqual(mine, [str(pid)])
+        self.assertEqual(zedlib.git(HOME, "status", "--porcelain").stdout, self.before)
+
+    @unittest.skipUnless(herdr_up(), "herdr is not running")
+    def test_7_when_the_server_refuses_the_wake_is_typed_into_the_coordinators_pane(self):
+        ws = json.loads(subprocess.run(["herdr", "workspace", "create", "--cwd", str(HOME), "--label", "zed wake smoke", "--no-focus",
+                                        "--env", f"ZED_PROFILE_DIR={self.profile}"], capture_output=True, text=True).stdout)["result"]
+        ws_id, pane = ws["workspace"]["workspace_id"], ws["root_pane"]["pane_id"]
+        self.addCleanup(subprocess.run, ["herdr", "workspace", "close", ws_id], capture_output=True)
+        time.sleep(1.5)
+        subprocess.run(["herdr", "pane", "run", pane, f"{HOME}/bin/zed coordinator"], capture_output=True)
+        deadline = time.monotonic() + 240
+        while not self.record.exists():
+            self.assertLess(time.monotonic(), deadline, subprocess.run(["herdr", "pane", "read", pane], capture_output=True, text=True).stdout)
+            time.sleep(2)
+        record = json.loads(self.record.read_text())
+        self.server, session = record["server"], record["session"]
+        print("\nwake typed into the pane:")
+        deadline = time.monotonic() + 60  # the TUI is up once herdr sees an idle OpenCode agent in the pane
+        while (self.z.pane_record(pane) or {}).get("agent_status") != "idle":
+            self.assertLess(time.monotonic(), deadline, "the TUI did not open: "
+                            + subprocess.run(["herdr", "pane", "get", pane], capture_output=True, text=True).stdout)
+            time.sleep(1)
+        self.track_a_session_whose_pane_is_gone()
+        seen = {m["id"] for m in self.api("GET", f"/session/{session}/message")}
+        self.record.write_text(json.dumps(record | {"server": record["server"] | {"password": "not-the-password"}}))  # the watcher's call will be refused
+        env = self.env | {"OPENCODE_SESSION_ID": session, "ZED_COORDINATOR": str(self.record), "HERDR_PANE_ID": pane}
+        digest = subprocess.run([sys.executable, str(HOME / "bin" / "zed"), "start"], env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(digest.returncode, 0, digest.stderr)
+        self.say("bin/zed start", next(l for l in digest.stdout.splitlines() if l.startswith("watcher:")))
+        lock = json.loads((self.profile / ".cache" / "zed.lock").read_text())
+        self.assertEqual((lock["agent_session"], lock["pane"]), (session, pane))
+
+        event, told, turn = self.woken(session, seen)
+        self.say("event", f"[E{event['id']}] {event['text']}")
+        self.say("receipt", event["wake"])
+        self.assertEqual(event["wake"]["via"], "herdr")
+        self.assertIn("401", event["wake"]["api_error"])
+        self.assertIn(f"[E{event['id']}]", json.dumps(told))
+        self.say("message the TUI submitted", f"{told['id']} type {told['type']}; an assistant message followed: {turn}")
+        self.record.write_text(json.dumps(record))
 
 
 if __name__ == "__main__":

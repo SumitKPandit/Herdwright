@@ -33,7 +33,6 @@ Test a payload:  echo '<json>' | zed-pretool --explain
 import argparse
 import json
 import os
-import re
 import sys
 import tempfile
 from pathlib import Path

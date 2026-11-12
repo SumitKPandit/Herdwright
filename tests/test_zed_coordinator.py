@@ -345,6 +345,42 @@ class StartTests(CoordinatorCase):
                                                          "skill and do nothing else until it is done.")
 
 
+class WakeTests(CoordinatorCase):
+    """What the long-lived watcher does with an event (tests/test_e2e_wake.py runs it whole; tests/smoke_opencode.py on the real runtime)."""
+    RECORD = {"session": "ses_test1", "server": {"url": "http://127.0.0.1:1", "password": "x"}}
+
+    def test_the_servers_message_id_is_the_receipt(self):
+        receipt = self.z.wake_coordinator(self.RECORD, "w1:p1", ["[E1] S1 asks", "[E2] S2 is gone"])
+        (method, path, body), = self.server.calls
+        self.assertEqual((method, path), ("POST", "/session/ses_test1/prompt"))
+        self.assertEqual(body["text"].splitlines(), [self.z.WAKE_HEADING, "[E1] S1 asks", "[E2] S2 is gone"])
+        self.assertEqual((receipt["via"], receipt["message"]), ("api", "msg_1"))
+        self.assertEqual([c for c in self.herdr_calls if c[0] == "herdr"], [])  # nothing typed
+
+    def test_a_server_that_fails_leaves_the_prompt_to_herdr_and_both_failing_is_said(self):
+        self.server.up = False
+        receipt = self.z.wake_coordinator(self.RECORD, "w1:p1", ["[E1] S1 asks"])
+        self.assertEqual((receipt["via"], receipt["api_error"]), ("herdr", "ConnectionRefusedError: connection refused"))
+        self.assertEqual(self.herdr_calls[-1], ["herdr", "agent", "prompt", "w1:p1", f"{self.z.WAKE_HEADING}\n[E1] S1 asks"])
+        failed = subprocess.CompletedProcess([], 1, "", "agent_not_found")
+        with patch.object(self.z, "run", return_value=failed):
+            receipt = self.z.wake_coordinator(self.RECORD, "w1:p1", ["[E1] S1 asks"])
+        self.assertEqual((receipt["via"], receipt["error"]), (None, "ConnectionRefusedError: connection refused; herdr: agent_not_found"))
+        self.assertIn("this session is in no herdr pane", self.z.wake_coordinator(self.RECORD, None, ["[E1] S1 asks"])["error"])
+
+    def test_a_receipt_is_kept_on_its_events_and_an_event_is_shown_again_only_after_a_while(self):
+        shown = self.z.queue_add(["S1 asks", "S2 is gone"])
+        self.z.queue_receipt(shown[:1], {"via": "api", "message": "msg_9"})
+        first, second = self.z.queue_pending()
+        self.assertEqual((first["wake"], "wake" in second), ({"via": "api", "message": "msg_9"}, False))
+        self.assertEqual(self.z.queue_represent(self.z.REPRESENT_SECONDS), [])  # fresh: the long-lived watcher leaves them
+        with self.z.wake_queue() as q:
+            q["events"][1]["shown_at"] -= self.z.REPRESENT_SECONDS + 1
+        again, = self.z.queue_represent(self.z.REPRESENT_SECONDS)
+        self.assertRegex(again, r"^\[E2\] \(again, un-acked since .*\) S2 is gone$")
+        self.assertEqual(self.z.queue_represent(self.z.REPRESENT_SECONDS), [])
+
+
 class RelayTests(CoordinatorCase):
     def setUp(self):
         super().setUp()
