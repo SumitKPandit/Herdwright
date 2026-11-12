@@ -588,6 +588,39 @@ class CoreSyncCheckTests(unittest.TestCase):
             self.assertGreater(data["oldest"], 0)
 
 
+    def test_apply_skips_a_commit_whose_change_is_on_main_already_and_says_so(self):
+        """T121: a core commit main already holds by another patch (so `git cherry` cannot tell) made an empty
+        cherry-pick, and --apply stopped there; it is skipped now and the commits around it are picked."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            git = lambda *a: subprocess.run(["git", "-C", tmp, *a], check=True, capture_output=True, text=True)
+            git("init", "-q", "-b", "main")
+            git("config", "user.email", "t@t")
+            git("config", "user.name", "t")
+            (repo / "bin").mkdir()
+            script = repo / "bin" / "hw-core-sync"
+            script.write_text((HOME / "bin" / "hw-core-sync").read_text())
+            (repo / "a").write_text("1\n")
+            git("add", ".")
+            git("commit", "-qm", "init")
+            git("checkout", "-qb", "profile/me")
+            for name, text in (("before", "x\n"), ("a", "2\n"), ("after", "y\n")):
+                (repo / name).write_text(text)
+                git("add", name)
+                git("commit", "-qm", f"core {name}")
+            on_profile = git("rev-parse", "HEAD~1").stdout.strip()
+            git("checkout", "-q", "main")
+            (repo / "a").write_text("2\n")
+            (repo / "other").write_text("o\n")  # a different patch with the same change to `a`
+            git("add", ".")
+            git("commit", "-qm", "main got it its own way")
+            git("checkout", "-q", "profile/me")
+            r = subprocess.run(["python3", str(script), "--apply"], capture_output=True, text=True, cwd=tmp)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn(f"skipped {on_profile[:9]}: its change is already on main (the cherry-pick was empty)", r.stdout)
+            self.assertIn("cherry-picked 2 commit(s) onto main", r.stdout)
+            self.assertEqual(git("log", "--format=%s", "main").stdout.split("\n")[:2], ["core after", "core before"])
+
     def test_check_exits_2_off_a_profile_branch_so_callers_can_tell_it_from_waiting_commits(self):
         with tempfile.TemporaryDirectory() as tmp:
             git = lambda *a: subprocess.run(["git", "-C", tmp, *a], check=True, capture_output=True, text=True)
