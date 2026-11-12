@@ -153,7 +153,7 @@ class PrepTests(unittest.TestCase):
 GOOD_DRAFT = """# Review of PR 12
 
 ## Findings
-- [blocker] app/guard.py:42 the role check is skipped on the error path.
+- [blocker] app/guard.py:42 the role check is skipped on the error path. Ground: bug.
   Fix: call require_role before the early return.
 - [should-fix] app/views.py:10 name `d` hides intent. Suggest: rename to `deadline`.
 - [nit] app/views.py:11 stray blank line. Fix: remove it.
@@ -183,6 +183,18 @@ class DraftTests(unittest.TestCase):
     def test_verdict_must_agree_with_the_findings(self):
         self.assertIn("verdict is clean but a finding is a blocker", self.problems(GOOD_DRAFT.replace("Verdict: blockers", "Verdict: clean")))
         self.assertIn("verdict is blockers but no finding is a blocker", self.problems(GOOD_DRAFT.replace("[blocker]", "[should-fix]")))
+
+    def test_a_blocker_names_an_objective_ground(self):
+        refused = "a blocker names its ground"
+        self.assertIn(refused, "\n".join(self.problems(GOOD_DRAFT.replace(" Ground: bug.", ""))))
+        for taste in ("Ground: naming.", "Ground: readability.", "Ground: rule.", "Ground: score 6."):
+            self.assertIn(refused, "\n".join(self.problems(GOOD_DRAFT.replace("Ground: bug.", taste))), taste)
+        for ground in ("Ground: requirement.", "Ground: rule 7.", "ground: Bug;"):
+            self.assertEqual(self.problems(GOOD_DRAFT.replace("Ground: bug.", ground)), [], ground)
+
+    def test_a_finding_that_does_not_block_needs_no_ground(self):
+        draft = GOOD_DRAFT.replace("[blocker]", "[should-fix]").replace(" Ground: bug.", "").replace("Verdict: blockers", "Verdict: clean")
+        self.assertEqual(self.problems(draft), [])
 
     def test_anything_addressed_to_a_pr_is_refused(self):
         for line in ("Run: gh pr review 12 --approve", "gh pr comment 3 -b 'hi'", "curl https://api.github.com/repos/a/b/pulls/9/comments", "/approve"):

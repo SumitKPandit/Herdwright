@@ -11,10 +11,15 @@ Usage
       never the value); CI state (PR url only, via zed-pr). The checks that read the diff are heuristics: they say
       where to look, the reviewer decides. exit 0 facts printed, 2 the diff could not be read
   zed-review check-draft <file> [--json]
-      refuses a review draft that has a finding without `file:line`, a severity or a suggested change, no verdict,
-      a verdict that contradicts the findings, or anything addressed to a PR (the draft is for Zed, never posted).
+      refuses a review draft that has a finding without `file:line`, a severity or a suggested change, a blocker
+      without its ground, no verdict, a verdict that contradicts the findings, or anything addressed to a PR (the
+      draft is for Zed, never posted). Only an objective failure is a blocker, so each one names its ground:
+      `requirement` (a requirement without a passing test, or a failing required check), `bug` (a logic bug shown with
+      a failing input) or `rule <n>` (a code rule that fails its check). Whether the ground is true is the reviewer's
+      judgement; that it is named is checked.
       Draft shape:
-        - [blocker|should-fix|nit] path/file.py:42 what is wrong. Fix: the change that would fix it
+        - [blocker] path/file.py:42 what is wrong. Ground: requirement | bug | rule <n>. Fix: the change that would fix it
+        - [should-fix|nit] path/file.py:10 what would improve. Fix: the change
         Verdict: clean | blockers
       exit 0 ok, 1 problems listed, 2 no such file
 """
@@ -244,6 +249,7 @@ def cmd_prep(a):
 SEVERITIES = ("blocker", "should-fix", "nit")
 FINDING = re.compile(r"^\s*(?:[-*]|\d+[.)])\s*\[(?P<sev>[^\]]*)\]\s*(?P<rest>.*)$")
 LOCATION = re.compile(r"[\w@./\\-]+\.\w+:\d+")
+GROUND = re.compile(r"\bground\s*:\s*(?:requirement|bug|rule\s+\d+)\b", re.I)  # the objective failures that may block
 SUGGESTION = re.compile(r"\b(fix|suggest(?:ion|ed)?|change to|replace with|instead)\s*:", re.I)
 VERDICT = re.compile(r"^\s*(?:\*\*)?verdict(?:\*\*)?\s*:\s*(?:\*\*)?(\S+?)(?:\*\*)?\s*$", re.I)
 OUTWARD = re.compile(r"\bgh\s+pr\b|/pulls?/\d+/(?:reviews|comments)|^\s*/(?:approve|lgtm)\b", re.I | re.M)
@@ -267,6 +273,8 @@ def check_draft(text):
             problems.append(f"{where}: severity must be one of {', '.join(SEVERITIES)} (got '{f['sev'] or 'empty'}')")
         if not LOCATION.search(f["text"]):
             problems.append(f"{where}: no file:line (like app/guard.py:42)")
+        if f["sev"] == "blocker" and not GROUND.search(f["text"]):
+            problems.append(f"{where}: a blocker names its ground (write 'Ground: requirement', 'Ground: bug' or 'Ground: rule <n>')")
         if not SUGGESTION.search(f["text"]):
             problems.append(f"{where}: no suggested change (write 'Fix: ...')")
     verdicts = [(n, m.group(1).lower()) for n, m in ((n, VERDICT.match(ln)) for n, ln in enumerate(text.splitlines(), 1)) if m]

@@ -38,6 +38,8 @@ about you lives in **`profile/`**, which exists only on your profile branch.
 | `bin/zed` | Task DB and herdr session driver (`bin/zed help`) |
 | `bin/zed-setup` | Prerequisite check + git guard hooks (`hooks/`) |
 | `bin/zed-employee`, `bin/zed-deny` | Hats for workers (build, review, qa): `zed spawn hat=`, `zed-employee finish`, each hat's deny policy |
+| `templates/hats/`, `templates/skills/` | Each hat's charter, deny policy and skills. A worker's first prompt names its hat's skills on either runtime, and `zed-employee skill show <name>` prints one |
+| `bin/zed-review` | The mechanical facts of a review and the check on its findings draft: `check-draft` refuses a review blocker that names no ground (`requirement`, `bug` or `rule <n>`) |
 | `bin/zed-core-sync` | Carries core improvements from your profile branch to `main` |
 | `profile.template/` | The skeleton onboarding copies to `profile/` |
 | `profile/` | Yours: `profile.md`, `rules.md` (your rules for workers), `lessons.md`, `knowledge/`, `config/` (incl. `claude.json`: model, effort ceiling, max running sessions; `opencode.json`: model and variant of OpenCode workers), `briefs/`, `db/`, `STATUS.md` |
