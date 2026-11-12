@@ -6,7 +6,7 @@ depend on me. A new failure gets a row here and, where possible, a check in `bin
 | Failure | Guard |
 |---|---|
 | Worker re-tools, re-reads or redoes finished work | Enforced: plan file required at spawn; watcher `STALL` after 30 min without plan progress |
-| Model or effort above what the work needs; too many parallel sessions | Enforced: `claude.json` effort ceiling and `effort_by_kind`; `max_running` counts every open Claude session and `spawn` queues the rest |
+| Model or effort above what the work needs; too many parallel sessions | Enforced for what the user set (`bin/hw configure`): the effort, also the ceiling of `effort_by_kind`; `max_running` counts every open session of the runtime and `spawn` queues the rest |
 | A worker asks while still `working` | Enforced: workers append to a status file the watcher reads in any state; the watcher scans working screens for `HW:` blocks; the answer waits for it (`hw-employee answers`) and is prompted once it is idle |
 | A wake event is lost when my turn crashes | Enforced: events queue until `bin/hw ack`; `watch` re-shows them, `start` lists them |
 | A worker idles without a `HW:` block, waits on a permission prompt, or its pane is gone | Enforced: nudge once, wake me on a repeat; `blocked` reported again after 5 min; `gone` reported |

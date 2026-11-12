@@ -3,11 +3,10 @@
 demo repo. For workers nothing is stubbed except Herdwright's own lock and capacity checks; the coordinator runs unstubbed.
 
 Not part of the default test run (its name does not match `test_*.py`), and skipped when `opencode` or herdr is
-missing. It starts model turns with neutral text only, on the shipped default model and variant (the profile template's
-config/opencode.json), or on the ones named in SMOKE_OPENCODE_MODEL and SMOKE_OPENCODE_VARIANT, which the throwaway
-profile's config/opencode.json then holds like any user's would:
+missing. It starts model turns with neutral text only, on the model and variant named in SMOKE_OPENCODE_MODEL and
+SMOKE_OPENCODE_VARIANT, which the throwaway profile's config/opencode.json then holds like any user's would. Herdwright
+ships no model, so without both it is skipped:
 
-    cd tests && python3 -m unittest -v smoke_opencode
     cd tests && SMOKE_OPENCODE_MODEL=provider/model SMOKE_OPENCODE_VARIANT=low python3 -m unittest -v smoke_opencode
 
 What is claimed about a guard is checked without asking a model for anything: the worker's server is called on its
@@ -70,8 +69,8 @@ import hwlib
 
 HOME = Path(__file__).resolve().parents[1]
 TURN_SECONDS = 420  # for the worker's first turn (its brief)
-CONFIG = json.loads((HOME / "profile.template" / "config" / "opencode.json").read_text()) | {
-    key: os.environ[name] for key, name in (("model", "SMOKE_OPENCODE_MODEL"), ("variant", "SMOKE_OPENCODE_VARIANT")) if os.environ.get(name)}
+CONFIG = {key: os.environ.get(name, "") for key, name in (("model", "SMOKE_OPENCODE_MODEL"), ("variant", "SMOKE_OPENCODE_VARIANT"))}
+NO_MODEL = "name the model and variant to run on: SMOKE_OPENCODE_MODEL=provider/model SMOKE_OPENCODE_VARIANT=<variant>"
 MODEL = json.dumps(dict(zip(("providerID", "id"), CONFIG["model"].split("/", 1))) | {"variant": CONFIG["variant"]}, sort_keys=True)
 FOOTER = f"· {CONFIG['variant']}"  # the TUI's footer ends "<model> <provider> · <variant>"
 
@@ -105,6 +104,7 @@ def herdr_up():
     return bool(shutil.which("herdr")) and subprocess.run(["herdr", "workspace", "list"], capture_output=True).returncode == 0
 
 
+@unittest.skipUnless(all(CONFIG.values()), NO_MODEL)
 @unittest.skipUnless(shutil.which("opencode"), "opencode is not installed")
 @unittest.skipUnless(herdr_up(), "herdr is not running")
 class OpenCodeWorkerSmoke(unittest.TestCase):
@@ -333,6 +333,7 @@ class OpenCodeWorkerSmoke(unittest.TestCase):
         self.assertEqual((self.worktree / "AGENTS.md").read_text(), (self.repo / "AGENTS.md").read_text())
 
 
+@unittest.skipUnless(all(CONFIG.values()), NO_MODEL)
 @unittest.skipUnless(shutil.which("opencode"), "opencode is not installed")
 class OpenCodeCoordinatorSmoke(unittest.TestCase):
     def setUp(self):

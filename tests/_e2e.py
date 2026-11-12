@@ -32,6 +32,8 @@ BASE = "main"
 RUNTIMES = {"claude": "OnClaude", "opencode": "OnOpenCode"}  # what a test class is called for each (per_runtime)
 # never inherited from the shell that runs the tests: a worker session carries all of these
 FOREIGN = ("HW_", "ZED_", "CLAUDE", "OPENCODE", "HERDR", "GIT_", "FAKE_")  # ZED_: HW_ before the rename; `start` names them
+# The model and effort (Claude Code) or variant (OpenCode) of a world's profile: Herdwright ships none, hw-setup asks.
+MODELS = {"claude": {"model": "claude-test-1", "effort": "low"}, "opencode": {"model": "acme/m-1", "variant": "minimal"}}
 FILL = re.compile(r"<FILL\b[^>\n]*>")  # what `bin/hw brief` leaves for the coordinator to write
 
 
@@ -118,6 +120,7 @@ class World:
             d.mkdir(parents=True)
         (self.profile / "profile.md").write_text("# Throwaway test profile\n")
         (self.profile / "config" / "settings.json").write_text(json.dumps({"runtime": runtime}))
+        (self.profile / "config" / f"{runtime}.json").write_text(json.dumps(MODELS[runtime]))  # what bin/hw-setup asks for
         (self.profile / "config" / "projects.json").write_text(json.dumps(
             {"worktree_root": str(self.worktrees), "repos": {REPO: {"path": str(self.repo), "role": "demo repo"}}}))
         shutil.copytree(template() / REPO, self.repo)

@@ -65,8 +65,27 @@ WATCHER_LOCK_PATH = PROFILE_DIR / ".cache" / "watch.lock"
 ARM_STAMP_PATH = PROFILE_DIR / ".cache" / "hook-arm.stamp"  # touched by the Stop hook's arm step on every firing
 
 RUNTIMES = ("claude", "opencode")  # an install runs on one of them, Herdwright and its workers alike: install_runtime()
+RUNTIME_NAMES = {"claude": "Claude Code", "opencode": "OpenCode"}
 # Claude Code workers: the model, effort ceiling and capacity live in <profile>/config/claude.json.
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+# What the user may choose per runtime: the profile's file and its two keys. Herdwright ships no value for either
+# and never fills one in: a key that is not set is not passed (model_choice()). Claude Code then runs the user's own
+# default; OpenCode's server would pick a model of its own, so there a model must be chosen once (choose_opencode_model()).
+# The user changes them by telling the assistant, who stores them with `bin/hw configure`.
+MODEL_CONFIG = {"claude": (CLAUDE_CONFIG_PATH, ("model", "effort")), "opencode": (OPENCODE_CONFIG_PATH, ("model", "variant"))}
+OPENCODE_MODEL = re.compile(r"[^/\s]+/\S+")  # provider/model
+PROFILE_TEMPLATE = HW_HOME / "profile.template"
+# Claude Code started with no model runs the user's own default. OpenCode does not: see choose_opencode_model().
+# What applies to a choice the user has not made, per runtime: `configure` shows it per key, `start` in one line.
+MODEL_UNSET = {
+    "claude": {"model": "not set: Claude Code's own default applies", "effort": "not set: Claude Code's own default applies"},
+    "opencode": {"model": "NOT SET: `bin/hw coordinator` asks for it, or --model <provider/model>",
+                 "variant": "not set: the model's default variant applies"}}
+NOTHING_SET = {"claude": "model and effort are Claude Code's own defaults",
+               "opencode": "model NOT SET: `bin/hw coordinator` asks for it, or `bin/hw configure --model <provider/model>`"}
+NO_OPENCODE_MODEL = ("no model is set for OpenCode (config/opencode.json), and a session created without one runs whatever "
+                     "OpenCode's server picks, not the user's choice. Ask the user which model to use, then "
+                     "`bin/hw configure --model <provider/model>` (`bin/hw coordinator` asks for it when none is set).")
 # Dialogs Claude Code can show before its first prompt, in the order it shows them.
 # Claude Code documents no flag or setting that answers either one in advance (code.claude.com/docs/en/memory and
 # /cli-reference, read 2026-11-11; dialogs observed on v2.1.322), so spawn answers them with key presses.
@@ -88,7 +107,6 @@ LIMIT_PATTERNS = [r"hit your \w+ limit", r"usage limit reached", r"limit reached
 # shell commands in the server, and a hat session is known by the pane that hosts its processes (hwemployee.process_pane).
 # The TUI takes no model flag, so spawn creates the session through the server's API with the model and variant from
 # <profile>/config/opencode.json and attaches the TUI to it. The TUI showed no dialog at start.
-OPENCODE_DEFAULTS_PATH = HW_HOME / "profile.template" / "config" / "opencode.json"  # the one place the defaults live
 OPENCODE_START_TIMEOUT_MS = 180000
 OPENCODE_SERVER_SECONDS = 60  # for the server to answer after `opencode serve`
 OPENCODE_CANARY_SECONDS = 180  # for the one model turn that makes the canary call
@@ -176,7 +194,6 @@ def require_profile():
 # Before it was renamed, Herdwright was called Zed and named its files after that. A profile from then still carries
 # those names; `start` and `coordinator` rename each one once (old name, new name).
 OLD_LOCK_PATH = PROFILE_DIR / ".cache" / "zed.lock"
-OLD_PROFILE_FILES = [(hwlib.OLD_DB_PATH, DB_PATH), (OLD_LOCK_PATH, LOCK_PATH)]
 OLD_DB_SIDE_FILES = ("-journal",)  # what a crashed write leaves next to the database: it moves with the database only
 OLD_LOCK_GUARD_PATH = OLD_LOCK_PATH.with_suffix(".guard")  # the empty file the old lock was serialised on: the new lock has its own
 OLD_PLUGIN_FOLDERS = {"zed-deny": "hw-deny", "zed-pretool": "hw-pretool"}  # in an OpenCode config folder under .cache
@@ -184,16 +201,35 @@ OLD_SYNC_REF, SYNC_REF = "refs/zed/core-sync/", "refs/hw/core-sync/"  # hw-core-
 OLD_VARIABLES = "ZED_"
 
 
+OLD_PROFILE_VARIABLE = OLD_VARIABLES + "PROFILE_DIR"
+
+
 def old_variables_note():
-    """The old environment variables are not read; those still set are named, with what to set instead."""
+    """The old environment variables are not read; those still set are named. Only the profile's has a new name the
+    user sets (the others are a worker session's own, set by spawn)."""
     stale = sorted(k for k in os.environ if k.startswith(OLD_VARIABLES))
-    return [f"NOT READ: {', '.join(stale)} (the old names). Set {', '.join('HW_' + k[len(OLD_VARIABLES):] for k in stale)} instead."] if stale else []
+    instead = " Set HW_PROFILE_DIR instead." if OLD_PROFILE_VARIABLE in stale else ""
+    return [f"NOT READ: {', '.join(stale)} (the old names).{instead}"] if stale else []
+
+
+def old_profile_variable_note():
+    """What to do when no profile is found while the old variable still names one: that is an upgrade with the
+    variable not renamed yet, not a new user, so nobody is onboarded into a second profile. None otherwise."""
+    old = os.environ.get(OLD_PROFILE_VARIABLE)
+    if not old or (PROFILE_DIR / "profile.md").exists():
+        return None
+    return (f"OLD VARIABLE, NO PROFILE: {OLD_PROFILE_VARIABLE}={old} is set and no longer read, and there is no profile at "
+            f"{PROFILE_DIR}. Do not onboard. Tell the user to set HW_PROFILE_DIR to that folder and start again; run the "
+            "`onboarding` skill only if they say there is no earlier profile.")
 
 
 def old_coordinator():
     """The live session of the code from before the rename that holds this profile's old lock, or None. This session
     holding it (the code was upgraded under it) is not another coordinator."""
-    h = read_json(OLD_LOCK_PATH, None)
+    try:
+        h = json.loads(OLD_LOCK_PATH.read_text())
+    except (FileNotFoundError, ValueError):  # empty or cut short by a crashed write: no holder, as for the new lock
+        return None
     if not isinstance(h, dict) or "pid" not in h or same_holder(h, me()):
         return None
     return h if holder_alive(h) else None
@@ -221,40 +257,56 @@ def migrate_old_sync_ref():
     branch checked out here is this checkout's own (git's other worktrees share the refs), and only a checkout that
     runs on its own `profile/` folder is the one being upgraded; with a profile elsewhere no ref is touched."""
     branch = hwlib.git(HW_HOME, "branch", "--show-current").stdout.strip()
-    if not branch or PROFILE_DIR != (HW_HOME / "profile").resolve():
+    if not branch:
         return []
     old, new = OLD_SYNC_REF + branch, SYNC_REF + branch
     sha = hwlib.git(HW_HOME, "rev-parse", "--verify", "--quiet", old).stdout.strip()
     if not sha:
         return []
     if hwlib.git(HW_HOME, "rev-parse", "--verify", "--quiet", new).returncode == 0:
-        return [f"OLD NAME LEFT ALONE: git refs {old} and {new} both exist; {new} is the one in use."]
+        return [f"OLD NAME LEFT ALONE: git refs {old} and {new} both exist; {new} is the one in use. "
+                f"Once the old one is not needed, drop it: `git update-ref -d {old}`."]
+    if PROFILE_DIR != (HW_HOME / "profile").resolve():
+        return [f"OLD NAME LEFT ALONE: git ref {old} ({sha[:9]}): the profile in use is outside this checkout, so no ref "
+                f"of it is renamed. If this checkout's branch belongs to that profile, record its sync point under the "
+                f"new name: `bin/hw-core-sync --mark {sha[:9]}`."]
     hwlib.git(HW_HOME, "update-ref", new, sha)
     hwlib.git(HW_HOME, "update-ref", "-d", old)
     return [f"renamed git ref {old} to {new}"]
+
+
+def migrate_old_database():
+    """Rename the old database, with the side file a crashed write left next to it. Next to a new one it is left
+    alone and both are reported with what they hold: which one is current is the user's call."""
+    old, new = hwlib.OLD_DB_PATH, DB_PATH
+    if not old.exists():
+        return []
+    if new.exists():
+        return [f"OLD NAME LEFT ALONE: {old} and {new} both exist ({tasks_in(old)}; {tasks_in(new)} and is the one in use); "
+                "keep the one that is current and delete the other."]
+    old.rename(new)
+    for suffix in OLD_DB_SIDE_FILES:
+        if old.with_name(old.name + suffix).exists():
+            old.with_name(old.name + suffix).rename(new.with_name(new.name + suffix))
+    return [f"renamed {old} to {new.name} (a profile from before the rename to Herdwright)"]
 
 
 def migrate_old_names():
     """Rename what a profile created before the rename still calls by the old name; returns one line per thing
     renamed or left alone. An old name next to its new one is left alone and reported: which one is current is the
     user's call. Not for a profile whose old lock a live session still holds (`old_coordinator`): ask that first."""
-    pairs = list(OLD_PROFILE_FILES)
+    pairs = [(OLD_LOCK_PATH, LOCK_PATH)]
     for old_name, new_name in OLD_PLUGIN_FOLDERS.items():
         pairs += [(folder, folder.with_name(new_name)) for folder in sorted((PROFILE_DIR / ".cache").glob(f"**/plugins/{old_name}"))]
-    notes = []
+    notes = migrate_old_database()
     for old, new in pairs:
         if not old.exists():
             continue
         if new.exists():
-            holds = f" ({tasks_in(old)}; {tasks_in(new)} and is the one in use)" if old == hwlib.OLD_DB_PATH else ""
-            notes.append(f"OLD NAME LEFT ALONE: {old} and {new} both exist{holds}; keep the one that is current and delete the other.")
+            notes.append(f"OLD NAME LEFT ALONE: {old} and {new} both exist; keep the one that is current and delete the other.")
             continue
         old.rename(new)
         notes.append(f"renamed {old} to {new.name} (a profile from before the rename to Herdwright)")
-        if old == hwlib.OLD_DB_PATH:
-            for suffix in OLD_DB_SIDE_FILES:
-                if old.with_name(old.name + suffix).exists():
-                    old.with_name(old.name + suffix).rename(new.with_name(new.name + suffix))
     if OLD_LOCK_GUARD_PATH.exists():
         OLD_LOCK_GUARD_PATH.unlink()
         notes.append(f"removed {OLD_LOCK_GUARD_PATH} (the old lock's empty guard file)")
@@ -416,6 +468,8 @@ def cmd_lock(args):
     """lock status | lock acquire [--take-over] | lock release"""
     sub = args[0] if args else "status"
     require_profile()
+    if sub == "acquire" and (holder := old_coordinator()):  # a second lock next to the one a live old session holds
+        die(old_coordinator_note(holder))
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(LOCK_PATH.with_suffix(".guard"), "w") as guard:
         fcntl.flock(guard, fcntl.LOCK_EX)  # serialise read-modify-write of the lock file
@@ -458,9 +512,10 @@ def herdr_json(args):
 
 # ---------------------------------------------------------------- Claude settings
 
-def claude_config():
-    """The profile's config/claude.json: {"model", "effort" (the ceiling), "effort_by_kind", "max_running"}; a profile without one uses the CLI's defaults."""
-    return read_json(CLAUDE_CONFIG_PATH, {})
+def runtime_config(runtime):
+    """The profile's config file for `runtime`: config/claude.json {"model", "effort" (also the ceiling of
+    effort_by_kind), "effort_by_kind", "max_running"} or config/opencode.json {"model", "variant", "max_running"}."""
+    return read_json(MODEL_CONFIG[runtime][0], {})
 
 
 def read_json(path, default):
@@ -482,41 +537,58 @@ def install_runtime():
     return configured or ("opencode" if shutil.which("opencode") and not shutil.which("claude") else "claude")
 
 
-def opencode_config():
-    """The profile's config/opencode.json: {"model" ("provider/model"), "variant"}; a missing file or key takes the
-    value in the profile template's opencode.json."""
-    return read_json(OPENCODE_DEFAULTS_PATH, {}) | read_json(OPENCODE_CONFIG_PATH, {})
+def model_problem(runtime, key, value):
+    """Why `value` cannot be a runtime's model, effort or variant, or None."""
+    if not isinstance(value, str) or not value.strip() or value != value.strip():
+        return f"the {key} is a word, not {value!r}"
+    if runtime == "claude" and key == "effort" and value not in EFFORTS:
+        return f"'{value}' is not an effort of Claude Code: {', '.join(EFFORTS)}"
+    if runtime == "opencode" and key == "model" and not OPENCODE_MODEL.fullmatch(value):
+        return f"an OpenCode model is written provider/model, not '{value}'"
+    return None
+
+
+def model_choice(runtime):
+    """{key: value} of the model and the effort (Claude Code) or variant (OpenCode) the user chose for `runtime`,
+    holding only what is set. Nothing set, nothing passed."""
+    path, keys = MODEL_CONFIG[runtime]
+    chosen = {key: value for key in keys if (value := runtime_config(runtime).get(key))}
+    for key, value in chosen.items():
+        if problem := model_problem(runtime, key, value):
+            die(f"{path}: {problem}. Set it with `bin/hw configure --{key} <{key}>`, or `--clear {key}`.")
+    return chosen
 
 
 def pick_model(kind):
-    """(model, effort, reason) for a new session: claude.json's model, and its effort for this kind of work
-    (effort_by_kind), never above claude.json's effort ceiling. None = let Claude Code use its default."""
-    cfg = claude_config()
-    effort = (cfg.get("effort_by_kind") or {}).get(kind or "") or cfg.get("effort")
-    cap = cfg.get("effort")
-    if effort and cap in EFFORTS and EFFORTS.index(effort) > EFFORTS.index(cap):
+    """(model, effort) for a new Claude Code session, None for what is not set: claude.json's model, and its effort
+    for this kind of work (effort_by_kind), never above claude.json's effort, which is the ceiling when it is set."""
+    cfg = runtime_config("claude")
+    chosen = model_choice("claude")
+    cap = chosen.get("effort")
+    effort = (cfg.get("effort_by_kind") or {}).get(kind or "") or cap
+    if effort in EFFORTS and cap and EFFORTS.index(effort) > EFFORTS.index(cap):
         effort = cap
-    return cfg.get("model"), effort, "claude.json" if cfg else "Claude Code default (no claude.json)"
+    return chosen.get("model"), effort
 
 
-def running_count(conn):
-    """How many Claude sessions are open right now: every live Claude agent in herdr, i.e. Herdwright itself, its workers
-    and the user's own, because they all draw on the same plan. Falls back to the DB's own sessions when herdr
-    can't be listed."""
+def running_count(conn, runtime):
+    """How many sessions of the install's runtime are open right now: every live agent of that kind in herdr, i.e.
+    Herdwright itself, its workers and the user's own, because they all draw on the same plan. Falls back to the DB's
+    own sessions when herdr can't be listed."""
     live = live_agents()
     if live:
-        return sum(1 for a in live.values() if a.get("agent") == "claude")
+        return sum(1 for a in live.values() if a.get("agent") == runtime)
     return conn.execute("SELECT COUNT(*) FROM sessions WHERE external=0 AND status IN ('running','waiting_user')").fetchone()[0]
 
 
-def require_capacity(conn, tid):
-    """At most claude.json max_running sessions, counting all of them (see running_count): a plan's limits are
-    shared. Beyond it the task stays queued (exit 75)."""
-    cap = claude_config().get("max_running")
-    n = running_count(conn)
+def require_capacity(conn, tid, runtime):
+    """At most max_running sessions (the runtime's config file), counting all of them (see running_count): a plan's
+    limits are shared. Beyond it the task stays queued (exit 75). Not set: no limit."""
+    cap = runtime_config(runtime).get("max_running")
+    n = running_count(conn, runtime)
     if cap is not None and n >= cap:
-        print(f"hw: queued: {n} Claude sessions are open (Herdwright, workers and your own; max_running {cap} in claude.json). "
-              f"T{tid} stays queued; spawn it again when one finishes (`bin/hw session list`).", file=sys.stderr)
+        print(f"hw: queued: {n} {RUNTIME_NAMES[runtime]} sessions are open (Herdwright, workers and your own; max_running {cap} in "
+              f"{MODEL_CONFIG[runtime][0].name}). T{tid} stays queued; spawn it again when one finishes (`bin/hw session list`).", file=sys.stderr)
         sys.exit(75)
 
 
@@ -1029,9 +1101,10 @@ def opencode_canary(server, session, program=hwdeny.CANARY_COMMAND, plugin="deny
 
 
 def opencode_session(server, directory, title, model, variant):
-    """Wait for an OpenCode server that was just started, then create a session in `directory` with `model`
-    ("provider/model") and `variant`. Returns (the session id or None, "" or why it is not the configured session).
-    Raises OSError when the server does not answer in OPENCODE_SERVER_SECONDS."""
+    """Wait for an OpenCode server that was just started, then create a session in `directory`: with `model`
+    ("provider/model") and `variant` when they are set, else with none, which leaves the choice to OpenCode. Returns
+    (the session id or None, "" or why it is not the configured session). Raises OSError when the server does not
+    answer in OPENCODE_SERVER_SECONDS."""
     deadline = time.monotonic() + OPENCODE_SERVER_SECONDS
     while True:
         try:
@@ -1041,11 +1114,14 @@ def opencode_session(server, directory, title, model, variant):
             if time.monotonic() > deadline:
                 raise
             time.sleep(1)
-    provider, _, name = model.partition("/")
-    wanted = {"providerID": provider, "id": name, "variant": variant}
-    created = opencode_api(server, "POST", "/session", {"location": {"directory": str(directory)}, "title": title, "model": wanted})
-    if created.get("model") != wanted:
-        return created["id"], f"the session runs {created.get('model')}, not the configured {wanted}"
+    body = {"location": {"directory": str(directory)}, "title": title}
+    if model:
+        provider, _, name = model.partition("/")
+        body["model"] = {"providerID": provider, "id": name} | ({"variant": variant} if variant else {})
+    created = opencode_api(server, "POST", "/session", body)
+    runs = created.get("model") or {}
+    if model and {key: runs.get(key) for key in body["model"]} != body["model"]:  # without a variant OpenCode names its own
+        return created["id"], f"the session runs {created.get('model')}, not the configured {body['model']}"
     return created["id"], ""
 
 
@@ -1197,8 +1273,10 @@ def cmd_spawn(args):
     """spawn <task-id> repo=<repo> base=<branch> branch=<branch> brief=<path> [name=<agent>]
     [model=] [effort=] [kind=<worktype|investigation|design…>] [from=<start point>]
     [hat=build|review|qa]   the hat the session wears (default build)
-    [runtime=claude|opencode]   claude (default); opencode takes its model and variant from config/opencode.json
-                                (model= overrides the model; no effort=, no claude.json policy)"""
+    [runtime=claude|opencode]   the install's runtime by default. Model and effort come from config/claude.json, on
+                                OpenCode model and variant from config/opencode.json (model= overrides the model; no
+                                effort=). What is set in neither place is not passed: Claude Code then runs its own default; OpenCode
+                                needs a model."""
     if not args or args[0] in ("-h", "--help"):
         print(cmd_spawn.__doc__)
         sys.exit(0 if args else 1)
@@ -1237,22 +1315,25 @@ def cmd_spawn(args):
         die(f"refused: {e}")
     sid = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM sessions").fetchone()[0]  # the session's env names it
     kind = kv.get("kind") or t["worktype"]
-    if hat_kind in (claude_config().get("effort_by_kind") or {}) and "kind" not in kv:
+    if hat_kind in (runtime_config("claude").get("effort_by_kind") or {}) and "kind" not in kv:
         kind = hat_kind  # the hat's own kind, when claude.json has an effort for it
+    require_capacity(conn, tid, runtime)
     if runtime == "claude":
-        require_capacity(conn, tid)
-        model, effort, model_why = pick_model(kind)
+        model, effort = pick_model(kind)
     else:  # claude.json names Claude models and efforts: an OpenCode worker's model and variant are in opencode.json
-        opencode = opencode_config()
-        model, effort, model_why = opencode["model"], opencode["variant"], "opencode.json"  # `effort` carries the variant
+        opencode = model_choice("opencode")
+        model, effort = opencode.get("model"), opencode.get("variant")  # `effort` carries the variant
+    config_name = MODEL_CONFIG[runtime][0].name
+    model_why = config_name if model or effort else f"nothing set in {config_name}: Claude Code's own default"
     if "model" in kv:
         model, model_why = kv["model"], "given to spawn"
-    if runtime == "opencode" and not re.fullmatch(r"[^/\s]+/\S+", model):
-        die(f"an OpenCode model is written provider/model, not '{model}'")
     if "effort" in kv:
         effort, model_why = kv["effort"], model_why + "; effort given to spawn"
-    if runtime == "claude" and effort and effort not in EFFORTS:  # an OpenCode variant is the model's own word
-        die(f"invalid effort '{effort}': {EFFORTS}")
+    for key, value in (("model", model), ("effort", effort)):  # an OpenCode variant is the model's own word
+        if value is not None and (problem := model_problem(runtime, key, value)):
+            die(problem)
+    if runtime == "opencode" and not model:
+        die(NO_OPENCODE_MODEL)
 
     agent = kv.get("name") or f"{hat}-t{tid}"
     if "name" not in kv and conn.execute("SELECT 1 FROM sessions WHERE agent=? AND status!='closed'", (agent,)).fetchone():
@@ -2681,16 +2762,18 @@ def coordinator_kit():
     has_profile = (PROFILE_DIR / "profile.md").exists()
     home = coordinator_record_path().parent if has_profile else Path(tempfile.mkdtemp(prefix="hw-coordinator-"))
     config_dir = hwdeny.coordinator_plugin(home / "coordinator-opencode", HW_HOME, {"HW_PROFILE_DIR": str(PROFILE_DIR)})
-    opencode = opencode_config()
+    opencode = model_choice("opencode")
+    model, variant = opencode.get("model"), opencode.get("variant")
+    if not model:
+        die(NO_OPENCODE_MODEL)
+    # the root model keeps no variant: the agent's model carries it
+    chosen = {"model": model} | ({"agents": {"build": {"model": f"{model}#{variant}"}}} if variant else {})
     (config_dir / "opencode.json").write_text(json.dumps({
-        "$schema": "https://opencode.ai/config.json",
-        "model": opencode["model"],
-        "agents": {"build": {"model": f"{opencode['model']}#{opencode['variant']}"}},  # the root model keeps no variant
+        "$schema": "https://opencode.ai/config.json", **chosen,
         "permissions": coordinator_permissions(),
         "instructions": [str(p) for p in start_reading()]}, indent=2) + "\n")
-    return {"config_dir": config_dir, "record": home / "coordinator.json", "model": opencode["model"],
-            "variant": opencode["variant"], "server": private_server(config_dir / "server.log"),
-            "temporary": None if has_profile else home}
+    return {"config_dir": config_dir, "record": home / "coordinator.json", "model": model, "variant": variant,
+            "server": private_server(config_dir / "server.log"), "temporary": None if has_profile else home}
 
 
 def open_coordinator(kit):
@@ -2742,6 +2825,9 @@ def cmd_coordinator(args):
             f"\"runtime\": \"opencode\" in {PROFILE_DIR / 'config' / 'settings.json'}.)")
     if not shutil.which("opencode"):
         die("`opencode` is not installed or not on PATH")
+    if note := old_profile_variable_note():
+        die(note)
+    choose_opencode_model()  # before anything is renamed or started
     if holder := old_coordinator():
         die(old_coordinator_note(holder))
     for note in migrate_old_names():  # before the config folder is written: a stale plugin there would refuse every call
@@ -2753,7 +2839,7 @@ def cmd_coordinator(args):
     kit = coordinator_kit()
     for sig in (signal.SIGHUP, signal.SIGTERM):  # a closed terminal must not leave the server behind
         signal.signal(sig, lambda number, frame: sys.exit(128 + number))
-    print(f"starting the coordinator on {kit['model']} ({kit['variant']}) and proving its guard: one model turn …", flush=True)
+    print(f"starting the coordinator on {kit['model']} ({kit['variant'] or 'its default variant'}) and proving its guard: one model turn …", flush=True)
     process, session, problem = open_coordinator(kit)
     try:
         if problem:
@@ -2773,23 +2859,148 @@ def cmd_coordinator(args):
     sys.exit(code)
 
 
+def ask_user(question):
+    """One line the user types in a terminal ("" for a bare Enter); None without a terminal. The question goes to
+    stderr: stdout is the command's report."""
+    if not sys.stdin.isatty():
+        return None
+    print(f"{question} ", end="", file=sys.stderr, flush=True)
+    return sys.stdin.readline().strip()
+
+
+def store_config(path, values):
+    """Set `values` in one of the profile's config files and keep its other keys; a value of None removes its key.
+    Before onboarding has made the profile the file starts as the template's: onboarding copies only the template
+    files that are not there yet."""
+    seed = {} if (PROFILE_DIR / "profile.md").exists() else read_json(PROFILE_TEMPLATE / "config" / path.name, {})
+    merged = seed | read_json(path, {}) | values
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({key: value for key, value in merged.items() if value is not None}, indent=2) + "\n")
+
+
+def opencode_last_model():
+    """(model, variant) the user last ran in OpenCode's own TUI, from its state file, or (None, None). Only ever
+    offered as an answer: OpenCode documents no such file, and its server does not use it."""
+    state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "opencode" / "model.json"
+    try:
+        data = json.loads(state.read_text())
+        last = data["recent"][0]
+        model = f"{last['providerID']}/{last['modelID']}"
+        variant = (data.get("variant") or {}).get(model)
+    except (OSError, ValueError, LookupError, TypeError):
+        return None, None
+    return (model, variant if isinstance(variant, str) else None) if OPENCODE_MODEL.fullmatch(model) else (None, None)
+
+
+def choose_opencode_model():
+    """On OpenCode a model must be chosen once: a session created through a server with no model runs whatever the
+    server picks, which is not the model the user's TUI shows (observed on v2.2.7). So `coordinator`, which the user
+    runs in a terminal, asks when none is stored, offers the TUI's last model and variant as the answer Enter accepts,
+    and stores the answer. After that it is changed like everything else: `bin/hw configure`."""
+    if model_choice("opencode").get("model"):
+        return
+    last_model, last_variant = opencode_last_model()
+    answer = ask_user("Which model should Herdwright and its workers run on (provider/model, as `opencode models` lists them)?"
+                      + (f" [{last_model}]" if last_model else ""))
+    model = answer or (last_model if answer is not None else None)
+    if not model and answer == "":
+        die(f"a model is needed: OpenCode's server has no default that is yours. `opencode models` lists them; "
+            "run `bin/hw coordinator` again and type one (provider/model).")
+    if not model:
+        die(f"no model is set for OpenCode in {OPENCODE_CONFIG_PATH}, and OpenCode's server has no default that is yours. "
+            "Run `bin/hw coordinator` in a terminal and answer its question, or `bin/hw configure --model <provider/model>`.")
+    if problem := model_problem("opencode", "model", model):
+        die(problem)
+    offered = last_variant if model == last_model else None
+    variant = ask_user("Which variant of it (the model's own name for how hard it thinks; nothing: its default)?"
+                       + (f" [{offered}]" if offered else "")) or offered
+    store_config(OPENCODE_CONFIG_PATH, {"model": model} | ({"variant": variant} if variant else {}))
+    print(f"stored: model {model}, variant {variant or 'the model default'} in {OPENCODE_CONFIG_PATH}. "
+          "To change it later, tell Herdwright which model you want.")
+
+
 def cmd_runtime(args):
-    """runtime [--set-installed] — print the runtime this install uses. --set-installed (bin/hw-setup) writes it to
-    the profile's config/settings.json when it is not set there and exactly one of Claude Code and OpenCode is
-    installed; with both installed the choice is the user's."""
+    """runtime [--choose [claude|opencode]] — print the runtime this install uses (`runtime` in the profile's
+    config/settings.json). --choose (bin/hw-setup) settles and stores it: the one named, else the one already stored,
+    else the only one installed. With both or neither installed the choice is the user's: asked in a terminal, and
+    without an answer nothing is stored and the command exits 1."""
+    if args[:1] != ["--choose"]:
+        print(install_runtime())
+        return
     path = PROFILE_DIR / "config" / "settings.json"
-    if "--set-installed" in args and (PROFILE_DIR / "profile.md").exists() and not hwlib.settings().get("runtime"):
-        installed = [r for r, program in (("claude", "claude"), ("opencode", "opencode")) if shutil.which(program)]
+    stored = hwlib.settings().get("runtime")
+    runtime, why = (args[1], "as given") if args[1:] else (stored, "as stored") if stored else (None, None)
+    if not runtime:
+        installed = [r for r in RUNTIMES if shutil.which(r)]
+        found = ("Claude Code and OpenCode are both installed" if installed else "Neither Claude Code nor OpenCode is installed") + ", and an install uses one"
         if len(installed) == 1:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(hwlib.settings() | {"runtime": installed[0]}, indent=2) + "\n")
-            print(f"runtime set to {installed[0]} in {path} (the only one installed)")
-            return
-        if installed:
-            print(f"Claude Code and OpenCode are both installed and an install uses one: set \"runtime\" in {path} "
-                  f"(now: {install_runtime()})")
-            return
-    print(install_runtime())
+            runtime, why = installed[0], "the only one installed"
+        elif not (runtime := ask_user(f"{found}. Which one (claude or opencode)?")):
+            print(f"MISSING  the runtime: {found}. Choose it: bin/hw-setup --runtime claude|opencode")
+            sys.exit(1)
+        else:
+            why = "your answer"
+    if runtime not in RUNTIMES:
+        die(f"'{runtime}' is not a runtime: {' or '.join(RUNTIMES)}")
+    derived = why == "the only one installed" and not (PROFILE_DIR / "profile.md").exists()  # nothing to keep before a profile
+    if runtime != stored and not derived:
+        store_config(path, {"runtime": runtime})
+    print(f"runtime  {runtime} ({why}" + ("" if derived else f"; \"runtime\" in {path}") + ")")
+
+
+CONFIGURE_KEYS = ("model", "effort", "variant", "max-sessions")
+
+
+def configure_report(runtime):
+    """What sessions of this install run on, one line per choice, with where it is stored or what applies without one."""
+    path, keys = MODEL_CONFIG[runtime]
+    chosen, cap = model_choice(runtime), runtime_config(runtime).get("max_running")
+    lines = [f"runtime       {runtime} ({RUNTIME_NAMES[runtime]})"]
+    lines += [f"{key:<13} {chosen.get(key) or MODEL_UNSET[runtime][key]}" for key in keys]
+    lines.append("max sessions  " + (f"{cap} open {RUNTIME_NAMES[runtime]} sessions at once, Herdwright's and yours included" if cap is not None else "not set: no limit"))
+    return lines + [f"stored in     {path}"]
+
+
+def cmd_configure(args):
+    """configure [--model <model>] [--effort <effort> | --variant <variant>] [--max-sessions <n>] [--clear <key>]…
+    — show, set or clear what the user chose for the sessions Herdwright starts: the model, its effort (Claude Code)
+    or variant (OpenCode), and how many sessions may be open at once. Herdwright ships no model, effort or variant:
+    what is not set is not passed, so Claude Code's own default applies; OpenCode needs a model, which `coordinator`
+    asks for once, before a variant can be set. Stored in the profile's config for the
+    install's runtime; every spawn after it uses it. --clear <key> (model, effort, variant, max-sessions) removes a
+    choice. Prints what now holds."""
+    runtime = install_runtime()
+    path, keys = MODEL_CONFIG[runtime]
+    values = {}
+    while args:
+        flag = args.pop(0)
+        value = args.pop(0) if args else None
+        key = flag[2:] if flag.startswith("--") else None
+        if value is None or key not in (*CONFIGURE_KEYS, "clear") or (key == "clear" and value not in CONFIGURE_KEYS):
+            die(cmd_configure.__doc__.split(" — ")[0].replace("configure", "usage: hw configure", 1))
+        cleared, key = key == "clear", value if key == "clear" else key
+        if key != "max-sessions" and key not in keys:
+            die(f"{RUNTIME_NAMES[runtime]} has no {key}: its choices are --{', --'.join(keys)} and --max-sessions")
+        if cleared:
+            values[key] = None
+        elif key == "max-sessions":
+            if not value.isdigit() or int(value) < 1:
+                die(f"--max-sessions takes a number of sessions, 1 or more, not '{value}' (no limit: --clear max-sessions)")
+            values[key] = int(value)
+        elif problem := model_problem(runtime, key, value):
+            die(problem)
+        else:
+            values[key] = value
+    if values:
+        require_profile()
+        if "max-sessions" in values:
+            values["max_running"] = values.pop("max-sessions")
+        if runtime == "opencode" and "model" in values and values["model"] is None:
+            die("OpenCode needs a model: set another one with --model <provider/model> instead of clearing it")
+        if runtime == "opencode" and values.keys() & {"model", "variant"} and not (runtime_config(runtime) | values).get("model"):
+            die(NO_OPENCODE_MODEL)
+        store_config(path, values)
+    print("\n".join(configure_report(runtime)))
 
 
 def cmd_name(args):
@@ -2799,14 +3010,11 @@ def cmd_name(args):
     name = " ".join(" ".join(args[1:]).split()) if args[:1] == ["--set"] else None  # one line: `start` prints it in one
     if args[:1] == ["--set"] and not name:
         die("usage: hw name --set <name>")
-    if args == ["--ask"] and (PROFILE_DIR / "profile.md").exists() and not hwlib.settings().get("assistant_name") and sys.stdin.isatty():
-        print(f"What should your assistant be called? [{hwlib.DEFAULT_ASSISTANT_NAME}] ", end="", file=sys.stderr, flush=True)
-        name = sys.stdin.readline().strip()
+    if args == ["--ask"] and (PROFILE_DIR / "profile.md").exists() and not hwlib.settings().get("assistant_name"):
+        name = ask_user(f"What should your assistant be called? [{hwlib.DEFAULT_ASSISTANT_NAME}]")
     if name:
         require_profile()
-        path = PROFILE_DIR / "config" / "settings.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(hwlib.settings() | {"assistant_name": name}, indent=2) + "\n")
+        store_config(PROFILE_DIR / "config" / "settings.json", {"assistant_name": name})
     print(hwlib.assistant_name())
 
 
@@ -2825,7 +3033,7 @@ def cmd_start(args):
         die(f"this session is {record['session']} to OpenCode but {me()['agent_session']} to herdr: the guard would not "
             "recognise the lock holder, so Herdwright does not act from it.")
     if not (PROFILE_DIR / "profile.md").exists():
-        print("\n".join(old_variables_note() + [  # a profile the old variable points at is not a new user's
+        print(old_profile_variable_note() or "\n".join(old_variables_note() + [
             f"NEW USER: there is no profile at {PROFILE_DIR}. Run the `onboarding` skill and do nothing else until it is done."
             + (" Then tell the user to quit and run `bin/hw coordinator` again." if record else "")]))
         return
@@ -2848,6 +3056,9 @@ def cmd_start(args):
            f"Herdwright home {HW_HOME} · profile {PROFILE_DIR}",
            f"runtime: {runtime}" + (f" · session {record['session']} · guard proven live at {record['started_at']}" if record else ""),
            f"lock: {'held by this session' if holds_lock() else describe(lock) if lock else 'none'}"]
+    chosen, cap = model_choice(runtime), runtime_config(runtime).get("max_running")
+    out.append("workers: " + (", ".join(f"{key} {value}" for key, value in chosen.items()) or NOTHING_SET[runtime])
+               + (f" · at most {cap} sessions open" if cap is not None else " · no session limit") + " (change: bin/hw configure)")
     watcher = watcher_alive()
     running = conn.execute("SELECT COUNT(*) FROM sessions WHERE status IN ('running','waiting_user')").fetchone()[0]
     if record and holds_lock():  # OpenCode has no Stop hook to re-arm a watcher after each turn: one long-lived watcher
@@ -2884,12 +3095,13 @@ def cmd_help(args):
                                      scaffold the brief from the task, projects.json, repo notes and plan
                                      block; leaves <FILL: …> for the model, which spawn refuses
   spawn <T> repo= base= branch= brief=<file> [name=<agent>] [from=<start-ref, default origin/<base>>]
-        [model=] [effort=] [kind=]   model/effort default to claude.json; kind (default: the task's worktype)
-                                     picks the effort by claude.json effort_by_kind; beyond max_running the task is queued (exit 75)
+        [model=] [effort=] [kind=]   model/effort come from the runtime's config file (`configure`), else
+                                     Claude Code's own default applies; kind (default: the task's worktype) picks the
+                                     effort by claude.json effort_by_kind; beyond max_running the task is queued (exit 75)
         [hat=build|review|qa]        the hat the session wears (default build);
                                      refused for a second writer on a worktree or a review/qa before the build's plan is done
         [runtime=claude|opencode]    the install's runtime by default (`runtime`); opencode takes model and variant
-                                     from config/opencode.json (model= overrides), no effort=, no max_running
+                                     from config/opencode.json (model= overrides), no effort=
   session list | session set <S|agent> key=value... (status pr_url claude_session_id pane_id workspace_id base brief)
   close <S|agent> [keep-worktree] [keep-scratch] [force]
                                      (external sessions are only untracked; the landed-work test below
@@ -2924,7 +3136,13 @@ def cmd_help(args):
                                      in a session opened by `coordinator`)
   coordinator                        OpenCode only: open Herdwright's own session with its config, guard plugin and a canary
                                      that proves the guard (Claude Code: start `claude` in Herdwright's home)
-  runtime [--set-installed]          the runtime this install uses (`runtime` in config/settings.json)
+  runtime [--choose [claude|opencode]]
+                                     the runtime this install uses (`runtime` in config/settings.json); --choose
+                                     (hw-setup) stores it, asking in a terminal when both or neither are installed
+  configure [--model M] [--effort E | --variant V] [--max-sessions N] [--clear <key>]…
+                                     show, set or clear the model, its effort (Claude Code) or variant (OpenCode) and
+                                     the number of sessions open at once. Nothing is shipped: what is not set is
+                                     not passed (Claude Code's own default applies; OpenCode needs a model)
   name [--set <name> | --ask]        what the assistant is called (`assistant_name` in config/settings.json;
                                      "Herdwright" when it is not set); --ask (hw-setup) asks for it in a terminal
   paths                              (Herdwright home, profile dir, DB/STATUS/config/briefs locations)
@@ -2937,7 +3155,7 @@ Session states: """ + ", ".join(SESSION_STATES))
 
 COMMANDS = {"task": cmd_task, "log": cmd_log, "q": cmd_q, "spawn": cmd_spawn, "session": cmd_session,
             "prompt": cmd_prompt, "relay": cmd_relay, "relay-post": cmd_relay_post, "gate": cmd_gate, "merge": cmd_merge, "close": cmd_close, "adopt": cmd_adopt, "watch": cmd_watch, "status": cmd_status,
-            "brief": cmd_brief, "landed": cmd_landed, "doctor": cmd_doctor, "ack": cmd_ack, "hook": cmd_hook, "paths": cmd_paths, "start": cmd_start, "coordinator": cmd_coordinator, "runtime": cmd_runtime, "name": cmd_name, "lock": cmd_lock, "help": cmd_help}
+            "brief": cmd_brief, "landed": cmd_landed, "doctor": cmd_doctor, "ack": cmd_ack, "hook": cmd_hook, "paths": cmd_paths, "start": cmd_start, "coordinator": cmd_coordinator, "runtime": cmd_runtime, "configure": cmd_configure, "name": cmd_name, "lock": cmd_lock, "help": cmd_help}
 
 def main(argv):
     if not argv or argv[0] not in COMMANDS:

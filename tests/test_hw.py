@@ -659,20 +659,34 @@ class HwTests(unittest.TestCase):
         self.assertEqual(len(self.z.queue_pending()), 1)
 
     def test_model_and_effort_come_from_claude_json_capped_by_its_ceiling(self):
-        self.assertEqual(self.z.pick_model("story"), (None, None, "Claude Code default (no claude.json)"))
+        self.assertEqual(self.z.pick_model("story"), (None, None))  # nothing set, nothing passed: Claude Code's own default
         self.config({"model": "claude-opus-5-5", "effort": "high", "effort_by_kind": {"bug": "medium", "design": "max"}})
-        self.assertEqual(self.z.pick_model("bug")[:2], ("claude-opus-5-5", "medium"))
-        self.assertEqual(self.z.pick_model("design")[:2], ("claude-opus-5-5", "high"))  # never above the ceiling
-        self.assertEqual(self.z.pick_model("unlisted")[:2], ("claude-opus-5-5", "high"))
+        self.assertEqual(self.z.pick_model("bug"), ("claude-opus-5-5", "medium"))
+        self.assertEqual(self.z.pick_model("design"), ("claude-opus-5-5", "high"))  # never above the ceiling
+        self.assertEqual(self.z.pick_model("unlisted"), ("claude-opus-5-5", "high"))
+        self.config({"effort_by_kind": {"design": "max"}})  # no ceiling set: the kind's effort as written, no model
+        self.assertEqual((self.z.pick_model("design"), self.z.pick_model("bug")), ((None, "max"), (None, None)))
+        self.config({"effort": "extreme"})
+        with self.assertRaises(SystemExit):
+            self.z.pick_model("bug")
+        self.assertIn("'extreme' is not an effort of Claude Code: low, medium, high, xhigh, max. Set it with `bin/hw configure --effort <effort>`",
+                      self.output.getvalue())
 
-    def test_max_running_counts_open_claude_sessions_and_queues_the_rest(self):
-        self.config({"max_running": 2})
-        agents = {"w:1": {"agent": "claude"}, "w:2": {"agent": "claude"}, "w:3": {"agent": "other"}}
+    def test_max_running_counts_open_sessions_of_the_runtime_and_queues_the_rest(self):
+        self.config({})
+        (self.root / "config" / "settings.json").write_text(json.dumps({"runtime": "claude"}))
+        self.z.cmd_configure(["--max-sessions", "2"])  # as the assistant stores what the user asked for
+        self.z.OPENCODE_CONFIG_PATH.write_text(json.dumps({"max_running": 1}))
+        agents = {"w:1": {"agent": "claude"}, "w:2": {"agent": "claude"}, "w:3": {"agent": "opencode"}}
         with patch.object(self.z, "live_agents", return_value=agents):
-            self.assertEqual(self.z.running_count(None), 2)
-            with self.assertRaises(SystemExit) as e:
-                self.z.require_capacity(None, 7)
-        self.assertEqual(e.exception.code, 75)
+            self.assertEqual((self.z.running_count(None, "claude"), self.z.running_count(None, "opencode")), (2, 1))
+            for runtime, said in (("claude", "2 Claude Code sessions are open"), ("opencode", "1 OpenCode sessions are open")):
+                with self.assertRaises(SystemExit) as e:
+                    self.z.require_capacity(None, 7, runtime)
+                self.assertEqual(e.exception.code, 75)
+                self.assertIn(f"hw: queued: {said}", self.output.getvalue())
+            self.config({})  # no limit set: nothing is queued
+            self.z.require_capacity(None, 7, "claude")
 
     def test_context_budget_check(self):
         self.z.HW_HOME = self.root / "home"
