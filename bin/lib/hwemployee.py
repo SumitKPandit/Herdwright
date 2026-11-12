@@ -291,7 +291,7 @@ def finish(session, *, verdict=None, draft=None, today=None):
     """End a hat session, no model. Refuses (FinishRefused) before changing anything unless: a review/qa has a
     verdict (and a findings draft when it is `blockers`), a build has no verdict, the session's own plan has every
     step ticked but the merge/push/raise-PR ones and the final "finish / report" step (which `finish` then ticks
-    itself), a review/qa left the code as it found it (one that changed it is an author and gives no verdict), and
+    itself), a review/qa wrote the own plan file it was given, a review/qa left the code as it found it (one that changed it is an author and gives no verdict), and
     the session was not finished before. Then the verdict is stored with the core-tree hash it is about, and the
     findings draft is recorded for whoever fixes. Who may finish which session is `target_session`'s rule.
     Returns the report lines."""
@@ -309,6 +309,9 @@ def finish(session, *, verdict=None, draft=None, today=None):
                 raise FinishRefused(f"a {hat} session needs --verdict {'|'.join(VERDICTS)}")
         elif verdict:
             raise FinishRefused(f"--verdict is for {' and '.join(VERDICT_HATS)} sessions; this one wore {hat}")
+        if hat in VERDICT_HATS and (plan := hwlib.session_plan(s)) and not plan.is_file():
+            raise FinishRefused(f"S{sid}'s own plan {plan} does not exist: write your plan there first, tick each step as it "
+                                "is done, then finish")  # a missing file reads as no steps, so it would pass unchecked
         if problem := hwlib.session_plan_problem(s, skip_finish=True):  # finish ticks its own "run finish / report" step
             raise FinishRefused(problem)
         if draft:

@@ -219,6 +219,20 @@ class FinishTests(AssignDb):
         self.assertEqual(plan.read_text().count("- [x]"), 3)
         self.assertIn("plan 3/3 steps ticked", out)
 
+    def test_a_review_or_qa_that_never_wrote_its_own_plan_is_refused(self):
+        """T121 review S393: a missing own plan read as no open steps, so finish passed without any plan."""
+        for sid, hat in ((self.seed("review", plan="T20-review-S1-plan.md"), "review"),
+                         (self.seed("qa", plan="T20-qa-S2-plan.md"), "qa")):
+            self.checkout(sid)
+            plan = self.profile / "briefs" / f"T20-{hat}-S{sid}-plan.md"
+            code, _, err = self.finish("--verdict", "clean", session=sid)
+            self.assertEqual(code, 1, hat)
+            self.assertIn(f"S{sid}'s own plan {plan} does not exist", err)
+            self.assertFalse(self.conn.execute("SELECT 1 FROM events WHERE kind='finish' AND text LIKE ?", (f"S{sid} %",)).fetchone())
+            plan.parent.mkdir(exist_ok=True)
+            plan.write_text("- [x] 1. Read the diff\n- [ ] 2. Run hw-employee finish and report (HW:DONE)\n")
+            self.assertEqual(self.finish("--verdict", "clean", session=sid)[0], 0, hat)
+
     def test_another_sessions_plan_never_blocks_a_finish(self):
         self.seed("build", plan="T20-api-plan.md")
         self.seed("review", plan="T20-api-review-plan.md")
