@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+"""A fake Claude Code CLI. This file is the only place that knows Claude Code's launch flags (`claude_launch` in
+bin/hw) and what its screen looks like; what the agent then does is agent.py, shared by every runtime. A fake for
+another runtime is a file like this one, named after its executable, reading that runtime's flags."""
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import agent  # noqa: E402
+
+VERSION = "9.9.9 (fake Claude Code)"
+# the screen, as `herdr agent read` showed Claude Code v2.1.322 on 2026-11-12: a prompt is echoed behind `❯` (its other
+# lines indented), a message behind `⏺`, a finished turn leaves a `✻ ... for 2s` line, and an idle CLI ends in its input box
+SCREEN = {"bullet": "⏺ ", "prompt_echo": "❯ ", "echo_indent": "  ", "turn_end": ["✻ Worked for 1s"],
+          "footer": ["─" * 40, "❯ ", "─" * 40, "  ⏵⏵ auto mode on (shift+tab to cycle)"]}
+
+def launch(argv):
+    p = argparse.ArgumentParser(prog="claude")
+    p.add_argument("--version", action="store_true")
+    p.add_argument("--permission-mode")
+    p.add_argument("-n", dest="name")
+    p.add_argument("--append-system-prompt-file", dest="rules")
+    p.add_argument("--add-dir", action="append", default=[], dest="add_dirs")
+    p.add_argument("--model")
+    p.add_argument("--effort")
+    p.add_argument("--settings")
+    return vars(p.parse_args(argv)) | {"runtime": "claude"} | SCREEN
+
+
+if __name__ == "__main__":
+    flags = launch(sys.argv[1:])
+    if flags["version"]:
+        print(VERSION)
+        sys.exit(0)
+    agent.main(flags)

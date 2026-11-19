@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""hw-pretool — pre-tool check that keeps the Herdwright coordinator from doing the work itself. It runs as a Claude Code
+PreToolUse hook and, under OpenCode, from the coordinator's plugin (hwdeny.coordinator_plugin), which sends the same
+payload with OpenCode's own tool names (shell, edit, write, patch, subagent).
+
+Ported from firstmate's fm-subagent-pretool-check / fm-cd-pretool-check / fm-primary-scope-lib. Prime directive 1:
+engineering work is delegated to worker sessions; the coordinator only does bookkeeping in Herdwright's own repo.
+firstmate: Copyright (c) 2026 Kun Chen, MIT licence, see THIRD_PARTY_LICENSES.md.
+
+It acts ONLY in the session that holds the profile's Herdwright lock (the hook payload's session_id must equal the
+lock's agent session). Workers, read-only sessions and every other tool call pass untouched. An unexpected payload
+allows the call; a shell command the guard cannot read with certainty, or trips over, is denied.
+
+For the coordinator it denies:
+  * Edit / Write / NotebookEdit / patch of a file outside Herdwright's home, the profile and the temp dirs, or inside
+    one of the user's project repos or the worktree root (projects.json), wherever they are: a temp dir included
+  * Bash: a command line outside the small grammar the guard reads (hwshell.GRAMMAR, read by hwshell.tokens and
+    hwshell.simple_command). The guard does not try to understand the shell: what the grammar does not name is
+    refused (hwshell.REFUSED), and the refusal says how to write it.
+  * Bash: a command line that names a variable git or a program would follow where the shell could set it
+    (hwshell.GUARDED_VARIABLES, hwshell.guarded_variable): `GIT_DIR=<project>/.git git branch x` writes a project
+    repo from Herdwright's own folder.
+  * Bash: outside the allowed roots, any git command that is not a known read (hwshell.GIT_READS, an allow list
+    strict by construction). In Herdwright's own repo every git command runs, unless it names a path outside the
+    allowed roots, takes a global option that can name a program (`-c`), or holds a word the shell expands other
+    than a message (git_problem).
+  * Bash: a `cd` that leads outside the allowed roots, and a write to a path outside them: a redirect, a
+    file-writing program, `sed -i`, `dd of=`, a `find` that deletes, writes a file or runs one of these
+    (hwshell.write_targets), behind a wrapper too (hwshell.WRAPPERS: only the wrappers listed there are looked
+    through). The path may be absolute or relative to where the shell stands (commands_problem). A `sed` script that
+    may write a file or run a program is refused wherever it would write (hwshell.sed_problem).
+  * Bash: a relative write, and every git command, where the guard cannot be sure in which directory the shell
+    stands: after any `cd` but `cd <path> &&` at the head of the line, to a directory that is there when the line
+    is checked, and after the first `;`, `||` or new line behind such a `cd` (hwshell.Standing). And a write through
+    a path an earlier command of the same line moves, copies or links (hwshell.changed_paths).
+    Not followed: a write made by another program (`python3 -c`, `gzip`, `tar`, `awk`, `sort -o`, `npm install`,
+    `curl -o`, a script file, a program git runs from its configuration: a pager, an alias, an editor), also behind
+    a wrapper the guard does not list. The guard stops ordinary commands and refuses what it cannot read; it is not
+    proof against a session that deliberately works around it.
+  * an edit-tool call that names no file (it cannot be checked)
+  * Agent / Workflow tools (delegate with `bin/hw spawn`; pass --allow-subagents to permit them)
+Reads are never blocked. One call is denied in every session: a shell command starting with `hw-pretool-canary`,
+which `bin/hw coordinator` uses to prove the OpenCode plugin is live before the session may act as Herdwright.
+
+Register in .claude/settings.json (hooks.PreToolUse, matcher "*") with command `bin/hw-pretool`.
+Test a payload:  echo '<json>' | hw-pretool --explain
+"""
+import argparse
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import hwdeny  # noqa: E402
+import hwlib  # noqa: E402
+from hwshell import (ASSIGNMENT, GRAMMAR, Standing, Unparsed, Word, cd_target, changed_paths, evaluated_text, find_runs,  # noqa: E402
+                     find_starts, git_command, git_global_problem, git_loose_words, git_named_paths, git_places,
+                     git_read_problem, git_runs_a_program, guarded_variable, inside, scoped_commands, simple_command,
+                     tokens, unresolved, walks_through, write_targets)
+
+
+def allowed_roots(hw_home=None, profile=None):
+    roots = [hw_home or hwlib.HW_HOME, profile or hwlib.PROFILE_DIR, Path(tempfile.gettempdir()), Path("/tmp"), Path("/private/tmp"),
+             Path("/dev/null"), Path("/dev/stdout"), Path("/dev/stderr")]  # discarding output is not a write
+    return [Path(os.path.realpath(r)) for r in roots]
+
+
+def project_roots(hw_home=None, profile=None):
+    """The user's project repos and the worktree root from projects.json: never Herdwright's to change, even under a
+    temp dir. A project that holds Herdwright's own repo or profile (Herdwright registered as a project) is left out."""
+    own = [Path(os.path.realpath(r)) for r in (hw_home or hwlib.HW_HOME, profile or hwlib.PROFILE_DIR)]
+    config = hwlib.read_json(hwlib.PROJECTS_PATH, {}) or {}
+    paths = [r.get("path") for r in (config.get("repos") or {}).values() if isinstance(r, dict)] + [config.get("worktree_root")]
+    found = []
+    for path in filter(None, paths):
+        p = Path(os.path.realpath(os.path.expanduser(str(path))))
+        if not any(p == o or p in o.parents for o in own):
+            found.append(p)
+    return found
+
+
+def lock_holder_session(lock_path=None):
+    lock = hwlib.read_json(lock_path or hwlib.PROFILE_DIR / ".cache" / "hw.lock", {}) or {}
+    return lock.get("agent_session") or lock.get("claude_session")
+
+
+def bash_problem(cmd, cwd, roots, protected=()):
+    """Reason to deny the shell command `cmd`, run in `cwd`, or None. A command line outside the grammar the guard
+    reads is denied, not passed (hwshell.tokens, hwshell.simple_command)."""
+    try:
+        return commands_problem(tokens(cmd), cwd, roots, protected)
+    except Unparsed as e:
+        return (f"the guard reads only plain command lines and refuses the rest. Refused here: {e}. "
+                f"What it reads: {GRAMMAR}.")
+    except Exception as e:  # a command the guard trips over is not known to be safe
+        return f"the guard could not check this command line ({type(e).__name__}), so it is refused: write it more simply."
+
+
+def commands_problem(toks, cwd, roots, protected, top=True):
+    """Reason to deny the commands `toks` (hwshell.tokens), run by a shell standing in `cwd` (None: unknown), or
+    None; Unparsed for a command outside the grammar. Every target is resolved where the shell will stand when it
+    runs: a relative path against `cwd`, or against the directory an earlier `cd` led to. `top`: the command line's
+    own shell, where a `cd` lasts; not what a `find -exec` runs, which is read the same way."""
+    standing = Standing(cwd)  # where each shell of the command line stands: the line's own, and one for each member of a pipe
+    moved = set()  # the paths that may lead elsewhere after the commands read so far (changed_paths)
+
+    def doubt(path, here):
+        """Why the guard cannot tell where `path` points, or None."""
+        if unresolved(path) or getattr(path, "glob", False) or getattr(path, "extended", False):
+            return (f"the shell expands `{path}` (a `$NAME`, a pattern, or a `^`, `#` or `~` zsh may read as one), so "
+                    f"the guard cannot tell where it points: write the path out, or quote it")
+        if here is None and not os.path.isabs(os.path.expanduser(path)):
+            return (f"`{path}` is relative to a directory the guard cannot know: it follows a `cd` only as `cd <folder "
+                    f"that is there> && ...` at the head of the line, up to the first `;`, `||` or new line. Use an "
+                    f"absolute path")
+        if walks_through(path, here, moved, at=False):
+            return (f"`{path}` passes through a path an earlier command of this line moves, copies or links, so "
+                    f"the guard cannot tell where it will point: run it as a command line of its own")
+        return None
+
+    def nested(inner, here):
+        return commands_problem(inner, here, roots, protected, top=False)
+
+    for raw, scope in scoped_commands(toks):
+        here = standing.at(scope)
+        words, before, written = simple_command(raw, piped=scope != ())
+        standing.after(words, scope, getattr(raw, "then", None))
+        if variable := guarded_variable(before + words):
+            return (f"this command line sets `{variable}`. The guard refuses every line that names a GIT_* variable, or one "
+                    f"that names a program or moves a path lookup (PAGER, EDITOR, VISUAL, LESSOPEN, PATH, HOME, CDPATH, ...), "
+                    f"where the shell could set it: git and every program the line starts would follow it. Use git's own "
+                    f"options (`git -C <dir>`, `--no-pager`), or hand it to a worker (bin/hw spawn).")
+        if text := evaluated_text(before + words):
+            return (f"`{text}` holds a `$(` or a backquote in quotes, in a place where the shell may still run it (an "
+                    f"assignment, an argument a builtin evaluates): the guard cannot read it, so it is refused.")
+        for target in written:
+            if why := doubt(target, here):
+                return f"a redirect: {why}."
+            if not allowed(target, roots, protected, here):
+                return f"writing to {target} is outside Herdwright's repo/profile/tmp: that is a worker's job."
+        if not words:
+            continue
+        name = Path(words[0]).name
+        if name == "cd":
+            there = cd_target(words, here)  # where it aims, followed or not
+            if top and there is not None and not allowed(there, roots, protected, "/"):
+                return f"don't `cd` into {there}: it silently changes where later commands run. Use absolute paths or `git -C` for reads, and delegate changes to a worker (bin/hw spawn)."
+            continue
+        if name == "git" and (problem := git_problem(words, before, here, roots, protected, moved)):
+            return problem
+        for w in write_targets(words):
+            if why := doubt(w, here):
+                return f"`{name}`: {why}."
+            if not allowed(w, roots, protected, here):
+                where = w if os.path.isabs(os.path.expanduser(w)) else f"{w} in {here}"
+                return f"`{name}` on {where}: outside Herdwright's repo/profile/tmp. Project files are changed by workers (bin/hw spawn)."
+            if holds(w, protected, here):
+                return (f"`{name}` on {w}: that folder holds a project repo, so the command could reach into it. Name the "
+                        f"file or folder you mean, below it.")
+        if name == "find":  # what it runs is read like a command, on each path it starts from
+            for _, run in find_runs(words):
+                for start in find_starts(words):
+                    if problem := nested([Word(w.replace("{}", start)) for w in run], here):
+                        return problem
+        moved |= changed_paths(words, here)
+    return None
+
+
+def git_problem(words, before, here, roots, protected, moved=()):
+    """Reason to deny the `git ...` command `words` (after the words `before` it), or None. In a repo outside the
+    allowed roots only a known read runs, written out in full. In Herdwright's own repo anything runs that names no
+    path outside it and no program for git to run. Where the guard cannot know in which directory the shell stands
+    (`here` is None: hwshell.Standing) no git command runs; where the repo's path passes through one of `moved`
+    (hwshell.changed_paths) only a known read does."""
+    sub, args, target = git_command(words, here)
+    sub_text = f"`git {sub}`" if sub else "`git`"
+    if here is None:
+        return (f"{sub_text} would run in a directory the guard cannot know: it stands after a `cd` the guard does not "
+                f"follow. It follows only `cd <folder that is there> && ...` at the head of the line, up to the first "
+                f"`;`, `||` or new line: write `cd <folder> && git ...`, or run git as a command line of its own with "
+                f"`git -C <folder>`.")
+    expands = lambda w: unresolved(w) or getattr(w, "glob", False) or str(w).startswith("^") and getattr(w, "extended", False)
+    if expanded := next((w for w in words[1:len(words) - len(args)] if expands(w)), None):
+        return f"{sub_text}: the shell expands `{expanded}`, so the guard cannot tell which repo this runs in: write it out."
+    read_problem = git_read_problem(words)
+    places = [None if place is not None and walks_through(place, here, moved) else place for place in git_places(words, here)]
+    if None in places:
+        return None if read_problem is None and not any(unresolved(w) for w in args) else \
+            f"{sub_text} would run in a directory the guard cannot know: use `git -C <absolute path>`."
+    target = next((p for p in places if not allowed(p, roots, protected, "/")), target)
+    if not allowed(target, roots, protected, "/"):
+        if any(ASSIGNMENT.fullmatch(w) for w in before):
+            read_problem = "a variable is set before `git`"
+        elif expanded := next((w for w in args if expands(w)), None):
+            read_problem = f"the shell expands `{expanded}`, so the guard cannot tell what git is given (quote a pattern meant for git)"
+        if read_problem:
+            return (f"{sub_text} in {target}: {read_problem}. Outside Herdwright's own repo only git commands that read "
+                    f"run (status, log, diff, show, the listing forms of branch, tag, worktree, ...), each in its strict "
+                    f"form. Project repos are changed only by workers (bin/hw spawn): a read the guard still refuses "
+                    f"goes to one too.")
+        return None
+    if problem := git_global_problem(words)[0] or git_runs_a_program(sub, args):
+        return (f"{sub_text}: {problem}. The guard does not follow a program git is told to run, so it is refused: "
+                f"hand it to a worker (bin/hw spawn), or run it yourself outside the session.")
+    loose = git_loose_words(sub, args)
+    if expanded := next((w for w in loose if unresolved(w)), None):
+        return (f"{sub_text}: the shell expands `{expanded}`, so the guard cannot tell what git is given (an option, a "
+                f"path in a project repo): write it out. Only a message (`-m \"$NAME\"`) may be expanded.")
+    if read_problem:
+        for w in loose:
+            for path in git_named_paths([w]):
+                if getattr(w, "glob", False):
+                    return f"{sub_text}: `{w}` names a path by a pattern, so the guard cannot tell where it points: write the path out."
+                if not allowed(path, roots, protected, target):
+                    return (f"{sub_text} names {path}, outside Herdwright's repo/profile/tmp: git would write or work there. "
+                            f"Project repos are changed only by workers (bin/hw spawn).")
+    return None
+
+
+def holds(path, protected, cwd):
+    """Whether `path` is a folder above one of the project repos: a recursive `rm`, `chmod -R` or deleting `find` on
+    it reaches into the repo without naming it."""
+    p = Path(os.path.realpath(Path(cwd or "/") / os.path.expanduser(str(path))))
+    return any(p in project.parents for project in protected)
+
+
+def allowed(path, roots, protected, cwd):
+    """Whether the coordinator may write `path`: inside an allowed root and not inside a project (project_roots)."""
+    return inside(path, roots, cwd) and not inside(path, protected, cwd)
+
+
+CANARY_COMMAND = hwdeny.PRETOOL_CANARY
+SUBAGENT_TOOLS = hwdeny.SUBAGENT_TOOLS | {"workflow"}
+
+
+def decide(payload, holder=None, roots=None, allow_subagents=False, protected=None):
+    """Reason to deny this tool call, or None to allow it. Tool names are compared in lower case, so Claude Code's
+    (`Bash`, `Edit`) and OpenCode's (`shell`, `edit`, `patch`) are checked alike."""
+    tool, inp, cwd = str(payload.get("tool_name", "")).lower(), payload.get("tool_input") or {}, payload.get("cwd") or os.getcwd()
+    shell = tool in hwdeny.SHELL_TOOLS and isinstance(inp, dict)
+    if shell and str(inp.get("command", "")).split()[:1] == [CANARY_COMMAND]:
+        return f"canary: `{inp['command'].strip()}` is denied in every session, so the coordinator guard is live"
+    holder = holder if holder is not None else lock_holder_session()
+    if not holder or payload.get("session_id") != holder:
+        return None  # not the coordinator
+    roots = roots or allowed_roots()
+    protected = [Path(os.path.realpath(p)) for p in (project_roots() if protected is None else protected)]
+    if tool in hwdeny.EDIT_TOOLS:
+        paths = hwdeny.edit_paths(inp)
+        if not paths:
+            return "an edit that names no file cannot be checked, so it is denied: name the file by its path."
+        for path in paths:
+            if not allowed(path, roots, protected, cwd):
+                return f"{path} is outside Herdwright's repo, profile and temp dirs. Herdwright does not edit project files: put it in a brief and spawn a worker (bin/hw spawn)."
+    elif shell:
+        if inp.get("workdir"):  # OpenCode's shell runs in `workdir`, relative to the session's directory
+            cwd = os.path.join(cwd, os.path.expanduser(inp["workdir"]))
+        return bash_problem(inp.get("command", ""), cwd, roots, protected)
+    elif tool in SUBAGENT_TOOLS and not allow_subagents:
+        return "Herdwright delegates engineering work to worker sessions in herdr (bin/hw spawn), not to in-process subagents."
+    return None
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="hw-pretool", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--allow-subagents", action="store_true")
+    ap.add_argument("--explain", action="store_true", help="print the decision in words instead of hook JSON")
+    a = ap.parse_args(argv)
+    try:
+        reason = decide(json.load(sys.stdin), allow_subagents=a.allow_subagents)
+    except Exception:  # an unreadable payload passes: a guard bug outside a shell command must never brick the coordinator
+        return 0
+    if a.explain:
+        print(f"deny: {reason}" if reason else "allow")
+    elif reason:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                 "permissionDecisionReason": f"hw-pretool: {reason}"}}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

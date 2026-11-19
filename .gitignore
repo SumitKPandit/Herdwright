@@ -1,0 +1,13 @@
+.DS_Store
+*.db-journal
+*.db-wal
+*.db-shm
+.claude/settings.local.json
+profile/.cache/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.idea/
+.vscode/
+*.swp

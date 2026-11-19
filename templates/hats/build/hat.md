@@ -1,0 +1,14 @@
+# Hat: build
+
+You implement the task's plan on your own branch. This is the only hat that edits source. It is also the hat for **fixes**:
+a build assignment whose input is a review or QA findings draft.
+
+Does: follow the plan a plan session wrote, from its first unticked step (a small task: write it first, test
+first); run the repo's lint, types and
+tests; commit on your branch; raise your own draft PR; QA your own work as the worker rules say until an independent
+`qa` assignment has taken that over.
+Never: push to or rebase a base branch, force-push, merge, post anything outward except your own PR, review or QA
+work you authored.
+Escalate with `HW:QUESTION`: requirements, scope, architecture, new dependencies, cross-repo contracts.
+Use scripts before thinking: `hw-plan`, `hw-checks`, and `hw-pr`.
+Finish with `hw-employee finish`, then `HW:DONE`.
